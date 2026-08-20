@@ -1,14 +1,27 @@
-"""The four bundled sinks.
+"""The seven bundled sinks.
 
 `matrix`, `ntfy` and `vikunja_task` are ported from the listeners this project replaces, minus
 their hardcoded endpoint defaults — those were one deployment's topology baked into source, and
 carrying them into a public repo is how a homelab's hostnames end up in someone else's traceback.
 Every endpoint here comes from config.
 
-`http` is the escape hatch, and it is the reason the other three do not need siblings. A generic
-POST with a rendered body covers any destination that speaks JSON, which is most of them. One of
-the receivers this replaced existed solely to shell out to a local reindex command; as an `http`
-sink it is a config entry.
+`http` is the escape hatch, and it is the reason most destinations do not need siblings. A
+generic POST with a rendered body covers any destination that speaks JSON, which is most of
+them. One of the receivers this replaced existed solely to shell out to a local reindex command;
+as an `http` sink it is a config entry.
+
+`discord`, `slack` and `apprise` are the cases where the escape hatch is a trap rather than a
+convenience, and each is here for a specific reason rather than for completeness:
+
+* **Discord and Slack** are reachable through `http` — but only by hand-templating raw JSON,
+  and `GenericHttpSink` raises `PermanentSinkError` on a body that does not parse. An issue
+  title containing a quote or a newline therefore goes straight to the DLQ unless the operator
+  remembered `| tojson`. Building the dict in Python deletes that failure mode. Both then add
+  the destination-specific hardening a generic sink has no way to know about.
+* **Apprise** is not expressible as an `http` sink at all: two of its response codes need
+  semantics `HttpSinkBase` gets wrong, one of them silently.
+
+The `apprise` *library* is deliberately not vendored — see `ARCHITECTURE.md`.
 """
 
 from __future__ import annotations
@@ -21,10 +34,18 @@ from urllib.parse import quote
 
 import httpx
 
-from ..config import HttpSink, MatrixSink, NtfySink, VikunjaTaskSink
+from ..config import (
+    AppriseSink,
+    DiscordSink,
+    HttpSink,
+    MatrixSink,
+    NtfySink,
+    SlackSink,
+    VikunjaTaskSink,
+)
 from ..errors import PermanentSinkError
-from ..templating import render, render_html, validate
-from .base import DeliveryOutcome, HttpSinkBase
+from ..templating import render, render_html, render_slack, validate
+from .base import DeliveryOutcome, Disposition, HttpSinkBase, Verdict
 
 
 def _resolve_url(spec: Any, secrets: dict[str, str]) -> str:
@@ -196,4 +217,179 @@ class GenericHttpSink(HttpSinkBase):
 
         return await self._send(
             client, self.spec.method, url, headers=headers, content=body.encode("utf-8")
+        )
+
+
+# Discord rejects a `content` longer than 2000 characters with a 400, which `_send` classifies
+# permanent — so an ordinary long release-notes payload would land in the DLQ rather than being
+# delivered slightly short. Truncating with a few characters of headroom is the better trade.
+_DISCORD_CONTENT_LIMIT = 2000
+_DISCORD_TRUNCATE_AT = 1997
+
+
+def _truncate(text: str, limit: int, cut: int) -> str:
+    """`text` bounded to `limit`, with a visible marker when it was shortened.
+
+    The ellipsis is the point: a silently truncated message reads as a complete one, and an
+    operator debugging a half-missing stack trace has no reason to suspect the sink.
+    """
+    if len(text) <= limit:
+        return text
+    return text[:cut] + "…"
+
+
+class DiscordWebhookSink(HttpSinkBase):
+    """Post a message to a Discord channel via an incoming webhook.
+
+    **`allowed_mentions` is set on every request and is not configurable.** Discord resolves
+    `@everyone` and `@here` out of message `content`, and on any public repo that content is
+    attacker-authored — an issue titled `@everyone pwned` mass-pings the server. `{"parse": []}`
+    disables all mention resolution. Discord's own webhook documentation recommends exactly this
+    for user-generated strings, so it is a vendor position rather than only this project's.
+
+    It is not a config flag on purpose. A flag that defaults safe still lets someone turn it off
+    without understanding what it was for, and the blast radius is everyone in the server. An
+    operator who wants a real `@here` should open a ticket with a reason.
+
+    Rendered with `render()`, not `render_html()`: Discord content is markdown, and HTML-escaping
+    it would put a literal `&amp;` in front of every user for the ordinary case of an ampersand.
+    Mention syntax is neutralised by `allowed_mentions` at the API level, which is where it
+    belongs — escaping the `@` would corrupt every email address instead.
+    """
+
+    def __init__(self, spec: DiscordSink, secrets: dict[str, str]) -> None:
+        self.name = spec.name
+        self.spec = spec
+        self.secrets = secrets
+        validate(spec.template)
+
+    async def deliver(self, context: dict[str, Any], client: httpx.AsyncClient) -> DeliveryOutcome:
+        webhook_url = self.secrets.get(self.spec.webhook_url_env, "").strip()
+        if not webhook_url:
+            raise PermanentSinkError(f"{self.name}: {self.spec.webhook_url_env} is unset")
+
+        payload: dict[str, Any] = {
+            "content": _truncate(
+                render(self.spec.template, context),
+                _DISCORD_CONTENT_LIMIT,
+                _DISCORD_TRUNCATE_AT,
+            ),
+            "allowed_mentions": {"parse": []},
+        }
+        if self.spec.username:
+            payload["username"] = self.spec.username
+        if self.spec.avatar_url:
+            payload["avatar_url"] = self.spec.avatar_url
+
+        params = {"thread_id": self.spec.thread_id} if self.spec.thread_id else None
+        return await self._send(client, "POST", webhook_url, params=params, json=payload)
+
+
+class SlackWebhookSink(HttpSinkBase):
+    """Post a message to a Slack channel via an incoming webhook.
+
+    Rendered with `render_slack()`, which escapes `&`, `<` and `>` in interpolated values.
+    Slack's `mrkdwn` reads `<http://evil|click here>` as a link with arbitrary display text —
+    a phishing primitive in a payload field an outsider controls — and `<!channel>` as a
+    broadcast. Escaping the angle brackets neutralises both. Like Discord's `allowed_mentions`,
+    this is not configurable.
+
+    Note for a future token-based variant, which this is not: Slack's *Web API*
+    (`chat.postMessage`) answers HTTP 200 with `{"ok": false, "error": ...}` in the body, which
+    the default classification reads as delivered. Incoming webhooks do not behave that way —
+    they return a non-2xx and a plain-text reason — so it is not a defect here. Whoever adds
+    token posting needs a body-level success check; override `_classify`, which exists for it.
+    """
+
+    def __init__(self, spec: SlackSink, secrets: dict[str, str]) -> None:
+        self.name = spec.name
+        self.spec = spec
+        self.secrets = secrets
+        validate(spec.template)
+
+    async def deliver(self, context: dict[str, Any], client: httpx.AsyncClient) -> DeliveryOutcome:
+        webhook_url = self.secrets.get(self.spec.webhook_url_env, "").strip()
+        if not webhook_url:
+            raise PermanentSinkError(f"{self.name}: {self.spec.webhook_url_env} is unset")
+
+        return await self._send(
+            client,
+            "POST",
+            webhook_url,
+            json={"text": render_slack(self.spec.template, context)},
+        )
+
+
+class AppriseNotifySink(HttpSinkBase):
+    """Fan out a notification through an apprise-api instance.
+
+    The substance of this sink is `_classify`, not the request. Two apprise-api response codes
+    mean something the default HTTP rule gets wrong:
+
+    * **`204` — no configuration for that key, or no valid URLs to notify.** The default reads
+      anything under 400 as delivered, so a typo'd key would swallow every event for as long as
+      it took someone to notice that a channel had gone quiet. Nothing is retryable about it —
+      the key will still be wrong next time — so it is permanent, and the DLQ row is the point.
+    * **`424` — at least one notification failed.** Permanent, and this one is a judgement call
+      worth stating. Retrying re-notifies the destinations that already *succeeded*, so five
+      attempts produce up to five duplicate messages on the healthy channels while the broken
+      one stays broken — noise at exactly the moment an operator is least able to tell which
+      channel actually failed. Apprise owns retry for its own downstreams. Doorman's job is to
+      make the partial failure visible, and a DLQ row does that without the duplicates.
+
+    Uses the stateful `POST {base}/notify/{key}` form so downstream credentials stay in
+    Apprise's store rather than in doorman's config. `Accept: application/json` is set so an
+    error response carries a structured `error` field, which is what makes the `response.text`
+    excerpt in the `SinkError` message worth reading.
+    """
+
+    def __init__(self, spec: AppriseSink, secrets: dict[str, str]) -> None:
+        self.name = spec.name
+        self.spec = spec
+        self.secrets = secrets
+        validate(spec.template)
+        validate(spec.title_template)
+
+    def _classify(self, response: httpx.Response) -> Verdict:
+        if response.status_code == 204:
+            return Verdict(
+                Disposition.PERMANENT,
+                "apprise accepted the request but notified nothing — unknown key, "
+                "or the key's configuration has no valid URLs",
+            )
+        if response.status_code == 424:
+            return Verdict(
+                Disposition.PERMANENT,
+                "at least one downstream notification failed; not retried, because a retry "
+                "re-notifies the destinations that succeeded",
+            )
+        return super()._classify(response)
+
+    async def deliver(self, context: dict[str, Any], client: httpx.AsyncClient) -> DeliveryOutcome:
+        base = _resolve_url(self.spec, self.secrets)
+        key = self.secrets.get(self.spec.key_env, "").strip()
+        if not key:
+            raise PermanentSinkError(f"{self.name}: {self.spec.key_env} is unset")
+
+        # The body's rendering context is chosen by config, so the escaping has to be too —
+        # this is the per-field doctrine applied to a field whose destination is a variable.
+        # The title is left unescaped in every mode: Apprise maps it onto plain-text slots
+        # (an email subject, a push notification title), the same split `VikunjaTaskSink_`
+        # settled on for its own title.
+        render_body = render_html if self.spec.body_format == "html" else render
+        payload: dict[str, Any] = {
+            "body": render_body(self.spec.template, context),
+            "title": render(self.spec.title_template, context),
+            "type": self.spec.notify_type,
+            "format": self.spec.body_format,
+        }
+        if self.spec.tag:
+            payload["tag"] = self.spec.tag
+
+        return await self._send(
+            client,
+            "POST",
+            f"{base}/notify/{quote(key, safe='')}",
+            headers={"Accept": "application/json"},
+            json=payload,
         )

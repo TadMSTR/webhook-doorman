@@ -119,11 +119,28 @@ Verification proves where a payload came from. It says nothing about whether the
 signed by GitHub either way. So content that reaches a destination has to be escaped for the way
 that destination renders it.
 
-That is a property of the sink, which is why there are two template environments rather than one
-global setting. `render()` leaves output alone: chat messages, push notifications and JSON
+That is a property of the sink, which is why there are three template environments rather than
+one global setting. `render()` leaves output alone: chat messages, push notifications and JSON
 bodies, where HTML-escaping is corruption rather than hardening. `render_html()` escapes every
 interpolated value, for destinations that render rich text — today, the Vikunja sink's
-`description`.
+`description`. `render_slack()` applies Slack's own three-character escape.
+
+Slack is the case that shows the split is about destinations rather than about a boolean. Its
+`mrkdwn` is neither HTML nor plain text: it reads `<http://evil|your bank>` as a link whose
+visible label the writer chose, and `<!channel>` as a broadcast to everyone in the channel. Both
+are reachable from an issue title. The documented escape set is exactly `&`, `<` and `>` — and
+escaping the angle brackets neutralises the broadcast tokens as a side effect, so one rule does
+both jobs. HTML autoescape looks close enough and is not: it also rewrites `"` and `'`, which
+Slack renders literally, so every quoted title would arrive full of `&#34;`. It is implemented
+as Jinja's `finalize` hook rather than as an autoescape policy, because autoescape is hardwired
+to `markupsafe.escape`; `finalize` runs on `{{ }}` expressions and is bypassed for literal
+template text, which is the same interpolated-values-only guarantee.
+
+Discord makes the same point from the other direction: its hardening is not an escape at all.
+Message content is markdown, so escaping it would corrupt ordinary messages — the mention
+problem is solved at the API level instead, with `allowed_mentions: {"parse": []}` on every
+request, which stops `@everyone` in a payload field from mass-pinging a server. Both that and
+Slack's escape are non-configurable on purpose.
 
 The first version of this module had one environment with autoescape off, and a GitHub issue
 body reached a Vikunja task description unescaped: stored XSS against whoever opened the task.
@@ -144,6 +161,50 @@ an interpreter — event-bridge uses RestrictedPython, WebhookX uses JS/wasm, Ni
 sandboxed JS — and for most of them that is reasonable. It is not here: the entire value on offer
 is fail-closed verification of untrusted inbound requests, and an in-process interpreter running
 operator-authored code over attacker-supplied data undoes more than it adds.
+
+### Apprise over HTTP, not the `apprise` library
+
+The obvious way to add Apprise support is to import it. Rejected for two reasons, either of
+which would be sufficient:
+
+* **Dependency weight.** The library carries 100+ notification plugins and their transitive
+  dependencies. This is a nine-dependency service whose value is a small auditable verification
+  path, and the supply-chain surface of a notification router should not exceed the surface of
+  the thing it is protecting. The same reasoning rejects a scripting engine, above.
+* **It is synchronous.** The `Sink` protocol hands every sink a shared `httpx.AsyncClient`,
+  because connection reuse and the configured timeout belong to the engine. A blocking library
+  would need an executor and would put a thread pool in the delivery path to gain nothing.
+
+apprise-api over HTTP gets the same fan-out with one more container and no new Python
+dependencies at all.
+
+The **stateful** endpoint (`POST {base}/notify/{key}`) is used rather than the stateless one.
+Stateless takes a `urls` list in the request body, which would put every downstream credential
+— Pushover tokens, Discord webhook URLs, SMTP passwords — into doorman's config *and* into
+every request it sends. That is against the grain of "don't store the secret and there is
+nothing to encrypt". Stateful leaves them in Apprise's own store; doorman holds one opaque key.
+
+### A failure read as a success is worse than a duplicate
+
+Two apprise-api response codes are reclassified, and the asymmetry behind both is worth stating
+because it generalises to any sink added later.
+
+`204` is the one that forced the sink to exist. Apprise answers it when it notified *nothing* —
+an unknown key, or a key whose configuration has no valid URLs — and 204 is below 400, so the
+default rule reads it as delivered. A typo'd key would therefore swallow every event silently:
+no retry, no DLQ row, no log line above debug. The failure is invisible until somebody notices
+a channel has been quiet for a week. It is now permanent, and the DLQ row is the entire point.
+
+`424` ("at least one notification failed") is a judgement call, and it goes to the DLQ rather
+than to retry. Retrying re-notifies the destinations that already succeeded, so five attempts
+produce up to five duplicate messages on the healthy channels while the broken one stays broken
+— noise at exactly the moment an operator is least able to tell which channel actually failed.
+Apprise owns retry for its own downstreams. Doorman's job is to make the partial failure
+visible, and a dead-letter row does that without the duplicates.
+
+The general rule: a success misread as a failure produces a duplicate an operator can see and
+reason about; a failure misread as a success produces silence. When a destination overloads a
+status code, prefer the error. `HttpSinkBase._classify` is the seam for it.
 
 ---
 
@@ -221,6 +282,13 @@ wrong credential.
 A model added to the `SinkSpec` union, a class in `sinks/`, an entry in `_BUILDERS`. Raise
 `PermanentSinkError` for failures a retry cannot fix, `SinkError` for ones it can — that
 distinction is what keeps a 400 from burning five attempts and a 503 from being discarded.
+
+**If the credential is embedded in a URL, do not inherit `_EndpointMixin`.** The mixin offers an
+inline `url` alongside `url_env` because a plain endpoint is topology rather than a secret. That
+reasoning inverts when the URL contains its own token, as Discord's and Slack's webhook URLs do:
+an inline form invites an adopter to commit a live credential to a file the README calls safe to
+commit, and it keeps the value out of `secret_values`, so it is never redacted from the event log
+either. Use a single required `webhook_url_env` and say why in the model's docstring.
 
 Three things the base layer already handles, so a new sink does not have to:
 

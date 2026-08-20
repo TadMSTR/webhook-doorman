@@ -322,8 +322,65 @@ class HttpSink(_SinkBase, _EndpointMixin):
     headers: dict[str, str] = Field(default_factory=dict)
 
 
+class DiscordSink(_SinkBase):
+    """Post a message to a Discord channel via an incoming webhook.
+
+    **No `_EndpointMixin`, deliberately.** A Discord webhook URL embeds its own token —
+    `.../api/webhooks/{id}/{token}` — so unlike a Matrix homeserver base there is no
+    non-secret inline form of it. Offering `url` here would invite an adopter to commit a
+    live credential to their config file, and it would keep that credential out of
+    `resolved.secret_values`, so it would never be redacted from the event log either.
+    `config.yml` names the variable; the value stays in the environment.
+
+    `username` and `avatar_url` override the webhook's configured identity per message.
+    `thread_id` posts into an existing thread rather than the parent channel.
+    """
+
+    type: Literal["discord"]
+    webhook_url_env: str
+    template: str = "{{ summary }}"
+    username: str | None = None
+    avatar_url: str | None = None
+    thread_id: str | None = None
+
+
+class SlackSink(_SinkBase):
+    """Post a message to a Slack channel via an incoming webhook.
+
+    Same credential-in-URL rule as `DiscordSink`: the webhook URL is the entire secret, so
+    there is no inline form.
+    """
+
+    type: Literal["slack"]
+    webhook_url_env: str
+    template: str = "{{ summary }}"
+
+
+class AppriseSink(_SinkBase, _EndpointMixin):
+    """Fan out a notification through an apprise-api instance.
+
+    `url` / `url_env` is the apprise-api base, which is genuinely non-secret topology — so
+    `_EndpointMixin` applies here where it does not for Discord and Slack. The key is the
+    credential, and it is `*_env` only.
+
+    Uses the **stateful** endpoint, `POST {base}/notify/{key}`. The stateless form takes a
+    `urls` list in the request body, which would put every downstream credential — Pushover
+    tokens, Discord webhook URLs, SMTP passwords — into doorman's config *and* into every
+    request it sends. Stateful keeps them in Apprise's own store and leaves doorman holding
+    one opaque key.
+    """
+
+    type: Literal["apprise"]
+    key_env: str
+    template: str = "{{ summary }}"
+    title_template: str = "{{ source }}"
+    notify_type: Literal["info", "success", "warning", "failure"] = "info"
+    body_format: Literal["text", "markdown", "html"] = "text"
+    tag: str | None = None
+
+
 SinkSpec = Annotated[
-    MatrixSink | NtfySink | VikunjaTaskSink | HttpSink,
+    MatrixSink | NtfySink | VikunjaTaskSink | HttpSink | DiscordSink | SlackSink | AppriseSink,
     Field(discriminator="type"),
 ]
 

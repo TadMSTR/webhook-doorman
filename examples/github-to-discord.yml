@@ -1,0 +1,61 @@
+# Example — GitHub issues and PRs into a Discord channel, with a Slack copy.
+#
+# Every value here is invented; `example.invalid` is reserved by RFC 2606 and will never
+# resolve. The Discord and Slack webhook URLs below are placeholders — yours are secrets.
+#
+#   .env:
+#     GITHUB_WEBHOOK_SECRET=<the secret you typed into GitHub's webhook form>
+#     DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>
+#     SLACK_WEBHOOK_URL=https://hooks.slack.com/services/<T>/<B>/<token>
+#
+# Getting the URLs:
+#   Discord — Server Settings → Integrations → Webhooks → New Webhook → Copy Webhook URL
+#   Slack   — api.slack.com/apps → your app → Incoming Webhooks → Add New Webhook to Workspace
+#
+# Both URLs contain their own credential. Keep them in .env, never in this file. There is
+# deliberately no inline `url:` form on either sink for exactly that reason.
+
+sources:
+  - name: github
+    path: /webhook/github
+    parser: github
+    verify:
+      strategy: hmac_sha256
+      header: X-Hub-Signature-256
+      prefix: "sha256="
+      encoding: hex
+      secret_env: GITHUB_WEBHOOK_SECRET
+    dedup:
+      # GitHub sends a unique ID per delivery and retries on any non-2xx. This is what stops a
+      # retry from posting the message twice.
+      id_header: X-GitHub-Delivery
+    sinks: [team-discord, team-slack]
+
+sinks:
+  # Discord renders message content as markdown, so the template can use it directly. The
+  # github parser exposes: repo, number, title, url, author, body, kind.
+  #
+  # `title` and `body` come from whoever opened the issue. On a public repo that is a stranger,
+  # which is why this sink disables mention resolution on every message without being asked —
+  # otherwise an issue titled "@everyone pwned" pings the whole server.
+  - name: team-discord
+    type: discord
+    webhook_url_env: DISCORD_WEBHOOK_URL
+    template: |
+      **[{{ kind }}] {{ repo }}#{{ number }}** — {{ title }}
+      opened by {{ author }}
+      {{ url }}
+
+  # The same event into Slack. Note the different link syntax: Slack writes links as
+  # `<url|label>` rather than markdown. That syntax is also why interpolated values are escaped
+  # here — without it, a crafted issue title could inject a link with any label it liked.
+  #
+  # The `*bold*` and the `<{{ url }}|...>` below are template text, not interpolated values, so
+  # they render as markup. Only what comes out of `{{ }}` is escaped.
+  - name: team-slack
+    type: slack
+    webhook_url_env: SLACK_WEBHOOK_URL
+    template: |
+      *[{{ kind }}] {{ repo }}#{{ number }}* — {{ title }}
+      opened by {{ author }}
+      <{{ url }}|view on GitHub>

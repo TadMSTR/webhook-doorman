@@ -22,7 +22,7 @@ import json
 import httpx
 import pytest
 
-from webhook_doorman.config import HttpSink, MatrixSink, NtfySink, VikunjaTaskSink
+from webhook_doorman.config import HttpSink, MatrixSink, NtfySink, SlackSink, VikunjaTaskSink
 from webhook_doorman.sinks import build_sink
 
 XSS_TITLE = '<script>alert("xss")</script>'
@@ -172,6 +172,93 @@ class TestTextSinksAreNotEscaped:
         await build_sink(spec, {}).deliver({**CONTEXT, "summary": "Fix A & B"}, client)
 
         assert json.loads(httpx_mock.get_requests()[0].read())["text"] == "Fix A & B"
+
+
+SLACK_URL = "https://hooks.slack.com/services/T0/B0/xxx"
+
+
+def slack_sink(**overrides):
+    spec = SlackSink.model_validate(
+        {
+            "name": "team-slack",
+            "type": "slack",
+            "webhook_url_env": "SLACK_WEBHOOK_URL",
+            **overrides,
+        }
+    )
+    return build_sink(spec, {"SLACK_WEBHOOK_URL": SLACK_URL})
+
+
+class TestSlackInterpolatedValuesAreEscaped:
+    """Slack is a third rendering context, not a variant of the other two.
+
+    `mrkdwn` reads `<url|label>` as a link with arbitrary display text and `<!channel>` as a
+    broadcast. Both are reachable from a payload field an outsider wrote. The escape set is
+    exactly `&`, `<`, `>` — see `TestSlackIsNotHtmlEscaped` for the half that keeps it from
+    becoming an over-broad HTML escape.
+    """
+
+    async def test_angle_brackets_and_ampersands_escape(self, client, httpx_mock):
+        httpx_mock.add_response(url=SLACK_URL, status_code=200)
+        await slack_sink().deliver({**CONTEXT, "summary": "A & B <c> d"}, client)
+
+        text = json.loads(httpx_mock.get_requests()[0].read())["text"]
+        assert text == "A &amp; B &lt;c&gt; d"
+
+    async def test_a_channel_broadcast_is_neutralised(self, client, httpx_mock):
+        """`<!channel>` pings everyone in the channel. Escaping the angle brackets is what
+        stops it resolving — Slack only honours a broadcast written with literal brackets."""
+        httpx_mock.add_response(url=SLACK_URL, status_code=200)
+        await slack_sink().deliver({**CONTEXT, "summary": "<!channel> deploy failed"}, client)
+
+        text = json.loads(httpx_mock.get_requests()[0].read())["text"]
+        assert "<!channel>" not in text
+        assert text.startswith("&lt;!channel&gt;")
+
+    async def test_a_link_with_deceptive_label_cannot_be_injected(self, client, httpx_mock):
+        """`<http://evil.example|Click here — totally safe>` renders as a bare hyperlink whose
+        visible text is whatever the attacker chose. That is a phishing primitive, and it lives
+        in an issue title on a public repo."""
+        httpx_mock.add_response(url=SLACK_URL, status_code=200)
+        await slack_sink().deliver(
+            {**CONTEXT, "summary": "<http://evil.example|your bank>"}, client
+        )
+
+        text = json.loads(httpx_mock.get_requests()[0].read())["text"]
+        assert "<http://evil.example|" not in text
+        assert text == "&lt;http://evil.example|your bank&gt;"
+
+    async def test_operator_markup_in_the_template_survives(self, client, httpx_mock):
+        """The half that makes the escape usable rather than merely safe.
+
+        Only interpolated values are escaped; the operator's own template text is their own.
+        Without this, `*{{ source }}*` could not render bold and nobody would use the sink.
+        """
+        httpx_mock.add_response(url=SLACK_URL, status_code=200)
+        await slack_sink(template="*{{ source }}* <https://runbook.example|runbook>").deliver(
+            CONTEXT, client
+        )
+
+        text = json.loads(httpx_mock.get_requests()[0].read())["text"]
+        assert text == "*github* <https://runbook.example|runbook>"
+
+
+class TestSlackIsNotHtmlEscaped:
+    """The other half, and the reason `render_slack` is not `render_html` renamed.
+
+    An over-broad "escape everything" fix must fail loudly here. Slack renders quotes and
+    apostrophes literally, so HTML escaping them is the same class of everyday visible bug as
+    HTML-escaping a Matrix message.
+    """
+
+    async def test_quotes_and_apostrophes_pass_through(self, client, httpx_mock):
+        httpx_mock.add_response(url=SLACK_URL, status_code=200)
+        await slack_sink().deliver({**CONTEXT, "summary": 'it\'s a "quoted" title'}, client)
+
+        text = json.loads(httpx_mock.get_requests()[0].read())["text"]
+        assert text == 'it\'s a "quoted" title'
+        assert "&#34;" not in text
+        assert "&#39;" not in text
 
 
 class TestEscapeFilterIsAvailableToOperators:

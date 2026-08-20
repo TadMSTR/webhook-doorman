@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from enum import Enum, auto
 from typing import Any, Protocol
 
 import httpx
@@ -32,6 +33,27 @@ class DeliveryOutcome:
 
     response_code: int | None
     latency_ms: int
+
+
+class Disposition(Enum):
+    """The three things a response can mean, mapped onto the failure vocabulary above."""
+
+    DELIVERED = auto()
+    RETRYABLE = auto()
+    PERMANENT = auto()
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """A classified response, and optionally why.
+
+    `reason` replaces the response body in the resulting error message. It exists because the
+    codes worth overriding are usually the ones with nothing useful in the body — a bare `204`
+    yields `HTTP 204: ` and tells an operator nothing about which of its two meanings applied.
+    """
+
+    disposition: Disposition
+    reason: str | None = None
 
 
 class Sink(Protocol):
@@ -61,6 +83,10 @@ class HttpSinkBase:
     which are the two the server is explicitly asking you to try again. On those, and on 5xx,
     a `Retry-After` header is carried back to the engine on the `SinkError` rather than
     discarded — see `parse_retry_after`.
+
+    That rule is a default, not a law: a destination that overloads a status code overrides
+    `_classify`. See its docstring for when, and for why the safe direction is to prefer the
+    error.
     """
 
     name: str
@@ -91,12 +117,13 @@ class HttpSinkBase:
 
         latency = _elapsed(started)
         code = response.status_code
+        verdict = self._classify(response)
 
-        if code < 400:
+        if verdict.disposition is Disposition.DELIVERED:
             return DeliveryOutcome(response_code=code, latency_ms=latency)
 
-        detail = response.text[:200]
-        if code in (408, 429) or code >= 500:
+        detail = verdict.reason or response.text[:200]
+        if verdict.disposition is Disposition.RETRYABLE:
             # A destination that says when to come back is answering the question the backoff
             # curve is guessing at. Read it on every retryable status rather than only 429 —
             # `Retry-After` is defined for 503 as well. The value is untrusted; the engine
@@ -106,6 +133,34 @@ class HttpSinkBase:
                 retry_after=parse_retry_after(response.headers.get("retry-after")),
             )
         raise PermanentSinkError(f"{self.name}: HTTP {code}: {detail}")
+
+    def _classify(self, response: httpx.Response) -> Verdict:
+        """What this response means. Override to correct a destination that disagrees with HTTP.
+
+        The default is the status-code rule in this class's docstring, and it is right for most
+        destinations. It is wrong for any API that overloads a code, and the two failure modes
+        are not symmetric: a success misread as a failure produces a duplicate delivery an
+        operator can see, while a *failure misread as a success* produces silence — no retry, no
+        DLQ row, no log line above debug. `AppriseNotifySink` overrides this because apprise-api
+        answers `204` when it has no valid URLs to notify, which the default reads as delivered.
+
+        Override by returning `Verdict` for the codes you know about and delegating the rest:
+
+            def _classify(self, response):
+                if response.status_code == 204:
+                    return Verdict(Disposition.PERMANENT, "reason an operator can act on")
+                return super()._classify(response)
+
+        This is also the seam for a destination that reports failure in the *body* of a 200 —
+        Slack's `chat.postMessage` Web API returns `{"ok": false, "error": ...}` that way. Read
+        `response.json()` here rather than adding a second check in `deliver`.
+        """
+        code = response.status_code
+        if code < 400:
+            return Verdict(Disposition.DELIVERED)
+        if code in (408, 429) or code >= 500:
+            return Verdict(Disposition.RETRYABLE)
+        return Verdict(Disposition.PERMANENT)
 
 
 def parse_retry_after(value: str | None, *, now: datetime | None = None) -> float | None:

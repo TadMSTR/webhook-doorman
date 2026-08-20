@@ -24,6 +24,7 @@ from .conftest import GITHUB_SECRET, sign_hex
 
 SINK_URL = "https://sink.example.invalid/notes"
 ADMIN_TOKEN = "admin-token-for-tests-0123456789abcd"
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/123456789/tok-0123456789abcdef"
 
 BODY = json.dumps(
     {
@@ -180,6 +181,53 @@ class TestSecretsNeverReachDisk:
         run_batch(client, engine)
 
         assert ADMIN_TOKEN.encode() not in read_all(db_path)
+
+    def test_a_discord_webhook_url_is_absent_from_the_database_file(self, tmp_path, httpx_mock):
+        """The Discord/Slack credential is the *URL*, which is a shape redaction had not seen.
+
+        Worth its own case rather than trusting the mechanism: until Plan 1 derived secret
+        names from the model, a `webhook_url_env` field was invisible to `resolve()`, so the
+        URL never entered `secret_values` and was never redacted. This asserts the property on
+        disk — the same standard as the four cases above — for the field that exposed the gap.
+        """
+        httpx_mock.add_response(url=DISCORD_WEBHOOK_URL, status_code=204)
+
+        data = config_data()
+        data["sources"][0]["sinks"] = ["team-discord"]
+        data["sinks"] = [
+            {
+                "name": "team-discord",
+                "type": "discord",
+                "webhook_url_env": "DISCORD_WEBHOOK_URL",
+                # Echo the credential into the message body, which is the way it would
+                # realistically reach the store: rendered content is persisted with the event.
+                "template": "{{ summary }} DISCORD_WEBHOOK_URL",
+            }
+        ]
+
+        db_path = tmp_path / "doorman.db"
+        env = {**ENV, "DISCORD_WEBHOOK_URL": DISCORD_WEBHOOK_URL}
+        resolved = resolve(Config.model_validate(data), env)
+        engine = Engine(resolved, store=SqliteStore(db_path))
+        app = create_app(resolved=resolved, engine=engine)
+
+        with TestClient(app, client=("127.0.0.1", 51234)) as client:
+            body = json.dumps(
+                {
+                    "action": "opened",
+                    "issue": {
+                        "number": 9,
+                        "title": "Leak",
+                        "body": DISCORD_WEBHOOK_URL,
+                        "user": {},
+                    },
+                    "repository": {"full_name": "o/r"},
+                }
+            ).encode()
+            client.post("/webhook/github", content=body, headers=headers(body, "d-discord"))
+            run_batch(client, engine)
+
+        assert DISCORD_WEBHOOK_URL.encode() not in read_all(db_path)
 
 
 class TestAdminReplay:

@@ -5,6 +5,58 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-08-20
+
+Three new sinks. Discord and Slack were already reachable through `type: http`, and that was the
+problem: it required hand-templating raw JSON, and `GenericHttpSink` dead-letters a body that
+does not parse — so an issue title containing a quote or a newline was lost unless the operator
+remembered `| tojson`. Apprise was not expressible at all.
+
+Nothing existing changes behaviour. Upgrading is a version bump.
+
+### Added
+
+- **`discord` sink.** Posts to an incoming webhook. Sends `allowed_mentions: {"parse": []}` on
+  every request, which is not configurable: message content is attacker-authored on any public
+  repo, and without it an issue titled `@everyone pwned` mass-pings the server. Discord's own
+  webhook documentation recommends exactly this for user-generated strings. Content is
+  truncated to Discord's 2000-character limit with a trailing `…` — over the limit Discord
+  answers `400`, which is permanent, so a long release-notes payload would otherwise be lost
+  rather than shortened. Optional `username`, `avatar_url` and `thread_id`.
+- **`slack` sink.** Posts to an incoming webhook, escaping `&`, `<` and `>` in interpolated
+  values. Slack's `mrkdwn` reads `<http://evil|your bank>` as a link whose visible label the
+  writer chose, and `<!channel>` as a broadcast; escaping the angle brackets neutralises both.
+  Also not configurable. Markup written in the template itself still renders, so `*{{ source }}*`
+  works as expected.
+- **`apprise` sink.** Fans out through an apprise-api instance via the stateful
+  `POST {base}/notify/{key}` endpoint, so downstream credentials stay in Apprise's store rather
+  than in doorman's config and in every outbound request. Options: `notify_type`, `body_format`
+  (`text`/`markdown`/`html`, and the body is HTML-escaped only in `html` mode), `tag`.
+
+  **Two response codes are reclassified, and this is the substance of the sink.** `204` means
+  Apprise notified *nothing* — an unknown key, or a key with no valid URLs — and because it is
+  below 400 the generic HTTP rule reads it as a successful delivery. A typo'd key would swallow
+  every event with no retry, no DLQ row and nothing above debug in the log. It is now permanent.
+  `424` ("at least one notification failed") is permanent too, deliberately: retrying re-notifies
+  the destinations that already succeeded, so the DLQ row is the honest outcome.
+- `render_slack()` in `templating.py`, a third template environment alongside `render()` and
+  `render_html()`. Implemented as Jinja's `finalize` hook rather than an autoescape policy,
+  because autoescape is hardwired to `markupsafe.escape` and that also rewrites `"` and `'`,
+  which Slack renders literally.
+- `HttpSinkBase._classify()`, an overridable hook returning a `Verdict`, for destinations whose
+  status codes disagree with HTTP's. Also the right seam for a destination that reports failure
+  in the body of a `200` — Slack's `chat.postMessage` Web API does, should token posting ever
+  be added.
+- `examples/github-to-discord.yml`, routing one GitHub source to Discord and Slack together.
+
+### Notes for adopters
+
+`discord` and `slack` take **`webhook_url_env`**, not `url` / `url_env`, and have no inline
+form. Their webhook URL embeds its own token, so the URL *is* the credential: an inline field
+would invite committing a live secret to `config.yml` and would keep the value out of the
+redaction set. This depends on the `sink_secret_env_names()` fix released in 0.1.1 — on 0.1.0
+these sinks would report `enabled: true` with the variable unset.
+
 ## [0.1.1] — 2026-08-20
 
 A correctness pass. Four places where the documented behaviour and the shipped behaviour had
@@ -123,4 +175,6 @@ First release. Security-audited before tagging: one Medium finding, resolved bel
   redacted before storage, collapsing every event onto one dedup id and silently discarding all
   but the first.
 
+[0.2.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.2.0
+[0.1.1]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.1.1
 [0.1.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.1.0

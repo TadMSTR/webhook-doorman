@@ -130,6 +130,62 @@ sinks:
     template: |
       {"text": {{ summary | tojson }}, "source": "{{ source }}"}
 
+  # --- Discord -------------------------------------------------------------------------------
+  # NOTE the field name: `webhook_url_env`, not `url_env`, and there is no inline `url` form.
+  # A Discord webhook URL embeds its own token, so the URL *is* the credential — writing it
+  # inline would commit a live secret to this file, and would keep it out of the redaction set
+  # so it could also reach the event log.
+  #
+  # This sink always sends `allowed_mentions: {"parse": []}` and that is not configurable.
+  # Message content is attacker-authored on any public repo, and Discord resolves `@everyone`
+  # out of it. Discord's own docs recommend exactly this for user-generated strings.
+  #
+  # Content is truncated to Discord's 2000-character limit with a trailing `…`, because over
+  # the limit Discord answers 400 and a 400 is permanent — the message would go to the DLQ.
+  #
+  # - name: team-discord
+  #   type: discord
+  #   webhook_url_env: DISCORD_WEBHOOK_URL
+  #   template: "{{ summary }}"
+  #   username: doorman            # optional: overrides the webhook's configured name
+  #   avatar_url: https://example.invalid/icon.png   # optional
+  #   thread_id: "1234567890"      # optional: post into an existing thread
+
+  # --- Slack ---------------------------------------------------------------------------------
+  # Same credential-in-URL rule as Discord: `webhook_url_env` only, no inline form.
+  #
+  # Interpolated values are escaped for Slack's `mrkdwn` (`&`, `<`, `>`). That stops a payload
+  # field from injecting `<http://evil|your bank>` — a link whose visible label the attacker
+  # chose — and neutralises `<!channel>`. Markup you write in the template yourself is left
+  # alone, so `*{{ source }}*` still renders bold.
+  #
+  # - name: team-slack
+  #   type: slack
+  #   webhook_url_env: SLACK_WEBHOOK_URL
+  #   template: "*{{ source }}* {{ summary }}"
+
+  # --- Apprise -------------------------------------------------------------------------------
+  # Fan out to many destinations through an apprise-api instance. Here the base URL is ordinary
+  # topology, so `url` / `url_env` applies as usual; the key is the credential.
+  #
+  # Uses the stateful `POST {url}/notify/{key}` endpoint. The stateless form would require
+  # listing every downstream URL — Pushover tokens, SMTP passwords — in this file and in every
+  # outbound request. Stateful leaves them in Apprise's own store.
+  #
+  # Two response codes are treated specially, and both mean a delivery you would otherwise
+  # never hear about: 204 ("no valid URLs to notify" — usually a wrong key) and 424 ("at least
+  # one notification failed"). Both dead-letter rather than reporting success.
+  #
+  # - name: fanout
+  #   type: apprise
+  #   url_env: APPRISE_BASE_URL
+  #   key_env: APPRISE_KEY
+  #   template: "{{ summary }}"
+  #   title_template: "{{ source }}"
+  #   notify_type: warning         # info | success | warning | failure
+  #   body_format: markdown        # text | markdown | html
+  #   tag: ops                     # optional: routes to a subset of the key's URLs
+
   # A task tracker sink, for reference.
   #
   # Webhook content is attacker-controlled — an issue title or body on a public repo is written
