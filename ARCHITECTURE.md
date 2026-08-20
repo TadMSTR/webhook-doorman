@@ -112,6 +112,24 @@ The regression test for this reads the SQLite file **and its WAL sidecar** as ra
 earlier version passed a test that checked the redaction function was called, while the GitHub
 parser was quietly writing the secret into `context_json`.
 
+**The ingest boundary is not the only write, and 0.3.0 fixed the other one.** `HttpSinkBase._send`
+puts part of a destination's response body into the error message, and `mark_exhausted` persisted
+that string verbatim — so a destination that echoed a submitted credential into its own 400 page
+wrote that credential into the DLQ, on the same disk, in the column an operator reads first. The
+ingest pass never covered it, because it redacts what the *producer* sent and this is what the
+*destination* replied.
+
+Redaction now also runs at the **engine** boundary, on both store-writing paths and on the log
+line, and the destination's body is truncated to 80 characters rather than 200. The engine is
+the right place for it, not the sink: `sinks/base.py` has no business knowing about resolved
+secrets, and the rule below says `redaction.py` must not know about sinks. Redacting where they
+meet keeps both true. It is idempotent, so the two paths need not coordinate.
+
+The generalisation worth carrying forward: **redaction belongs at every boundary where a string
+crosses into storage or an exporter, not at the one where secrets were first thought about.**
+`GET /admin/dlq` deliberately landed *after* this fix, because exposing an unredacted column
+over HTTP is a different severity from leaving it in a file.
+
 ### Escaping belongs to the destination, not the data
 
 Verification proves where a payload came from. It says nothing about whether the payload's
@@ -222,6 +240,92 @@ The general rule: a success misread as a failure produces a duplicate an operato
 reason about; a failure misread as a success produces silence. When a destination overloads a
 status code, prefer the error. `HttpSinkBase._classify` is the seam for it.
 
+**A 3xx was the same defect in the default rule itself**, found while security-baselining the
+apprise sink and fixed in 0.3.0. The engine builds its client with `follow_redirects=False`
+deliberately — a Discord or Slack webhook URL embeds its own credential, and following an
+attacker-influenced `Location` would hand that credential to whoever set it. But the classifier
+read everything under 400 as delivered, so an un-followed redirect was recorded as a successful
+delivery in which nothing was sent. Typing `http://` at an instance that redirects to `https://`
+produced a sink reporting every delivery as successful while notifying nobody. Only 2xx is
+delivered now; 3xx is permanent, with a reason naming the `Location` header.
+
+An adopter whose destination legitimately answers 3xx will start dead-lettering. That is the
+intended outcome and it is why 0.3.0 is a minor release rather than a patch.
+
+### No `prometheus_client` dependency
+
+`/metrics` emits the Prometheus text exposition format by hand, in `metrics.py`. The format is a
+few lines of string formatting, the default install is nine dependencies with an argument for
+each, and a client library would earn its place only if we needed a multiprocess collector or
+the protobuf format. We need neither.
+
+The cost of hand-rolling a format is that "the output is valid" becomes a claim rather than a
+guarantee — and a hand-written assertion agreeing with a hand-written emitter proves nothing. So
+`prometheus_client` **is** a dependency, of the test suite only: every rendering test runs the
+real output through the reference parser.
+
+The distinction the module exists to protect is counter versus gauge. `store.stats()` returns
+current table counts, and every one of them goes *down* when the retention sweep runs. Named
+`_total`, Prometheus would read that drop as a counter reset and every `rate()` over it would be
+silently wrong. Gauges are rendered from `stats()` at scrape time and never accumulate here;
+counters are incremented in-process at the sites that already log the same event, so every
+counter has a corresponding log line and vice versa.
+
+Label cardinality is bounded by `config.yml` — `source`, `sink` and `strategy` come from there,
+and `reason` and `outcome` are closed vocabularies. Nothing producer-controlled is ever a label.
+`event_type` and `response_code` in particular are unbounded, and a producer varying either
+would turn the endpoint into an out-of-memory; they stay in the log line, where
+high-cardinality detail belongs.
+
+### Tracing is optional, and never fatal
+
+OpenTelemetry sits behind an `[otel]` extra and produces nothing unless
+`OTEL_EXPORTER_OTLP_ENDPOINT` is set *and* the packages import. The variable set with the extra
+missing is a **boot warning**, not a crash: a router that refuses to start in production because
+an optional telemetry extra is absent has traded a feature for an outage.
+
+Spans carry only config-derived and structural attributes. No payload content, no headers, no
+rendered template output — the redaction work above exists precisely because that material
+leaks, and a span exporter is simply another egress.
+
+**That rule has to cover the spans this project does not author.** Enabling tracing also enables
+OTel's automatic `httpx` instrumentation, a second and independent span source, and it records
+the full request URL. For Discord and Slack the webhook URL *is* the credential — the same fact
+that makes `follow_redirects=False` load-bearing — and for Apprise it is the `key` path segment.
+Holding the invariant only for the hand-written spans would have left the auto-instrumented ones
+exporting exactly what the DLQ fix in this same release was written to stop.
+
+So every resolved secret is scrubbed from span attributes at instrumentation time, and the scrub
+**matches by value, not by attribute name**. Scrubbing a known key like `http.url` would be a
+denylist against a moving target: the instrumentation is mid-migration from `http.url` to
+`url.full`, and the rename would silently reopen the leak while the code still read as correct.
+Matching the secret values themselves covers a renamed or newly added attribute the day it
+appears, and it redacts at the right granularity — an Apprise span keeps its base URL and loses
+only the key.
+
+Two traps worth recording, both found by testing rather than reading:
+
+* **The async hook is a different parameter.** The delivery client is an `httpx.AsyncClient`, and
+  the async path consults only `async_request_hook`. Passing `request_hook` alone is accepted
+  silently and never fires — a fix that looks applied and leaks anyway. Both are registered.
+* **A mock transport produces no client span at all.** `httpx.MockTransport` bypasses the
+  instrumented transport, so a test written against it asserts "no credential in zero spans" and
+  passes no matter what. The regression test drives a real request over a real socket, and was
+  confirmed red against both the unhooked and the sync-hook-only variants.
+
+The guard depends on the credential reaching `resolved.secret_values`, which is why
+`sink_secret_env_names` derives `*_env` fields from the model rather than a hardcoded list. A
+credential written inline as `url:` is not a resolved secret and is redacted nowhere — in the
+event log, the DLQ, or a span.
+
+The SDK is configured in-process. Its `BatchSpanProcessor` runs a background thread that is not
+fork-safe, which is why SigNoz's Python docs recommend Gunicorn-with-Uvicorn-workers for
+multi-worker ASGI servers. That hazard does not apply here because `__main__.py` calls
+`uvicorn.run` with no `workers` argument — one process, no fork. **The constraint that creates:
+adding `--workers` later would silently stop exporting spans from the children.** That note
+lives next to `uvicorn.run` as well as here, because that is where someone reaching for it will
+be looking.
+
 ---
 
 ## Exposure model
@@ -239,7 +343,11 @@ So exposure is controlled where it actually lives:
 |---|---|
 | Host-side producers only | `-p 127.0.0.1:8080:8080` |
 | Reverse proxy only | join the proxy's network, publish nothing |
-| Public ingress | proxy with TLS and rate limiting; deny `/admin/` there |
+| Public ingress | proxy with TLS and rate limiting; deny `/admin/` and `/metrics` there |
+
+A source `path` may start with neither `/admin` nor `/metrics`, enforced in `config.py`. Both
+prefixes are expected to be denied at the proxy, and an ingest path living under one would be
+silently blocked by that rule.
 
 The packaged entry point runs uvicorn with `proxy_headers=False`. That is load-bearing: an
 unverified source's `allow_from` matches the **socket peer**, and enabling proxy headers would
@@ -271,7 +379,9 @@ loopback-only would be safe but invisible; a startup failure makes the decision 
 | `app.py` | HTTP: routes, limits, status codes | Contains verification or persistence |
 | `store/` | All SQL, behind the `Store` protocol | Knows about HTTP or sinks |
 | `sinks/` | Delivery to one destination type | Knows which source produced an event |
-| `engine.py` | Persist-then-dispatch, retry, DLQ, sweeps | Contains SQL or verification |
+| `engine.py` | Persist-then-dispatch, retry, DLQ, sweeps; redacting sink errors | Contains SQL or verification |
+| `metrics.py` | Counters, histograms, exposition rendering | Imports config, HTTP or storage |
+| `tracing.py` | Optional OTel setup and the span helper | Is ever required for the router to run |
 
 **No sink knows its source.** A sink that special-cases `if source == "github"` has let routing
 leak into delivery, and the abstraction that makes this a router rather than four glued-together

@@ -182,6 +182,42 @@ class TestSecretsNeverReachDisk:
 
         assert ADMIN_TOKEN.encode() not in read_all(db_path)
 
+    def test_a_secret_echoed_by_the_destination_is_absent_from_the_dlq(self, stack, httpx_mock):
+        """The destination's *reply* is the route redaction did not cover.
+
+        `redaction.py` runs at ingest, so it sees what the producer sent. `HttpSinkBase._send`
+        puts part of the destination's response body into the error message, and `mark_exhausted`
+        persisted that string verbatim — so a destination that echoes a submitted credential into
+        its own 400 page wrote that credential into the DLQ, on the same disk, in the column an
+        operator reads first. Asserted against raw bytes for the same reason as the cases above.
+        """
+        httpx_mock.add_response(
+            url=SINK_URL,
+            status_code=400,
+            text=f"rejected token {GITHUB_SECRET} is not valid for this channel",
+        )
+        client, engine, db_path = stack
+
+        client.post("/webhook/github", content=BODY, headers=headers())
+        run_batch(client, engine)
+
+        assert stats(client, engine)["dlq"] == 1, "expected the 400 to dead-letter"
+        assert GITHUB_SECRET.encode() not in read_all(db_path)
+
+    def test_the_destination_error_still_reaches_the_dlq(self, stack, httpx_mock):
+        """Redaction must not become deletion — the non-secret part is the diagnostic.
+
+        A fix that dropped the destination's body entirely would pass the test above and leave
+        an operator with `HTTP 400:` and nothing else.
+        """
+        httpx_mock.add_response(url=SINK_URL, status_code=400, text="channel_not_found")
+        client, engine, db_path = stack
+
+        client.post("/webhook/github", content=BODY, headers=headers())
+        run_batch(client, engine)
+
+        assert b"channel_not_found" in read_all(db_path)
+
     def test_a_discord_webhook_url_is_absent_from_the_database_file(self, tmp_path, httpx_mock):
         """The Discord/Slack credential is the *URL*, which is a shape redaction had not seen.
 
@@ -277,6 +313,115 @@ class TestAdminReplay:
         data["sources"][0]["path"] = "/admin/webhook"
         with pytest.raises(ValueError, match="/admin"):
             Config.model_validate(data)
+
+
+AUTH = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+
+
+def dead_letter(client: TestClient, engine: Engine, n: int) -> None:
+    """Drive `n` events all the way to the DLQ. `max_attempts` is 2, so one 400 is terminal."""
+    for i in range(n):
+        client.post("/webhook/github", content=BODY, headers=headers(BODY, f"dlq-{i}"))
+        run_batch(client, engine)
+
+
+class TestAdminDlq:
+    def test_requires_a_token(self, stack):
+        client, _, _ = stack
+        assert client.get("/admin/dlq").status_code == 401
+
+    def test_rejects_a_wrong_token(self, stack):
+        client, _, _ = stack
+        assert (
+            client.get("/admin/dlq", headers={"Authorization": "Bearer " + "x" * 36}).status_code
+            == 401
+        )
+
+    def test_a_short_token_is_rejected(self, stack):
+        """`check_admin_token` compares against the configured value, which has a length floor."""
+        client, _, _ = stack
+        assert client.get("/admin/dlq", headers={"Authorization": "Bearer abc"}).status_code == 401
+
+    def test_the_token_is_checked_before_the_queue_is_read(self, stack, httpx_mock):
+        """A populated DLQ and an empty one must be indistinguishable without a token.
+
+        Asserting on the *body* rather than only the status: a handler that queried first and
+        rejected second would still answer 401, but would have done the read — and any detail
+        that leaked into the error body would leak the queue's shape with it.
+        """
+        httpx_mock.add_response(url=SINK_URL, status_code=400, is_reusable=True)
+        client, engine, _ = stack
+        dead_letter(client, engine, 3)
+
+        response = client.get("/admin/dlq")
+        assert response.status_code == 401
+        assert response.json() == {"detail": "Unauthorized"}
+
+    def test_lists_the_failure_metadata_needed_to_replay(self, stack, httpx_mock):
+        httpx_mock.add_response(url=SINK_URL, status_code=400, text="channel_not_found")
+        client, engine, _ = stack
+        dead_letter(client, engine, 1)
+
+        body = client.get("/admin/dlq", headers=AUTH).json()
+        assert body["count"] == 1
+        entry = body["entries"][0]
+        assert entry["source"] == "github"
+        assert entry["sink"] == "notes"
+        assert entry["response_code"] is None or isinstance(entry["response_code"], int)
+        assert "channel_not_found" in entry["error"]
+        # The point of the endpoint: this is the id `POST /admin/replay/{id}` takes.
+        assert client.post(f"/admin/replay/{entry['event_id']}", headers=AUTH).status_code == 200
+
+    def test_the_response_carries_no_payload(self, stack, httpx_mock):
+        """Failure metadata, not stored request bodies. The event body is replay-only."""
+        httpx_mock.add_response(url=SINK_URL, status_code=400)
+        client, engine, _ = stack
+        dead_letter(client, engine, 1)
+
+        response = client.get("/admin/dlq", headers=AUTH)
+        entry = response.json()["entries"][0]
+        assert not {"payload", "body", "context", "headers"} & set(entry)
+        # Asserted on the raw text too — a nested field would satisfy the key check above.
+        assert "octocat" not in response.text
+        assert "Something broke" not in response.text
+
+    def test_limit_is_clamped_server_side(self, stack, httpx_mock):
+        """A cap the caller can raise is not a cap."""
+        httpx_mock.add_response(url=SINK_URL, status_code=400, is_reusable=True)
+        client, engine, _ = stack
+        dead_letter(client, engine, 3)
+
+        body = client.get("/admin/dlq?limit=100000", headers=AUTH).json()
+        assert body["limit"] == 100
+        assert body["count"] == 3
+
+    def test_keyset_paging_returns_each_row_exactly_once(self, stack, httpx_mock):
+        httpx_mock.add_response(url=SINK_URL, status_code=400, is_reusable=True)
+        client, engine, _ = stack
+        dead_letter(client, engine, 5)
+
+        first = client.get("/admin/dlq?limit=2", headers=AUTH).json()
+        assert first["count"] == 2
+        second = client.get(
+            f"/admin/dlq?limit=2&before_id={first['next_before_id']}", headers=AUTH
+        ).json()
+
+        ids = [e["id"] for e in first["entries"] + second["entries"]]
+        assert ids == sorted(ids, reverse=True), "newest first, across the page boundary"
+        assert len(set(ids)) == 4, "no row returned twice"
+
+    def test_a_short_page_offers_no_cursor(self, stack, httpx_mock):
+        """Otherwise a client loops forever on an exhausted queue."""
+        httpx_mock.add_response(url=SINK_URL, status_code=400, is_reusable=True)
+        client, engine, _ = stack
+        dead_letter(client, engine, 2)
+
+        assert client.get("/admin/dlq?limit=50", headers=AUTH).json()["next_before_id"] is None
+
+    def test_an_empty_queue_is_200_not_404(self, stack):
+        client, _, _ = stack
+        body = client.get("/admin/dlq", headers=AUTH).json()
+        assert body == {"count": 0, "limit": 50, "next_before_id": None, "entries": []}
 
 
 class TestHealthWithEngine:

@@ -27,8 +27,19 @@ class SinkError(WebhookDoormanError):
     a backoff. Raise `PermanentSinkError` instead when a retry cannot possibly succeed.
     """
 
-    def __init__(self, *args: object, retry_after: float | None = None) -> None:
+    def __init__(
+        self, *args: object, retry_after: float | None = None, latency_ms: int = 0
+    ) -> None:
         super().__init__(*args)
+        self.latency_ms = latency_ms
+        """How long the failed attempt took, in milliseconds. `0` when nothing was sent.
+
+        Carried on the exception because a failure has no `DeliveryOutcome` to put it on, and
+        discarding it would leave the latency histogram fed only by successes — which hides the
+        one case it exists to show. A destination that is slow *and* failing would improve its
+        own p99 as it got worse.
+        """
+
         self.retry_after = retry_after
         """Seconds the destination asked us to wait, from its `Retry-After` header.
 

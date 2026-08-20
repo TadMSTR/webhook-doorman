@@ -33,10 +33,23 @@ delivery:
   poll_interval_seconds: 1
 
 admin:
-  # POST /admin/replay/{event_id} re-fires a stored event. Disabled unless this variable is set
-  # AND holds at least `min_token_length` characters. Never route /admin/ through a public proxy.
+  # POST /admin/replay/{event_id} re-fires a stored event, and GET /admin/dlq lists what has
+  # dead-lettered (failure metadata only — never the payload). Both are disabled unless this
+  # variable is set AND holds at least `min_token_length` characters. Never route /admin/
+  # through a public proxy.
   token_env: ADMIN_TOKEN
   min_token_length: 32
+
+# GET /metrics serves the Prometheus text format. It is UNAUTHENTICATED unless you set
+# `token_env` below — that is the scrape convention, and a mandatory token breaks a stock
+# scrape_config. It exposes your source and sink *names* and traffic volume; never a payload,
+# a header or a secret. Deny /metrics at the reverse proxy, exactly like /admin/, and scrape it
+# from inside the network.
+#
+# metrics:
+#   token_env: METRICS_TOKEN     # optional. A value shorter than min_token_length is treated as
+#   min_token_length: 32         # absent and leaves the endpoint OPEN — logged at boot as
+#                                # `metrics_unauthenticated`.
 
 # ---------------------------------------------------------------------------------------------
 # Sources — one entry per producer. Adding a producer is an entry here, not a code change.

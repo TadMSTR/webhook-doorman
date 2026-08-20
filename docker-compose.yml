@@ -13,7 +13,7 @@ services:
   webhook-doorman:
     # Pinned, not :latest. A floating tag means `docker compose pull` can change what is running
     # without anything in this file changing — including across a breaking release.
-    image: ghcr.io/tadmstr/webhook-doorman:0.1.1
+    image: ghcr.io/tadmstr/webhook-doorman:0.3.0
     container_name: webhook-doorman
     restart: unless-stopped
 
@@ -57,8 +57,9 @@ services:
         max-size: "10m"
         max-file: "3"
 
-# Serving public traffic? Drop the `ports:` block, join the proxy's network, and deny /admin/
-# at the proxy -- the replay endpoint re-fires real events.
+# Serving public traffic? Drop the `ports:` block, join the proxy's network, and deny both
+# /admin/ and /metrics at the proxy -- the replay endpoint re-fires real events, and /metrics is
+# unauthenticated by default (scrape convention) and exposes your source and sink names.
 #
 #     networks: [proxy]
 #

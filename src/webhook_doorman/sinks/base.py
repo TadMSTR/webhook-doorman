@@ -26,6 +26,11 @@ import httpx
 
 from ..errors import PermanentSinkError, SinkError
 
+# How much of a destination's response body travels back in an error message. Chosen small on
+# purpose: 200 characters of an arbitrary error page is rarely more diagnostic than 80, and it is
+# 120 more characters of someone else's output to store, log and export.
+DESTINATION_BODY_CHARS = 80
+
 
 @dataclass(frozen=True)
 class DeliveryOutcome:
@@ -79,10 +84,16 @@ class Sink(Protocol):
 class HttpSinkBase:
     """Shared HTTP mechanics: timing, status classification, error translation.
 
-    Status handling is the part worth stating explicitly. 4xx is permanent *except* 408 and 429,
-    which are the two the server is explicitly asking you to try again. On those, and on 5xx,
-    a `Retry-After` header is carried back to the engine on the `SinkError` rather than
-    discarded — see `parse_retry_after`.
+    Status handling is the part worth stating explicitly. Only 2xx is delivered. 4xx is permanent
+    *except* 408 and 429, which are the two the server is explicitly asking you to try again. On
+    those, and on 5xx, a `Retry-After` header is carried back to the engine on the `SinkError`
+    rather than discarded — see `parse_retry_after`.
+
+    **3xx is permanent, not delivered.** The engine builds its client with
+    `follow_redirects=False` on purpose, because a webhook URL embeds its own credential and
+    following an attacker-influenced `Location` would hand that credential elsewhere. An
+    un-followed redirect therefore delivers nothing, and counting it as success is the silent
+    failure this class's `_classify` docstring warns about.
 
     That rule is a default, not a law: a destination that overloads a status code overrides
     `_classify`. See its docstring for when, and for why the safe direction is to prefer the
@@ -110,10 +121,19 @@ class HttpSinkBase:
             # `NtfySink_`); this is the net under them, and it is what keeps a sink safe by
             # default when its message routinely carries an em-dash or an emoji.
             raise PermanentSinkError(f"{self.name}: cannot encode request: {exc}") from exc
+        # Both failure paths carry the elapsed time, not just the message. A timeout is the
+        # slowest thing a sink does and a connect failure can take seconds to give up; recording
+        # either as 0ms would put the worst latencies in the fastest bucket and flatter the
+        # histogram exactly when the destination is at its worst.
         except httpx.TimeoutException as exc:
-            raise SinkError(f"{self.name}: timeout after {_elapsed(started)}ms: {exc}") from exc
+            raise SinkError(
+                f"{self.name}: timeout after {_elapsed(started)}ms: {exc}",
+                latency_ms=_elapsed(started),
+            ) from exc
         except httpx.HTTPError as exc:
-            raise SinkError(f"{self.name}: transport error: {exc}") from exc
+            raise SinkError(
+                f"{self.name}: transport error: {exc}", latency_ms=_elapsed(started)
+            ) from exc
 
         latency = _elapsed(started)
         code = response.status_code
@@ -122,7 +142,12 @@ class HttpSinkBase:
         if verdict.disposition is Disposition.DELIVERED:
             return DeliveryOutcome(response_code=code, latency_ms=latency)
 
-        detail = verdict.reason or response.text[:200]
+        # The destination's own body, and therefore the one part of this message that is not
+        # ours. It is carried because "HTTP 400" alone rarely says which field was wrong, but it
+        # is cut short and redacted at the engine boundary before it is persisted or logged —
+        # destinations have been known to echo a submitted token back in an error page, and
+        # `redaction.py` runs at ingest only. See `Engine._redact_error`.
+        detail = verdict.reason or response.text[:DESTINATION_BODY_CHARS]
         if verdict.disposition is Disposition.RETRYABLE:
             # A destination that says when to come back is answering the question the backoff
             # curve is guessing at. Read it on every retryable status rather than only 429 —
@@ -131,8 +156,9 @@ class HttpSinkBase:
             raise SinkError(
                 f"{self.name}: HTTP {code}: {detail}",
                 retry_after=parse_retry_after(response.headers.get("retry-after")),
+                latency_ms=latency,
             )
-        raise PermanentSinkError(f"{self.name}: HTTP {code}: {detail}")
+        raise PermanentSinkError(f"{self.name}: HTTP {code}: {detail}", latency_ms=latency)
 
     def _classify(self, response: httpx.Response) -> Verdict:
         """What this response means. Override to correct a destination that disagrees with HTTP.
@@ -156,11 +182,28 @@ class HttpSinkBase:
         `response.json()` here rather than adding a second check in `deliver`.
         """
         code = response.status_code
-        if code < 400:
+        if code < 300:
             return Verdict(Disposition.DELIVERED)
+        if code < 400:
+            return Verdict(Disposition.PERMANENT, _redirect_reason(response))
         if code in (408, 429) or code >= 500:
             return Verdict(Disposition.RETRYABLE)
         return Verdict(Disposition.PERMANENT)
+
+
+def _redirect_reason(response: httpx.Response) -> str:
+    """Why a 3xx is a configuration error, named concretely enough to act on.
+
+    The `Location` value is destination-controlled, so it is truncated and carried as text only —
+    nothing in this codebase follows it. It is here because "301 to https://..." tells an operator
+    they typed `http://` in one glance, and a bare "HTTP 301" does not.
+    """
+    location = response.headers.get("location")
+    target = f" to {location[:120]}" if location else ""
+    return (
+        f"destination redirected{target}; redirects are not followed because a webhook URL "
+        f"carries its own credential — point the sink at the final URL"
+    )
 
 
 def parse_retry_after(value: str | None, *, now: datetime | None = None) -> float | None:

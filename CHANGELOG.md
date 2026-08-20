@@ -5,6 +5,91 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-08-20
+
+Observability. The logging half of this project was always good — structured JSON, stable event
+names — but there was no numeric telemetry at all, and the dead-letter queue was write-only: the
+repo shipped a replay endpoint with no way to discover what to replay.
+
+**Read the Changed section before upgrading.** A 3xx response is no longer counted as a
+successful delivery, which is a behaviour change for every sink.
+
+### Added
+
+- **`GET /admin/dlq`.** Lists dead-lettered deliveries, newest first, behind the same bearer
+  token as replay and checked before any database read. This is how you find the `event_id` for
+  `POST /admin/replay/{event_id}`. Returns **failure metadata only** — `event_id`, `source`,
+  `sink`, `attempt`, `response_code`, `error`, `exhausted_at` — and never the payload; the event
+  body stays retrievable only by deliberately replaying it. Keyset pagination on `id` rather
+  than `OFFSET`, because the retention sweep deletes rows underneath a paging client and
+  `OFFSET` silently skips one for every deletion behind the cursor. `limit` is clamped
+  server-side at 100.
+- **`GET /metrics`.** Prometheus text exposition, emitted directly — **no `prometheus_client`
+  dependency**; the default install stays at nine. Counters for events received, deduplicated,
+  verification failures, pre-verification rejections and delivery attempts by outcome; gauges
+  for the current events, deliveries-by-status and DLQ counts; `build_info` and
+  `process_start_time_seconds`. Every config-derived series is initialised at zero, so "no
+  failures yet" is distinguishable from "target not reporting".
+
+  The gauges are point-in-time and deliberately **not** named `_total` — they go down when the
+  retention sweep runs, and a counter that goes down is a reset to Prometheus. No label is
+  producer-controlled: `event_type` and `response_code` are unbounded and stay in the log line.
+
+  Unauthenticated by default, which is the scrape convention — a mandatory token breaks a stock
+  `scrape_config`. It exposes source and sink names and traffic volume, never a payload or a
+  secret. Deny it at the reverse proxy alongside `/admin/`, or set `metrics.token_env`.
+- **`webhook_doorman_delivery_latency_seconds`**, a histogram with fixed buckets, labelled by
+  sink. Observed on **every settled attempt including failures** — a destination that is slow
+  *and* failing is the case you most want to see, and a histogram fed only by successes improves
+  its own p99 as the destination gets worse. Timeouts and transport errors carry their real
+  elapsed time rather than zero.
+- **Optional OpenTelemetry**, behind a `[otel]` extra and off unless
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set. One span per ingest and one per delivery attempt,
+  correlated by `delivery_id` rather than parented — a retry runs in the background worker
+  minutes after its request finished. Spans carry only config-derived and structural attributes;
+  no payload content, headers or rendered template output. The published Docker image includes
+  the extra, so enabling tracing there is one environment variable.
+- **`metrics.token_env`** and **`metrics.min_token_length`** config keys.
+
+### Changed
+
+- **A `3xx` response is now a permanent failure, not a successful delivery.** The engine sets
+  `follow_redirects=False` on purpose — a Discord or Slack webhook URL embeds its own credential,
+  and following an attacker-influenced `Location` would hand it over — so an un-followed redirect
+  delivers nothing. It was being recorded as a success: no retry, no DLQ row, nothing above
+  debug. An operator who typed `http://` at an instance redirecting to `https://` had a sink
+  reporting every delivery as successful while notifying nobody. The dead-letter reason names the
+  `Location` header.
+
+  **If your destination legitimately answers 3xx, it will now dead-letter.** Point the sink at
+  the final URL. This is why 0.3.0 is a minor release.
+- A source `path` may no longer start with `/metrics`, for the same reason it may not start with
+  `/admin`: both are expected to be denied at the reverse proxy, and an ingest path under either
+  would be silently blocked by that rule.
+- The destination response body carried in a delivery error is truncated to 80 characters,
+  down from 200.
+
+### Fixed
+
+- **Delivery error text reached the dead-letter queue unredacted.** Redaction runs at the ingest
+  boundary, so it covers what a producer sent — it never covered what a *destination* sent back,
+  and `HttpSinkBase._send` puts part of that response body into the error message that
+  `mark_exhausted` persists verbatim. A destination echoing a submitted credential into its own
+  `400` page wrote that credential into the DLQ, where it survived every backup of the SQLite
+  file. Redaction now also runs at the engine boundary, on both store-writing paths and on the
+  log line. Fixed **before** `GET /admin/dlq` shipped, so the column was never exposed over HTTP
+  unredacted.
+- **Sink credentials would have been exported on trace spans.** Enabling tracing also enables
+  OTel's automatic `httpx` instrumentation, which records the full request URL on every client
+  span — and for Discord and Slack the webhook URL *is* the credential, while for Apprise it is
+  the `key` path segment. Resolved secrets are now scrubbed from span attributes before export,
+  matching by value rather than by attribute name so the guard survives OTel's in-progress
+  `http.url` → `url.full` rename. Found in the pre-release audit; never shipped.
+
+  Note the limit: this covers credentials declared through a `*_env` field, which is how every
+  bundled sink declares one. A `type: http` sink with an authenticated URL written inline as
+  `url:` is not a resolved secret and is redacted nowhere — use `url_env`.
+
 ## [0.2.0] — 2026-08-20
 
 Three new sinks. Discord and Slack were already reachable through `type: http`, and that was the
@@ -188,6 +273,7 @@ First release. Security-audited before tagging: one Medium finding, resolved bel
   redacted before storage, collapsing every event onto one dedup id and silently discarding all
   but the first.
 
+[0.3.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.3.0
 [0.2.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.2.0
 [0.1.1]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.1.1
 [0.1.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.1.0

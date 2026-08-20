@@ -15,6 +15,7 @@ A source is either enabled or it rejects. There is no third state, and in partic
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -24,9 +25,10 @@ import structlog
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import __version__
+from . import __version__, tracing
 from .config import Config, NoneVerify, load_config
-from .models import InboundEvent
+from .metrics import METRICS
+from .models import DlqEntry, InboundEvent
 from .parsers import get_parser, parse
 from .redaction import redact_bytes, redact_headers, redact_json, redact_text
 from .secrets import Resolved, SourceState, resolve
@@ -49,6 +51,7 @@ class EngineLike(Protocol):
     async def ingest(self, event: InboundEvent) -> dict[str, Any]: ...
     async def replay(self, event_id: int) -> dict[str, Any]: ...
     async def stats(self) -> dict[str, int]: ...
+    async def list_dlq(self, *, limit: int, before_id: int | None = None) -> list[DlqEntry]: ...
     def check_admin_token(self, presented: str) -> bool: ...
 
 
@@ -156,12 +159,22 @@ def build_source_route(
                 # 503, not 401: the caller's credentials were never the problem, and a producer
                 # that distinguishes them can back off instead of rotating a working secret.
                 log.warning("source_disabled_rejected", reason=state.disabled_reason)
+                METRICS.increment(
+                    "webhook_doorman_requests_rejected_total",
+                    source=source.name,
+                    reason="source_disabled",
+                )
                 raise HTTPException(status_code=503, detail="Source is not available")
 
             try:
                 body = await read_body_capped(request, max_body)
             except BodyTooLarge:
                 log.warning("body_too_large", limit=max_body)
+                METRICS.increment(
+                    "webhook_doorman_requests_rejected_total",
+                    source=source.name,
+                    reason="body_too_large",
+                )
                 raise HTTPException(status_code=413, detail="Payload too large") from None
 
             headers = lowered_headers(request)
@@ -175,6 +188,15 @@ def build_source_route(
             if not result.ok:
                 # The reason goes to the log, never to the caller.
                 log.warning("verification_failed", reason=result.reason)
+                # The rejection *rate* is the security-relevant signal for a fail-closed
+                # router — a rise here means someone is probing an endpoint, and before this
+                # counter that was only discoverable by grepping logs after the fact. The
+                # `reason` is deliberately not a label: it is attacker-influenced.
+                METRICS.increment(
+                    "webhook_doorman_verification_failures_total",
+                    source=source.name,
+                    strategy=source.verify.strategy,
+                )
                 raise HTTPException(status_code=401, detail="Unauthorized")
 
             # Redact once, here, and derive everything downstream from the redacted bytes.
@@ -217,8 +239,14 @@ def _safe_json(body: bytes) -> Any:
         return None
 
 
+#: Server-side ceiling on `GET /admin/dlq?limit=`, applied whatever the caller asks for. A cap
+#: the caller can raise is not a cap; this is the one that holds.
+DLQ_MAX_LIMIT = 100
+DLQ_DEFAULT_LIMIT = 50
+
+
 def build_admin_router(engine: EngineLike) -> APIRouter:
-    """The replay API.
+    """The replay and DLQ-triage API.
 
     Two independent controls, because replay re-fires real events at real destinations:
 
@@ -242,6 +270,51 @@ def build_admin_router(engine: EngineLike) -> APIRouter:
             return await engine.replay(event_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="Event not found") from exc
+
+    @router.get("/dlq")
+    async def list_dlq(
+        limit: int = DLQ_DEFAULT_LIMIT,
+        before_id: int | None = None,
+        authorization: str = Header(default=""),
+    ) -> dict[str, Any]:
+        """What is in the dead-letter queue, newest first.
+
+        This is the other half of `POST /admin/replay/{event_id}`, which until now pointed at
+        ids an operator had no way to discover short of opening the SQLite file.
+
+        The response carries **failure metadata only** — see `DlqEntry`. `next_before_id` is the
+        cursor for the following page and is `None` on the last one; feeding it back as
+        `before_id` is stable across a concurrent retention sweep in a way `OFFSET` is not.
+        """
+        presented = authorization.removeprefix("Bearer ").strip()
+        if not engine.check_admin_token(presented):
+            # Before the query, like `replay` above: an unauthenticated caller must not be able
+            # to tell a populated DLQ from an empty one by response timing or shape.
+            log.warning("admin_auth_failed", path="/admin/dlq")
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        effective = max(1, min(limit, DLQ_MAX_LIMIT))
+        entries = await engine.list_dlq(limit=effective, before_id=before_id)
+        return {
+            "count": len(entries),
+            "limit": effective,
+            # Only offer a cursor on a full page. A short page means the DLQ is exhausted, and
+            # handing back a cursor there invites a client to loop on an empty result forever.
+            "next_before_id": entries[-1].id if len(entries) == effective else None,
+            "entries": [
+                {
+                    "id": e.id,
+                    "event_id": e.event_id,
+                    "source": e.source,
+                    "sink": e.sink,
+                    "attempt": e.attempt,
+                    "response_code": e.response_code,
+                    "error": e.error,
+                    "exhausted_at": e.exhausted_at.isoformat(),
+                }
+                for e in entries
+            ],
+        }
 
     return router
 
@@ -318,6 +391,48 @@ def build_health_route(
     return health
 
 
+#: `text/plain; version=0.0.4` is the Prometheus exposition content type. A scraper will parse
+#: a bare `text/plain` too, but sending the versioned form is what the format specifies.
+EXPOSITION_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+
+
+def build_metrics_route(
+    resolved: Resolved, engine: EngineLike | None = None
+) -> Callable[[str], Awaitable[Response]]:
+    """`GET /metrics`: Prometheus exposition.
+
+    Unauthenticated unless `metrics.token_env` is configured — see `MetricsConfig` for that
+    decision and its three mitigations. When a token *is* configured, a wrong one is 401.
+
+    The gauges come from `store.stats()`, which runs `COUNT(*)` over three tables plus a GROUP
+    BY on every scrape. That is nothing at this volume; at a hundred times the traffic, or on a
+    store with a million rows, it is the first thing to reach for. A store error degrades the
+    response to counters-only rather than failing it: the counters are what an alert is usually
+    evaluating, and a 500 here reads to a scraper as "the target is down", which is a worse and
+    less true statement than "the gauges are missing".
+    """
+
+    async def metrics(authorization: str = Header(default="")) -> Response:
+        expected = resolved.metrics_token()
+        if expected is not None:
+            presented = authorization.removeprefix("Bearer ").strip()
+            if not hmac.compare_digest(expected, presented):
+                log.warning("metrics_auth_failed")
+                raise HTTPException(status_code=401, detail="Unauthorized")
+
+        stats: dict[str, int] | None = None
+        if engine is not None:
+            try:
+                stats = await engine.stats()
+            except Exception as exc:
+                log.warning("metrics_stats_failed", error=str(exc))
+
+        body = METRICS.render(version=__version__, stats=stats)
+        return Response(content=body, media_type=EXPOSITION_CONTENT_TYPE)
+
+    return metrics
+
+
 def log_startup_state(resolved: Resolved) -> None:
     """Announce disabled sources and unverified sources at boot.
 
@@ -348,6 +463,19 @@ def log_startup_state(resolved: Resolved) -> None:
             reason=(
                 f"{resolved.config.admin.token_env} is unset or shorter than "
                 f"{resolved.config.admin.min_token_length} characters"
+            ),
+        )
+
+    # The one fail-*open* case in this file, so it gets said out loud. An operator who set
+    # `metrics.token_env` believes /metrics is gated; if the variable is unset or too short it
+    # is not, and the only visible difference is a scrape that keeps working.
+    if resolved.config.metrics.token_env and resolved.metrics_token() is None:
+        log.warning(
+            "metrics_unauthenticated",
+            reason=(
+                f"{resolved.config.metrics.token_env} is unset or shorter than "
+                f"{resolved.config.metrics.min_token_length} characters — /metrics is serving "
+                f"without a token; deny it at the reverse proxy"
             ),
         )
 
@@ -405,8 +533,20 @@ def create_app(
     app.state.resolved = resolved
     app.state.engine = engine
 
+    # No-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set *and* the [otel] extra is installed.
+    # Never raises for either — see tracing.py. `secret_values` is not optional in practice:
+    # without it the httpx auto-instrumentation exports Discord and Slack webhook URLs, which
+    # are themselves the credential.
+    tracing.configure(app, secret_values=resolved.secret_values)
+
+    METRICS.initialise(
+        sources={name: s.config.verify.strategy for name, s in resolved.sources.items()},
+        sinks=resolved.sinks,
+    )
+
     router = APIRouter()
     router.add_api_route("/health", build_health_route(resolved, engine), methods=["GET"])
+    router.add_api_route("/metrics", build_metrics_route(resolved, engine), methods=["GET"])
 
     handler = ingest or (engine.ingest if engine is not None else _log_only_ingest)
     for name, state in resolved.sources.items():

@@ -185,11 +185,84 @@ Control exposure at the boundary that actually has it:
 |---|---|
 | Host-side producers only | `-p 127.0.0.1:8080:8080` |
 | Reverse proxy only | join the proxy's network, publish **nothing** |
-| Public ingress | reverse proxy with TLS and rate limiting; block `/admin/` there |
+| Public ingress | reverse proxy with TLS and rate limiting; block `/admin/` **and `/metrics`** there |
 
 `POST /admin/replay/{event_id}` re-fires a stored event. It requires a token of at least 32
 characters and is disabled entirely without one — and it should never be routed through a public
 reverse proxy.
+
+A source `path` may not start with `/admin` or `/metrics`. That is not stylistic: if an ingest
+path could live under either prefix, a deny rule at the proxy would silently block it.
+
+## Observability
+
+Structured JSON logs to stdout have always been there. As of 0.3.0 there are numbers too.
+
+### `GET /metrics`
+
+Prometheus text format, no `prometheus_client` dependency. Unauthenticated by default — that is
+the scrape convention, and requiring a token breaks a stock `scrape_config`. It exposes your
+source and sink *names* and your traffic volume; it never exposes a payload, a header or a
+secret. **Deny it at the reverse proxy, alongside `/admin/`.** Set `metrics.token_env` if you
+want a bearer gate and can live with a non-standard scrape config.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `webhook_doorman_events_received_total` | counter | `source` |
+| `webhook_doorman_events_deduplicated_total` | counter | `source` |
+| `webhook_doorman_verification_failures_total` | counter | `source`, `strategy` |
+| `webhook_doorman_requests_rejected_total` | counter | `source`, `reason` |
+| `webhook_doorman_delivery_attempts_total` | counter | `sink`, `outcome` |
+| `webhook_doorman_delivery_latency_seconds` | histogram | `sink` |
+| `webhook_doorman_events_stored` | **gauge** | — |
+| `webhook_doorman_deliveries` | **gauge** | `status` |
+| `webhook_doorman_dlq_size` | **gauge** | — |
+| `webhook_doorman_build_info` | gauge | `version` |
+
+The gauges are point-in-time table counts and can go *down* when the retention sweep runs, which
+is why none of them is named `_total`. The counters reset when the process restarts — correct
+Prometheus semantics, and `process_start_time_seconds` is exported so a scraper can tell a reset
+from a real drop.
+
+`webhook_doorman_verification_failures_total` is the one to alert on. For a fail-closed router
+the rejection rate is the security signal: a rise means something is probing an endpoint.
+
+### `GET /admin/dlq`
+
+Lists dead-lettered deliveries, newest first, behind the same bearer token as replay. This is
+how you find the `event_id` to hand to `POST /admin/replay/{event_id}`.
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  'http://localhost:8080/admin/dlq?limit=20'
+```
+
+It returns failure metadata — `event_id`, `source`, `sink`, `attempt`, `response_code`, `error`,
+`exhausted_at` — and **not the payload**. Pass the `next_before_id` from one page back as
+`before_id` to get the next; that cursor is stable even while the retention sweep is deleting
+rows underneath you.
+
+### Tracing
+
+Optional, off unless configured, and behind an extra:
+
+```bash
+pip install 'webhook-doorman[otel]'
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318
+export OTEL_SERVICE_NAME=webhook-doorman   # optional
+```
+
+The published Docker image already includes the extra, so there it is just the environment
+variable. Setting the endpoint *without* the extra installed logs a warning at boot and the
+router runs normally — telemetry is not worth taking a router down for. Spans carry only
+config-derived and structural attributes; no payload content, headers or rendered template
+output are ever exported.
+
+Enabling tracing also enables OTel's automatic `httpx` instrumentation, which records the full
+destination URL. For Discord and Slack that URL *is* the credential, so every resolved secret is
+scrubbed from span attributes before export. Declare any credential-bearing URL through `*_env`
+(`webhook_url_env`, `key_env`, `url_env`) rather than inline — an inline `url:` is not a resolved
+secret and is redacted nowhere.
 
 ## Alternatives
 

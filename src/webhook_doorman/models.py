@@ -103,3 +103,28 @@ class Delivery:
     response_code: int | None = None
     latency_ms: int | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class DlqEntry:
+    """One dead-lettered delivery, as `GET /admin/dlq` reports it.
+
+    **Failure metadata only — no payload, no headers, no rendered body.** The question this
+    answers is "what failed, why, and which `event_id` do I replay"; the event body is already
+    retrievable by replaying it. A list endpoint that returned stored request bodies would be a
+    far larger exfiltration surface than one that returns why a POST got a 400, and it would be
+    reachable with the single admin token rather than requiring a deliberate replay.
+
+    `id` is the DLQ row id and exists to be a pagination cursor. `event_id` is what you hand to
+    `POST /admin/replay/{event_id}`; they are different numbers and confusing them replays the
+    wrong event.
+    """
+
+    id: int
+    event_id: int
+    source: str
+    sink: str
+    attempt: int
+    response_code: int | None
+    error: str | None
+    exhausted_at: datetime

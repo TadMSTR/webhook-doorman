@@ -81,6 +81,17 @@ def main(argv: list[str] | None = None) -> int:
     app = create_app(resolved=resolved, engine=engine)
 
     log.info("starting", version=__version__, port=args.port, config=args.config)
+    # NOTE: no `workers=`. Keep it that way, or make tracing's setup fork-aware first.
+    #
+    # `tracing.configure` builds the OTel SDK in this process, and the SDK's
+    # `BatchSpanProcessor` runs a background thread that is not fork-safe. One process means no
+    # fork and the in-process setup is safe. Adding `--workers` here would fork *after* that
+    # setup and silently stop exporting spans from the children — no error, no log line, just a
+    # service that gradually looks idle in SigNoz. The documented workaround for a genuinely
+    # multi-worker ASGI deployment is Gunicorn with Uvicorn workers and per-worker SDK init.
+    #
+    # Also note the store: SQLite has a single writer, so more workers is not the scaling lever
+    # it looks like here. ARCHITECTURE.md records the revisit trigger.
     uvicorn.run(app, host="0.0.0.0", port=args.port, proxy_headers=False, access_log=False)
     return 0
 
