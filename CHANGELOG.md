@@ -5,6 +5,54 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] — 2026-08-20
+
+A correctness pass. Four places where the documented behaviour and the shipped behaviour had
+drifted apart, all of them in the fail-closed direction the project exists to guarantee.
+
+### Changed
+
+- **`/health` now returns `503` when the router cannot do its job**, with `"status": "degraded"`
+  and a `degraded` list naming why. It previously returned `200` and `"status": "ok"`
+  unconditionally, which meant the image's `HEALTHCHECK` could not fail for any reason short of
+  the process dying. **This is the one change an existing adopter's monitoring could notice.**
+
+  Degraded means *no source is enabled*, or *the store is unreachable*. A partially degraded
+  router — one source disabled out of several — still returns `200`, because a disabled source
+  is usually a deliberate operator state and flapping a container on it would be a worse answer
+  than the silence it replaces. The disabled source is named in the body either way.
+- `sink_secret_env_names()` derives a sink's credentials from the model instead of a hardcoded
+  `("token_env", "room_env", "topic_env", "url_env")` tuple. Any `*_env` field is now found
+  automatically. A sink with a credential field outside that tuple was reported `enabled: true`
+  at `/health` with its variable unset, and its value never entered the redaction set — so it
+  was never redacted from the stored event. No bundled sink was affected; every sink added from
+  here on is.
+- A retryable response carrying `Retry-After` now schedules the next attempt against the
+  advertised delay instead of the exponential curve. Both RFC 9110 forms are accepted. The
+  value is clamped to `delivery.max_backoff_seconds` and still jittered — an unclamped delay
+  would let a destination park a delivery indefinitely without it ever reaching the DLQ.
+- `/health` includes a `stats` block (event, delivery and DLQ counts) when an engine is
+  attached. `stats()` was implemented at three layers and called from nowhere but tests.
+
+### Fixed
+
+- **The `ntfy` sink no longer fails on a non-ASCII title.** An em-dash, curly quote, accented
+  name or emoji in the rendered `title_template` raised `UnicodeEncodeError` inside httpx,
+  escaped the sink's error handling, and burned every retry on a failure that could never
+  succeed. Titles are now RFC 2047 encoded-words (`=?UTF-8?B?…?=`) when — and only when — they
+  contain non-ASCII, which ntfy documents and decodes.
+- `HttpSinkBase` treats any `UnicodeError` as a permanent failure, so an unencodable request
+  reaches the DLQ on the first attempt rather than after `max_attempts` of identical failures.
+
+### Added
+
+- `LOG_FORMAT=console` selects structlog's `ConsoleRenderer` for local development. The default
+  stays `json`; anything unrecognised falls back to `json` rather than to a surprise.
+- Request-scoped log context: every line emitted while handling a request carries `source`, and
+  `delivery_id` once it is known. A `verification_failed` or `body_too_large` line previously
+  carried a source name and nothing else, so a 401 could not be correlated with the request
+  that caused it.
+
 ## [0.1.0] — 2026-08-20
 
 First release. Security-audited before tagging: one Medium finding, resolved below.

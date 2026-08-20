@@ -13,6 +13,7 @@ sink it is a config entry.
 
 from __future__ import annotations
 
+import base64
 import json
 import time
 from typing import Any
@@ -34,6 +35,25 @@ def _resolve_url(spec: Any, secrets: dict[str, str]) -> str:
     if not value:
         raise PermanentSinkError(f"{spec.name}: {spec.url_env} is unset")
     return value.rstrip("/")
+
+
+def _encoded_word(value: str) -> str:
+    """An HTTP header value safe to send as ASCII, RFC 2047-encoding it only if it has to.
+
+    Header values go out as ASCII — httpx raises `UnicodeEncodeError` from inside
+    `client.request` otherwise — but the content rendered into them is event data, and event
+    data is full of em-dashes, curly quotes and accented names. ntfy documents RFC 2047
+    encoded-words for exactly this (`=?UTF-8?B?<base64>?=`) and decodes them back for display.
+
+    Encoding only when needed is deliberate: an ASCII title stays readable in a packet capture,
+    in a server log, and to any tool downstream that has not implemented RFC 2047.
+    """
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError:
+        encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
+        return f"=?UTF-8?B?{encoded}?="
+    return value
 
 
 class MatrixMessageSink(HttpSinkBase):
@@ -86,7 +106,7 @@ class NtfySink_(HttpSinkBase):
             raise PermanentSinkError(f"{self.name}: {self.spec.topic_env} is unset")
 
         headers = {
-            "Title": render(self.spec.title_template, context),
+            "Title": _encoded_word(render(self.spec.title_template, context)),
             "Tags": self.spec.tags,
         }
         if self.spec.token_env:

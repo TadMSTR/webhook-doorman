@@ -154,9 +154,39 @@ cutover looks fine and delivers nothing.
 
 ---
 
+## Health
+
+`GET /health` answers with a status code as well as a body, and the image's `HEALTHCHECK` polls
+it, so the code is what decides whether the container is healthy.
+
+| Condition | Code | `status` |
+|---|---|---|
+| Serving normally | `200` | `ok` |
+| Some sources disabled, at least one enabled | `200` | `ok` |
+| No source enabled at all | `503` | `degraded` |
+| Store unreachable | `503` | `degraded` |
+
+A partial degradation stays healthy on purpose. One disabled source out of several is usually
+deliberate — a secret not provisioned yet, a producer retired in place — and turning that into an
+unhealthy container would mean a restart loop over a state you chose. The disabled source is
+named in `sources`, with the reason, either way; that is where you look, not at the status code.
+
+When `status` is `degraded`, the `degraded` array names each reason. When an engine is attached,
+a `stats` block carries event, delivery and DLQ counts; it is omitted rather than fatal if the
+store cannot answer, and that omission is itself one of the degraded conditions.
+
+---
+
 ## Operating
 
-**Logs** are JSON on stdout. `LOG_LEVEL=DEBUG` for more. Events worth alerting on:
+**Logs** are JSON on stdout. `LOG_LEVEL=DEBUG` for more. `LOG_FORMAT=console` switches to
+human-readable output for local development — leave it unset in a container, where a parseable
+stream is the point.
+
+Every line emitted while handling a request carries `source`, and `delivery_id` once it is
+known, so a rejection can be traced back to the request that caused it.
+
+Events worth alerting on:
 
 | Event | Meaning |
 |---|---|
@@ -165,6 +195,7 @@ cutover looks fine and delivers nothing.
 | `verification_failed` | Someone sent an unsigned or mis-signed request. |
 | `delivery_exhausted` | A delivery gave up and went to the DLQ. |
 | `deliveries_requeued` | Recovery after an unclean shutdown. Expected after a restart. |
+| `health_stats_failed` | `/health` could not read the store. The container is reporting 503. |
 
 **Backups.** The database holds the event log — no credentials, by design, and there is a test
 asserting exactly that against the raw file. Back up `/data` if you want the replay history;

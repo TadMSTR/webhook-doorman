@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import base64
+from datetime import UTC, datetime
+
 import httpx
 import pytest
 
 from webhook_doorman.config import HttpSink, MatrixSink, NtfySink, VikunjaTaskSink
 from webhook_doorman.errors import ConfigError, PermanentSinkError, SinkError
 from webhook_doorman.sinks import build_sink
+from webhook_doorman.sinks.base import parse_retry_after
 from webhook_doorman.templating import render, validate
 
 CONTEXT = {
@@ -190,6 +194,164 @@ class TestNtfySink:
         )
         with pytest.raises(PermanentSinkError):
             await build_sink(spec, {}).deliver(CONTEXT, client)
+
+
+class TestNtfyNonAsciiTitle:
+    """An em-dash in a title used to crash the sink and burn all five attempts.
+
+    Not an edge case: em-dashes, curly quotes, accented names and emoji are ordinary in real
+    Vikunja task titles, and the failure was quiet because the same event's Matrix sink
+    delivered fine. Reported as vikunja#446 against v0.1.0.
+    """
+
+    @staticmethod
+    def sink():
+        spec = NtfySink.model_validate(
+            {
+                "name": "push",
+                "type": "ntfy",
+                "url": "https://ntfy.example.invalid",
+                "topic_env": "NTFY_TOPIC",
+                "title_template": "{{ summary }}",
+            }
+        )
+        return build_sink(spec, {"NTFY_TOPIC": "alerts"})
+
+    async def test_an_em_dash_title_delivers(self, client, httpx_mock):
+        httpx_mock.add_response(url="https://ntfy.example.invalid/alerts", status_code=200)
+        context = {**CONTEXT, "summary": "[smoke test] requeue — ignore"}
+        assert (await self.sink().deliver(context, client)).response_code == 200
+
+    async def test_the_title_header_is_rfc_2047_encoded(self, client, httpx_mock):
+        httpx_mock.add_response(url="https://ntfy.example.invalid/alerts", status_code=200)
+        context = {**CONTEXT, "summary": "café — 100% ✅"}
+        await self.sink().deliver(context, client)
+
+        title = httpx_mock.get_requests()[0].headers["Title"]
+        assert title.startswith("=?UTF-8?B?") and title.endswith("?=")
+        # Decode it the way ntfy's server does, and confirm nothing was lost on the way out.
+        payload = title.removeprefix("=?UTF-8?B?").removesuffix("?=")
+        assert base64.b64decode(payload).decode("utf-8") == "café — 100% ✅"
+
+    async def test_an_ascii_title_is_left_alone(self, client, httpx_mock):
+        """Encoding unconditionally would make every title unreadable in a log or a capture."""
+        httpx_mock.add_response(url="https://ntfy.example.invalid/alerts", status_code=200)
+        await self.sink().deliver({**CONTEXT, "summary": "plain ascii"}, client)
+        assert httpx_mock.get_requests()[0].headers["Title"] == "plain ascii"
+
+    async def test_the_body_still_carries_utf8_directly(self, client, httpx_mock):
+        """Only headers are ASCII-constrained. The body was never the problem."""
+        httpx_mock.add_response(url="https://ntfy.example.invalid/alerts", status_code=200)
+        await self.sink().deliver({**CONTEXT, "summary": "body — dash"}, client)
+        assert httpx_mock.get_requests()[0].read() == "body — dash".encode()
+
+
+class TestUnicodeGuard:
+    """`HttpSinkBase` treats an encoding failure as terminal — the net under every sink.
+
+    A sink that forgets to encode a header should surface immediately in the DLQ, not five
+    attempts and several minutes of backoff later. Plan 2's Discord and Slack sinks inherit this.
+    """
+
+    async def test_a_non_ascii_header_is_permanent_not_retryable(self, client):
+        spec = HttpSink.model_validate(
+            {
+                "name": "notes",
+                "type": "http",
+                "url": "https://sink.example.invalid/notes",
+                "headers": {"X-Trace": "café"},
+            }
+        )
+        with pytest.raises(PermanentSinkError, match="cannot encode request"):
+            await build_sink(spec, {}).deliver(CONTEXT, client)
+
+    async def test_the_request_is_never_sent(self, client, httpx_mock):
+        """httpx raises from inside `request`, so there is nothing on the wire to observe."""
+        spec = HttpSink.model_validate(
+            {
+                "name": "notes",
+                "type": "http",
+                "url": "https://sink.example.invalid/notes",
+                "headers": {"X-Trace": "ünicode"},
+            }
+        )
+        with pytest.raises(PermanentSinkError):
+            await build_sink(spec, {}).deliver(CONTEXT, client)
+        assert httpx_mock.get_requests() == []
+
+
+class TestParseRetryAfter:
+    """Both RFC 9110 §10.2.3 forms, and the failure directions that matter."""
+
+    def test_delta_seconds(self):
+        assert parse_retry_after("7") == 7.0
+
+    def test_delta_seconds_with_surrounding_space(self):
+        assert parse_retry_after("  7  ") == 7.0
+
+    def test_fractional_seconds_are_accepted(self):
+        """Sub-second rate-limit windows are real; RFC 9110's integer-only form is not a reason
+        to throw the value away and wait the full backoff instead."""
+        assert parse_retry_after("0.75") == 0.75
+
+    def test_negative_delta_becomes_zero(self):
+        assert parse_retry_after("-5") == 0.0
+
+    def test_http_date(self):
+        now = datetime(2026, 10, 21, 7, 28, 0, tzinfo=UTC)
+        assert parse_retry_after("Wed, 21 Oct 2026 07:28:30 GMT", now=now) == 30.0
+
+    def test_an_http_date_in_the_past_is_zero_not_negative(self):
+        now = datetime(2026, 10, 21, 7, 30, 0, tzinfo=UTC)
+        assert parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", now=now) == 0.0
+
+    @pytest.mark.parametrize("value", [None, "", "   ", "soon", "next tuesday", "7 seconds"])
+    def test_unreadable_values_fall_back_to_the_backoff_curve(self, value):
+        """`None`, not `0` — garbage must not be able to collapse the retry interval."""
+        assert parse_retry_after(value) is None
+
+
+class TestRetryAfterOnTheWire:
+    @staticmethod
+    def sink():
+        spec = HttpSink.model_validate(
+            {"name": "notes", "type": "http", "url": "https://sink.example.invalid/notes"}
+        )
+        return build_sink(spec, {})
+
+    @pytest.mark.parametrize("code", [429, 503])
+    async def test_a_retryable_status_carries_retry_after(self, client, httpx_mock, code):
+        httpx_mock.add_response(
+            url="https://sink.example.invalid/notes",
+            status_code=code,
+            headers={"Retry-After": "7"},
+        )
+        with pytest.raises(SinkError) as exc:
+            await self.sink().deliver(CONTEXT, client)
+        assert exc.value.retry_after == 7.0
+
+    async def test_absent_header_leaves_it_unset(self, client, httpx_mock):
+        httpx_mock.add_response(url="https://sink.example.invalid/notes", status_code=429)
+        with pytest.raises(SinkError) as exc:
+            await self.sink().deliver(CONTEXT, client)
+        assert exc.value.retry_after is None
+
+    async def test_a_permanent_failure_carries_no_delay(self, client, httpx_mock):
+        """A 400 is not coming back, whatever the destination says about when."""
+        httpx_mock.add_response(
+            url="https://sink.example.invalid/notes",
+            status_code=400,
+            headers={"Retry-After": "7"},
+        )
+        with pytest.raises(PermanentSinkError) as exc:
+            await self.sink().deliver(CONTEXT, client)
+        assert exc.value.retry_after is None
+
+    async def test_a_transport_error_carries_no_delay(self, client, httpx_mock):
+        httpx_mock.add_exception(httpx.ConnectError("refused"))
+        with pytest.raises(SinkError) as exc:
+            await self.sink().deliver(CONTEXT, client)
+        assert exc.value.retry_after is None
 
 
 class TestVikunjaTaskSink:

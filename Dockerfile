@@ -46,7 +46,12 @@ EXPOSE 8080
 
 # stdlib only. Adding curl to a slim image for a healthcheck is a package and a CVE feed for
 # something Python already does.
+#
+# The `except` is not defensive padding. Since 0.1.1 `/health` answers 503 when the router has
+# no enabled source or cannot reach its store, and `urlopen` raises `HTTPError` on a 503 rather
+# than returning a response to compare — so without this, a designed unhealthy state exits
+# non-zero via an uncaught traceback. Same verdict, arrived at by accident and logged as noise.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["python", "-c", "import urllib.request as u, sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
+    CMD ["python", "-c", "import sys, urllib.request as u\ntry:\n    sys.exit(0 if u.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)\nexcept Exception:\n    sys.exit(1)"]
 
 ENTRYPOINT ["webhook-doorman"]

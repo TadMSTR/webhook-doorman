@@ -13,7 +13,7 @@ services:
   webhook-doorman:
     # Pinned, not :latest. A floating tag means `docker compose pull` can change what is running
     # without anything in this file changing — including across a breaking release.
-    image: ghcr.io/tadmstr/webhook-doorman:0.1.0
+    image: ghcr.io/tadmstr/webhook-doorman:0.1.1
     container_name: webhook-doorman
     restart: unless-stopped
 

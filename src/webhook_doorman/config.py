@@ -152,7 +152,13 @@ VerifySpec = Annotated[
 
 
 def secret_env_names(spec: VerifySpec) -> list[str]:
-    """Every environment variable this strategy needs. Empty for `none`."""
+    """Every environment variable this strategy needs. Empty for `none`.
+
+    Checked against `sink_secret_env_names`'s failure mode and it is exhaustive over today's
+    union — but only because every member is named here. A fifth strategy carrying a `*_env`
+    field would fall through to `return []` and be just as silently invisible, so
+    `test_verify_union_env_coverage` asserts exhaustiveness rather than leaving it to review.
+    """
     if isinstance(spec, HmacVerify | BearerVerify):
         return [spec.secret_env]
     if isinstance(spec, BasicVerify):
@@ -323,13 +329,20 @@ SinkSpec = Annotated[
 
 
 def sink_secret_env_names(sink: SinkSpec) -> list[str]:
-    """Environment variables a sink needs before it can be used."""
-    names: list[str] = []
-    for attr in ("token_env", "room_env", "topic_env", "url_env"):
-        value = getattr(sink, attr, None)
-        if value:
-            names.append(value)
-    return names
+    """Environment variables a sink needs before it can be used.
+
+    Derived from the model rather than from a literal attribute list. A hardcoded tuple
+    silently misses any new `*_env` field, and the resulting failure is quiet rather than
+    loud: a sink whose credential is not discovered here is reported `enabled: true` at
+    `/health` with its variable unset, and its value never enters `resolved.secret_values`,
+    so it is never redacted from the event log. A sink author who adds `webhook_url_env`
+    should not also have to remember to register it in a second place.
+    """
+    return [
+        value
+        for name in type(sink).model_fields
+        if name.endswith("_env") and (value := getattr(sink, name, None))
+    ]
 
 
 # --------------------------------------------------------------------------------------

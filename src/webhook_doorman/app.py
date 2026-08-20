@@ -120,14 +120,13 @@ def compute_delivery_id(state: SourceState, headers: Mapping[str, str], body: by
 
 
 async def _log_only_ingest(event: InboundEvent) -> dict[str, Any]:
-    """Fallback ingest used when no engine is wired in (tests, config validation runs)."""
-    log.info(
-        "event_accepted",
-        source=event.source,
-        event_type=event.event_type,
-        delivery_id=event.delivery_id,
-        sinks=event.sinks,
-    )
+    """Fallback ingest used when no engine is wired in (tests, config validation runs).
+
+    `source` and `delivery_id` are not passed explicitly: the handler has them bound as
+    request-scoped context, and repeating them here would mask a broken binding behind a line
+    that looks correct.
+    """
+    log.info("event_accepted", event_type=event.event_type, sinks=event.sinks)
     return {"status": "accepted"}
 
 
@@ -144,58 +143,68 @@ def build_source_route(
     max_body = resolved.config.server.max_body_bytes
 
     async def handler(request: Request) -> Response:
-        if not state.enabled:
-            # 503, not 401: the caller's credentials were never the problem, and a producer
-            # that distinguishes them can back off instead of rotating a working secret.
-            log.warning(
-                "source_disabled_rejected", source=source.name, reason=state.disabled_reason
+        # Everything logged inside this block carries the source, and — once it is known — the
+        # delivery id. Without it a 401 or a 413 line names the source and nothing else, which
+        # is not enough to correlate a rejection with the request that caused it.
+        #
+        # `bound_contextvars` rather than a bare `bind`/`clear` pair: it restores what was there
+        # before and touches no other key, so a leaked binding cannot attach one request's ids
+        # to another's log lines. Requests already run in separate asyncio tasks and therefore
+        # separate contexts, but that is a property of the server, not of this handler.
+        with structlog.contextvars.bound_contextvars(source=source.name):
+            if not state.enabled:
+                # 503, not 401: the caller's credentials were never the problem, and a producer
+                # that distinguishes them can back off instead of rotating a working secret.
+                log.warning("source_disabled_rejected", reason=state.disabled_reason)
+                raise HTTPException(status_code=503, detail="Source is not available")
+
+            try:
+                body = await read_body_capped(request, max_body)
+            except BodyTooLarge:
+                log.warning("body_too_large", limit=max_body)
+                raise HTTPException(status_code=413, detail="Payload too large") from None
+
+            headers = lowered_headers(request)
+            result = verify(
+                source.verify,
+                body=body,
+                headers=headers,
+                peer=peer_address(request),
+                secrets=resolved.secrets,
             )
-            raise HTTPException(status_code=503, detail="Source is not available")
+            if not result.ok:
+                # The reason goes to the log, never to the caller.
+                log.warning("verification_failed", reason=result.reason)
+                raise HTTPException(status_code=401, detail="Unauthorized")
 
-        try:
-            body = await read_body_capped(request, max_body)
-        except BodyTooLarge:
-            log.warning("body_too_large", source=source.name, limit=max_body)
-            raise HTTPException(status_code=413, detail="Payload too large") from None
+            # Redact once, here, and derive everything downstream from the redacted bytes.
+            # Parsing the raw body and redacting the result afterwards is the same work with a
+            # hole in it: a parser lifts nested payload fields into `context`, and a redaction
+            # pass that covers `body` but not `context` writes the secret to disk in the field
+            # nobody was looking at.
+            secret_values = resolved.secret_values
+            safe_body = redact_bytes(body, secret_values)
+            parsed = parse(parser_name, safe_body, headers)
+            delivery_id = compute_delivery_id(state, headers, safe_body)
 
-        headers = lowered_headers(request)
-        result = verify(
-            source.verify,
-            body=body,
-            headers=headers,
-            peer=peer_address(request),
-            secrets=resolved.secrets,
-        )
-        if not result.ok:
-            # The reason goes to the log, never to the caller.
-            log.warning("verification_failed", source=source.name, reason=result.reason)
-            raise HTTPException(status_code=401, detail="Unauthorized")
+            with structlog.contextvars.bound_contextvars(delivery_id=delivery_id):
+                event = InboundEvent(
+                    source=source.name,
+                    delivery_id=delivery_id,
+                    event_type=parsed.event_type,
+                    summary=redact_text(parsed.summary, secret_values),
+                    headers=redact_headers(
+                        headers, extra_headers=credential_headers, secret_values=secret_values
+                    ),
+                    body=safe_body,
+                    payload=_safe_json(safe_body),
+                    context=redact_json(parsed.context, secret_values),
+                    sinks=list(source.sinks) if parsed.actionable else [],
+                    verified=not isinstance(source.verify, NoneVerify),
+                )
 
-        # Redact once, here, and derive everything downstream from the redacted bytes. Parsing
-        # the raw body and redacting the result afterwards is the same work with a hole in it:
-        # a parser lifts nested payload fields into `context`, and a redaction pass that covers
-        # `body` but not `context` writes the secret to disk in the field nobody was looking at.
-        secret_values = resolved.secret_values
-        safe_body = redact_bytes(body, secret_values)
-        parsed = parse(parser_name, safe_body, headers)
-
-        event = InboundEvent(
-            source=source.name,
-            delivery_id=compute_delivery_id(state, headers, safe_body),
-            event_type=parsed.event_type,
-            summary=redact_text(parsed.summary, secret_values),
-            headers=redact_headers(
-                headers, extra_headers=credential_headers, secret_values=secret_values
-            ),
-            body=safe_body,
-            payload=_safe_json(safe_body),
-            context=redact_json(parsed.context, secret_values),
-            sinks=list(source.sinks) if parsed.actionable else [],
-            verified=not isinstance(source.verify, NoneVerify),
-        )
-
-        payload = await ingest(event)
-        return JSONResponse(status_code=200, content=payload)
+                payload = await ingest(event)
+                return JSONResponse(status_code=200, content=payload)
 
     handler.__name__ = f"source_{source.name}"
     return handler
@@ -237,16 +246,31 @@ def build_admin_router(engine: EngineLike) -> APIRouter:
     return router
 
 
-def build_health_route(resolved: Resolved) -> Callable[[], Awaitable[dict[str, Any]]]:
+def build_health_route(
+    resolved: Resolved, engine: EngineLike | None = None
+) -> Callable[[Response], Awaitable[dict[str, Any]]]:
     """`/health`: liveness plus the per-source enabled state and any unverified sources.
 
     Unverified sources are named here on purpose. `allow_unverified` is an acknowledgement, not
     an amnesty — an operator should be able to see at a glance which endpoints are accepting
     traffic on reachability alone.
+
+    **The status code carries a verdict**, because `Dockerfile`'s HEALTHCHECK polls this route:
+    a body that always says `ok` makes the container's health status unable to fail for any
+    reason short of the process dying. It returns **503** when the router cannot do its job at
+    all — no source is enabled, or the store is unreachable.
+
+    A *partially* degraded router stays **200**. One disabled source out of three is usually a
+    deliberate state (a secret not yet provisioned, a source retired in place), and flapping the
+    container on it would replace one wrong answer with a noisier one. The disabled source is
+    still named in the body, which is where that belongs.
+
+    `engine` is optional so the log-only path — `create_app` without an engine — keeps a route
+    that has no storage concern at all rather than growing a null-store branch.
     """
 
-    async def health() -> dict[str, Any]:
-        return {
+    async def health(response: Response) -> dict[str, Any]:
+        body: dict[str, Any] = {
             "status": "ok",
             "version": __version__,
             "sources": {
@@ -269,6 +293,27 @@ def build_health_route(resolved: Resolved) -> Callable[[], Awaitable[dict[str, A
             "unverified_sources": resolved.unverified_source_names(),
             "replay_enabled": resolved.admin_token() is not None,
         }
+
+        degraded: list[str] = []
+        if not any(state.enabled for state in resolved.sources.values()):
+            degraded.append("no sources are enabled")
+
+        if engine is not None:
+            try:
+                body["stats"] = await engine.stats()
+            except Exception as exc:
+                # A store that cannot be queried is the "not connected" condition, and it is a
+                # real degradation. It must not be a 500 though: this is the liveness endpoint,
+                # and an unhandled exception here reports the same thing as a dead process.
+                log.warning("health_stats_failed", error=str(exc))
+                degraded.append("store is unavailable")
+
+        if degraded:
+            body["status"] = "degraded"
+            body["degraded"] = degraded
+            response.status_code = 503
+
+        return body
 
     return health
 
@@ -361,7 +406,7 @@ def create_app(
     app.state.engine = engine
 
     router = APIRouter()
-    router.add_api_route("/health", build_health_route(resolved), methods=["GET"])
+    router.add_api_route("/health", build_health_route(resolved, engine), methods=["GET"])
 
     handler = ingest or (engine.ingest if engine is not None else _log_only_ingest)
     for name, state in resolved.sources.items():

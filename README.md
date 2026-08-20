@@ -76,11 +76,13 @@ cp config.example.yml config.yml && $EDITOR config.yml   # declare your sources 
 echo 'GITHUB_WEBHOOK_SECRET=...' > .env                  # secrets live here, never in YAML
 docker run --rm -p 127.0.0.1:8080:8080 \
   -v "$PWD/config.yml:/config/config.yml:ro" -v doorman-data:/data \
-  --env-file .env ghcr.io/tadmstr/webhook-doorman:0.1.0
+  --env-file .env ghcr.io/tadmstr/webhook-doorman:0.1.1
 ```
 
 `docker compose up -d` with the bundled `docker-compose.yml` does the same with hardened
-defaults. `GET /health` reports which sources are live and which are disabled, and why.
+defaults. `GET /health` reports which sources are live and which are disabled, and why — and
+answers `503` when no source is enabled or the store is unreachable, so the container's health
+status means something. See [Health](docs/deployment.md#health).
 
 ## Configuration
 
