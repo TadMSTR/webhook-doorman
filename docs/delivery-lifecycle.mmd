@@ -1,0 +1,39 @@
+%% The states one delivery moves through, and what moves it. A delivery is a single
+%% (event, sink) pair; an event with three sinks has three of these running independently.
+stateDiagram-v2
+    [*] --> pending: event stored,<br/>one row per sink
+
+    pending --> in_flight: worker claims it<br/>(next_attempt_at is due)
+
+    in_flight --> delivered: 2xx
+    in_flight --> pending: retryable failure —<br/>5xx, 408, 429, timeout,<br/>transport error
+    in_flight --> exhausted: permanent failure —<br/>other 4xx, bad template,<br/>sink unavailable
+    in_flight --> exhausted: attempts reached<br/>max_attempts
+
+    pending --> pending: backoff window<br/>(base × 2ⁿ, capped, ± jitter)
+
+    exhausted --> [*]: row written to dlq
+    delivered --> [*]: swept after<br/>retention_days
+
+    note right of pending
+        A process killed while rows are in_flight
+        leaves them with nothing running to finish
+        them. requeue_incomplete() at startup returns
+        every pending and in_flight row to pending and
+        makes it due now — otherwise it is a lost event
+        wearing a database row.
+    end note
+
+    note left of exhausted
+        Permanent and retryable are separated on
+        purpose. Five backed-off attempts at a 400
+        only delay the moment the operator finds out,
+        and treating a 503 as terminal throws away a
+        delivery that would have succeeded in a minute.
+    end note
+
+%% Jitter is not decoration. After an outage every queued delivery becomes due at the same
+%% instant; firing them in lockstep re-creates the load that caused the outage.
+%%
+%% An event is only swept once all of its deliveries have settled — sweeping one mid-retry would
+%% delete the payload that retry is about to send.

@@ -16,24 +16,40 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Awaitable, Callable, Mapping
-from typing import Any
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
+from typing import Any, Protocol
 
 import structlog
-from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
+from fastapi import APIRouter, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import __version__
 from .config import Config, NoneVerify, load_config
 from .models import InboundEvent
 from .parsers import get_parser, parse
-from .redaction import redact_bytes, redact_headers
+from .redaction import redact_bytes, redact_headers, redact_json, redact_text
 from .secrets import Resolved, SourceState, resolve
 from .verification import verify
 
 log = structlog.get_logger(__name__)
 
 IngestFn = Callable[[InboundEvent], Awaitable[dict[str, Any]]]
+
+
+class EngineLike(Protocol):
+    """What `create_app` needs from an engine.
+
+    A protocol rather than the concrete class so the app layer stays free of storage and
+    delivery concerns, and so tests can drive routes with a stub.
+    """
+
+    async def start(self) -> None: ...
+    async def stop(self) -> None: ...
+    async def ingest(self, event: InboundEvent) -> dict[str, Any]: ...
+    async def replay(self, event_id: int) -> dict[str, Any]: ...
+    async def stats(self) -> dict[str, int]: ...
+    def check_admin_token(self, presented: str) -> bool: ...
 
 
 class BodyTooLarge(Exception):
@@ -80,6 +96,14 @@ def peer_address(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
+# A delivery ID is a producer's opaque handle — GitHub's is a UUID, most are shorter. This is
+# the value that goes into a unique index and every log line for the event, and it arrives in a
+# header we do not control, so it gets an upper bound. Anything longer is truncated rather than
+# rejected: the truncation is deterministic, so dedup still works, and refusing the delivery
+# over a long header would be a worse outcome than a coarser key.
+MAX_DELIVERY_ID_LENGTH = 200
+
+
 def compute_delivery_id(state: SourceState, headers: Mapping[str, str], body: bytes) -> str:
     """Derive the ID that dedup keys on.
 
@@ -91,7 +115,7 @@ def compute_delivery_id(state: SourceState, headers: Mapping[str, str], body: by
     if header_name:
         value = headers.get(header_name.lower(), "").strip()
         if value:
-            return value
+            return value[:MAX_DELIVERY_ID_LENGTH]
     return "sha256:" + hashlib.sha256(body).hexdigest()
 
 
@@ -147,20 +171,25 @@ def build_source_route(
             log.warning("verification_failed", source=source.name, reason=result.reason)
             raise HTTPException(status_code=401, detail="Unauthorized")
 
-        parsed = parse(parser_name, body, headers)
-
+        # Redact once, here, and derive everything downstream from the redacted bytes. Parsing
+        # the raw body and redacting the result afterwards is the same work with a hole in it:
+        # a parser lifts nested payload fields into `context`, and a redaction pass that covers
+        # `body` but not `context` writes the secret to disk in the field nobody was looking at.
         secret_values = resolved.secret_values
+        safe_body = redact_bytes(body, secret_values)
+        parsed = parse(parser_name, safe_body, headers)
+
         event = InboundEvent(
             source=source.name,
-            delivery_id=compute_delivery_id(state, headers, body),
+            delivery_id=compute_delivery_id(state, headers, safe_body),
             event_type=parsed.event_type,
-            summary=parsed.summary,
+            summary=redact_text(parsed.summary, secret_values),
             headers=redact_headers(
                 headers, extra_headers=credential_headers, secret_values=secret_values
             ),
-            body=redact_bytes(body, secret_values),
-            payload=_safe_json(body),
-            context=parsed.context,
+            body=safe_body,
+            payload=_safe_json(safe_body),
+            context=redact_json(parsed.context, secret_values),
             sinks=list(source.sinks) if parsed.actionable else [],
             verified=not isinstance(source.verify, NoneVerify),
         )
@@ -177,6 +206,35 @@ def _safe_json(body: bytes) -> Any:
         return json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
+
+
+def build_admin_router(engine: EngineLike) -> APIRouter:
+    """The replay API.
+
+    Two independent controls, because replay re-fires real events at real destinations:
+
+    * A bearer token of at least `admin.min_token_length` characters. Absent or short means the
+      endpoint rejects everything — `check_admin_token` returns False rather than opening up.
+    * The `/admin/` prefix, which is expected to be blocked at the reverse proxy. Source paths
+      are forbidden from living under it, so the deny rule cannot accidentally shadow ingest.
+
+    Note the token is checked before the event id is looked up, so an unauthenticated caller
+    cannot use response codes to probe which event ids exist.
+    """
+    router = APIRouter(prefix="/admin", tags=["admin"])
+
+    @router.post("/replay/{event_id}")
+    async def replay(event_id: int, authorization: str = Header(default="")) -> dict[str, Any]:
+        presented = authorization.removeprefix("Bearer ").strip()
+        if not engine.check_admin_token(presented):
+            log.warning("admin_auth_failed", path=f"/admin/replay/{event_id}")
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        try:
+            return await engine.replay(event_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="Event not found") from exc
+
+    return router
 
 
 def build_health_route(resolved: Resolved) -> Callable[[], Awaitable[dict[str, Any]]]:
@@ -255,6 +313,8 @@ def create_app(
     config_path: str | None = None,
     env: Mapping[str, str] | None = None,
     ingest: IngestFn | None = None,
+    engine: EngineLike | None = None,
+    resolved: Resolved | None = None,
 ) -> FastAPI:
     """Build the application from a config.
 
@@ -262,31 +322,48 @@ def create_app(
         config: an already-loaded config. Mutually exclusive with `config_path`.
         config_path: path to `config.yml`.
         env: environment to resolve secrets from. Defaults to `os.environ`.
-        ingest: what to do with a verified event. Defaults to log-only; the engine supplies the
-            persisting implementation.
+        resolved: an already-resolved config. Pass this when an engine was built from the same
+            resolution, so the app and the engine cannot disagree about which sinks are enabled.
+        ingest: what to do with a verified event. Defaults to the engine's `ingest` when one is
+            supplied, and to log-only otherwise.
+        engine: the delivery engine. When present its lifecycle is bound to the app's, and the
+            `/admin` router is mounted.
 
     Returns:
-        A FastAPI app with one POST route per source and a `/health` route.
+        A FastAPI app with one POST route per source, `/health`, and `/admin` if an engine
+        was supplied.
     """
-    if config is None:
-        if config_path is None:
-            raise ValueError("provide either config or config_path")
-        config = load_config(config_path)
-
-    resolved = resolve(config, env)
+    if resolved is None:
+        if config is None:
+            if config_path is None:
+                raise ValueError("provide either config or config_path")
+            config = load_config(config_path)
+        resolved = resolve(config, env)
     log_startup_state(resolved)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        if engine is not None:
+            await engine.start()
+        try:
+            yield
+        finally:
+            if engine is not None:
+                await engine.stop()
 
     app = FastAPI(
         title="webhook-doorman",
         version=__version__,
         description="A fail-closed inbound webhook router.",
+        lifespan=lifespan,
     )
     app.state.resolved = resolved
+    app.state.engine = engine
 
     router = APIRouter()
     router.add_api_route("/health", build_health_route(resolved), methods=["GET"])
 
-    handler = ingest or _log_only_ingest
+    handler = ingest or (engine.ingest if engine is not None else _log_only_ingest)
     for name, state in resolved.sources.items():
         router.add_api_route(
             state.config.path,
@@ -297,4 +374,6 @@ def create_app(
         )
 
     app.include_router(router)
+    if engine is not None:
+        app.include_router(build_admin_router(engine))
     return app

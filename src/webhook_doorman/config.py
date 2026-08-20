@@ -28,6 +28,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from .errors import ConfigError
+from .redaction import SENSITIVE_HEADERS
 
 MAX_BODY_BYTES_DEFAULT = 1_048_576  # 1 MiB
 
@@ -210,6 +211,27 @@ class SourceConfig(_Strict):
         if not v:
             raise ValueError("must route to at least one sink")
         return v
+
+    @model_validator(mode="after")
+    def _dedup_header_is_not_a_credential(self):
+        """The dedup key must not be a credential header.
+
+        Two things go wrong if it is. The value is redacted before storage, so every event
+        would dedup to the same key and the second one onwards would be silently discarded —
+        a dedup config that deletes traffic. And if it were *not* redacted, the credential
+        would be written to the event log as the delivery id.
+        """
+        header = (self.dedup.id_header or "").lower()
+        if not header:
+            return self
+        verify_header = getattr(self.verify, "header", "").lower()
+        if header in SENSITIVE_HEADERS or (verify_header and header == verify_header):
+            raise ValueError(
+                f"dedup.id_header {self.dedup.id_header!r} is a credential header; it is "
+                f"redacted before storage, so using it as the dedup key would collapse every "
+                f"event onto one id. Use the producer's delivery-id header, or omit dedup."
+            )
+        return self
 
 
 # --------------------------------------------------------------------------------------

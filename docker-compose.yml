@@ -1,0 +1,67 @@
+# webhook-doorman — reference deployment.
+#
+#   1. cp config.example.yml config.yml && $EDITOR config.yml
+#   2. cp .env.example .env && $EDITOR .env && chmod 600 .env
+#   3. mkdir -p data && sudo chown -R 10001:10001 data
+#   4. docker compose up -d
+#
+# Step 3 is not optional. The container runs as UID 10001, and SQLite needs to create the
+# database plus its -wal and -shm siblings in that directory. A root- or user-owned volume
+# leaves the service failing at boot with a permissions error that reads like a bug.
+
+services:
+  webhook-doorman:
+    # Pinned, not :latest. A floating tag means `docker compose pull` can change what is running
+    # without anything in this file changing — including across a breaking release.
+    image: ghcr.io/tadmstr/webhook-doorman:0.1.0
+    container_name: webhook-doorman
+    restart: unless-stopped
+
+    # The image already sets USER 10001. Stating it here means a future base-image change cannot
+    # silently promote the container to root.
+    user: "10001:10001"
+
+    # env_file, not a bind mount. The Docker daemon reads this as root at container start, so
+    # the file stays 0600 and owned by you while the container runs as a non-root user. Bind-
+    # mount it instead and UID 10001 cannot open it -- the service fails closed at boot with a
+    # confusing error.
+    env_file: .env
+
+    volumes:
+      - ./config.yml:/config/config.yml:ro
+      - ./data:/data
+
+    # Loopback only: host-side producers reach it, the network does not. To serve external
+    # traffic, put a reverse proxy on a shared network and publish nothing here at all.
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    # Hardening. read_only applies to the image layers; /data and /tmp stay writable.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # Generous for the workload — the router idles in single-digit MB and this is a ceiling, not
+    # a reservation. Its job is to stop a runaway retry loop or a pathological payload from
+    # taking the host down with it.
+    mem_limit: 256m
+    cpus: 0.5
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Serving public traffic? Drop the `ports:` block, join the proxy's network, and deny /admin/
+# at the proxy -- the replay endpoint re-fires real events.
+#
+#     networks: [proxy]
+#
+# networks:
+#   proxy:
+#     external: true

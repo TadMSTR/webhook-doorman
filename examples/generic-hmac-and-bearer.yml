@@ -1,0 +1,81 @@
+# Example — a vendor nobody wrote a parser for, plus an internal producer.
+#
+# Most webhook sources need no parser at all. `generic` hands the decoded payload to the
+# template and lets you write the message, which is usually less work than reading a parser's
+# field list. A named parser only earns its place when it saves every adopter from re-deriving
+# the same nested paths.
+#
+#   .env:
+#     VENDOR_WEBHOOK_SECRET=<from the vendor's webhook settings>
+#     INTERNAL_TOKEN=<generate one: openssl rand -hex 32>
+#     ALERT_WEBHOOK_URL=https://ops.example.invalid/ingest
+#     OPS_TOKEN=<token for the destination above>
+
+server:
+  # Only needed if you enable the commented-out `legacy` source at the bottom.
+  allow_unverified: false
+
+sources:
+  # --- A vendor that signs with a bare hex digest, no prefix -----------------------------------
+  # Vary `header`, `prefix` and `encoding` to match whatever the vendor documents. Between them
+  # they cover nearly every HMAC-SHA256 scheme in the wild:
+  #
+  #   GitHub    header: X-Hub-Signature-256   prefix: "sha256="   encoding: hex
+  #   Vikunja   header: X-Vikunja-Signature   prefix: ""          encoding: hex
+  #   Shopify   header: X-Shopify-Hmac-Sha256 prefix: ""          encoding: base64
+  - name: vendor
+    path: /webhook/vendor
+    parser: generic
+    verify:
+      strategy: hmac_sha256
+      header: X-Vendor-Signature
+      encoding: hex
+      secret_env: VENDOR_WEBHOOK_SECRET
+    dedup:
+      id_header: X-Vendor-Event-Id
+    sinks: [ops]
+
+  # --- An internal service that cannot sign, but can send a header ----------------------------
+  # A shared bearer token is three lines of config and leaves you with a verified source. Reach
+  # for `none` only when the producer genuinely cannot send a header at all.
+  - name: internal
+    path: /webhook/internal
+    verify:
+      strategy: bearer
+      secret_env: INTERNAL_TOKEN
+      header: X-Internal-Token
+      prefix: ""
+    sinks: [ops]
+
+  # --- Last resort: a producer that can send nothing -------------------------------------------
+  # Requires server.allow_unverified: true above. Startup refuses without all three of
+  # allow_unverified, unverified_reason, and a non-empty allow_from.
+  #
+  # allow_from matches the socket peer, not X-Forwarded-For. Behind a reverse proxy the peer is
+  # the proxy, so this would allow anything the proxy forwards — use a real strategy there.
+  #
+  # - name: legacy
+  #   path: /webhook/legacy
+  #   verify:
+  #     strategy: none
+  #     unverified_reason: "vendored appliance, no signing or auth header support; loopback only"
+  #     allow_from: ["127.0.0.1/32"]
+  #   sinks: [ops]
+
+sinks:
+  - name: ops
+    type: http
+    url_env: ALERT_WEBHOOK_URL
+    token_env: OPS_TOKEN
+    method: POST
+    content_type: application/json
+    # Rendered output is parsed as JSON before sending when content_type is application/json,
+    # so a template that produces something malformed fails here rather than as an opaque 400
+    # from the destination.
+    template: |
+      {
+        "source": "{{ source }}",
+        "event": "{{ event_type }}",
+        "summary": "{{ summary }}",
+        "received_at": "{{ received_at }}"
+      }

@@ -1,0 +1,42 @@
+# Example — GitHub issues and PRs into a Matrix room.
+#
+# The most common shape: one signed producer, one chat destination. Every value here is
+# invented; `example.invalid` is reserved by RFC 2606 and will never resolve.
+#
+#   .env:
+#     GITHUB_WEBHOOK_SECRET=<the secret you typed into GitHub's webhook form>
+#     MATRIX_HOMESERVER=https://matrix.example.invalid
+#     MATRIX_TOKEN=<a bot account's access token>
+#     MATRIX_ROOM=!yourroomid:example.invalid
+#
+# In GitHub: Settings → Webhooks → Add webhook. Content type application/json, and put the
+# same secret in the Secret field. Send only "Issues" and "Pull requests" unless you plan to
+# route the rest.
+
+sources:
+  - name: github
+    path: /webhook/github
+    parser: github
+    verify:
+      strategy: hmac_sha256
+      header: X-Hub-Signature-256
+      prefix: "sha256="
+      encoding: hex
+      secret_env: GITHUB_WEBHOOK_SECRET
+    dedup:
+      # GitHub sends a unique ID per delivery and retries on any non-2xx. This is what stops a
+      # retry from posting the message twice.
+      id_header: X-GitHub-Delivery
+    sinks: [team-chat]
+
+sinks:
+  - name: team-chat
+    type: matrix
+    url_env: MATRIX_HOMESERVER
+    token_env: MATRIX_TOKEN
+    room_env: MATRIX_ROOM
+    # The github parser exposes: repo, number, title, url, author, body, kind.
+    template: |
+      [{{ kind }}] {{ repo }}#{{ number }} — {{ title }}
+      opened by {{ author }}
+      {{ url }}

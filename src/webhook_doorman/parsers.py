@@ -113,6 +113,88 @@ def parse_github(payload: Any, headers: Mapping[str, str]) -> ParsedEvent:
     )
 
 
+def parse_vikunja(payload: Any, headers: Mapping[str, str]) -> ParsedEvent:
+    """Parse a Vikunja webhook.
+
+    Two event names are easy to get wrong, and both were verified against Vikunja's docs rather
+    than assumed: there is **no** `task.done` event — completion arrives as `task.updated` with
+    the task's `done` field true — and reminders fire as `task.reminder.fired`, a *user* webhook
+    event, not `task.reminder`.
+    """
+    if not isinstance(payload, dict):
+        return ParsedEvent("vikunja", "unparseable Vikunja payload", actionable=False)
+
+    event_name = payload.get("event_name") or "vikunja"
+    data = payload.get("data")
+    data = data if isinstance(data, dict) else {}
+    task = data.get("task")
+    task = task if isinstance(task, dict) else {}
+
+    title = task.get("title") or "(untitled)"
+    task_id = task.get("id")
+
+    if event_name == "task.updated" and task.get("done") is True:
+        summary = f"Task completed: {title}"
+        event_name = "task.done"
+    elif event_name == "task.comment.created":
+        author = _dig(data, "comment", "author", "username") or "someone"
+        summary = f"Comment by {author} on: {title}"
+    else:
+        summary = f"{event_name}: {title}"
+
+    return ParsedEvent(
+        event_type=event_name,
+        summary=summary,
+        context={"title": title, "task_id": task_id, "done": bool(task.get("done"))},
+    )
+
+
+def parse_grafana(payload: Any, headers: Mapping[str, str]) -> ParsedEvent:
+    """Parse a Grafana alerting webhook (Alertmanager-shaped).
+
+    Every field here is optional in practice, whatever the docs imply — the payload varies with
+    the alert rule, the notification template and the Grafana version. Hence the defensive
+    chains: a missing `alerts` array produces a thin summary, not a rejected delivery.
+
+    Note Grafana does not sign its payloads at all. Absorbing that with a `bearer` or `basic`
+    verify block, rather than a fourth bespoke endpoint, is the case this project's source
+    abstraction exists to handle.
+    """
+    if not isinstance(payload, dict):
+        return ParsedEvent("grafana", "unparseable Grafana payload", actionable=False)
+
+    status = payload.get("status") or "unknown"
+    alerts = payload.get("alerts")
+    alerts = alerts if isinstance(alerts, list) else []
+    firing = sum(1 for a in alerts if isinstance(a, dict) and a.get("status") == "firing")
+
+    title = (
+        payload.get("title")
+        or _dig(payload, "commonLabels", "alertname")
+        or (_dig(alerts[0], "labels", "alertname") if alerts else None)
+        or "Grafana alert"
+    )
+    message = payload.get("message") or _dig(payload, "commonAnnotations", "summary") or ""
+
+    marker = {"firing": "[FIRING]", "resolved": "[RESOLVED]"}.get(status, f"[{status.upper()}]")
+    summary = f"{marker} {title}"
+    if message:
+        summary = f"{summary} — {message}"
+
+    return ParsedEvent(
+        event_type=f"grafana.{status}",
+        summary=summary,
+        context={
+            "status": status,
+            "title": title,
+            "message": message,
+            "alert_count": len(alerts),
+            "firing_count": firing,
+            "external_url": payload.get("externalURL") or "",
+        },
+    )
+
+
 def _dig(mapping: Any, *keys: str) -> Any:
     """Walk nested dicts, returning None the moment the path stops being a dict."""
     current = mapping
@@ -126,6 +208,8 @@ def _dig(mapping: Any, *keys: str) -> Any:
 _PARSERS: dict[str, Parser] = {
     "generic": parse_generic,
     "github": parse_github,
+    "vikunja": parse_vikunja,
+    "grafana": parse_grafana,
 }
 
 

@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from webhook_doorman.redaction import REDACTED, redact_bytes, redact_headers, redact_text
+from webhook_doorman.redaction import (
+    REDACTED,
+    redact_bytes,
+    redact_headers,
+    redact_json,
+    redact_text,
+)
 
 SECRET = "super-secret-token-value-0123456789"
 
@@ -59,6 +65,23 @@ class TestRedactBody:
     def test_empty_secret_list_is_a_no_op(self):
         body = b"anything at all"
         assert redact_bytes(body, []) == body
+
+
+class TestRedactJson:
+    def test_nested_string_is_redacted(self):
+        data = {"issue": {"body": SECRET, "n": 1}}
+        assert redact_json(data, [SECRET]) == {"issue": {"body": REDACTED, "n": 1}}
+
+    def test_list_members_are_redacted(self):
+        assert redact_json([SECRET, "safe"], [SECRET]) == [REDACTED, "safe"]
+
+    def test_non_string_scalars_pass_through(self):
+        data = {"n": 1, "f": 1.5, "b": True, "z": None}
+        assert redact_json(data, [SECRET]) == data
+
+    def test_no_secrets_is_a_no_op(self):
+        data = {"a": "b"}
+        assert redact_json(data, []) is data
 
 
 class TestRedactText:

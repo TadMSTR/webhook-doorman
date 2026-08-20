@@ -52,6 +52,10 @@ Each of these has an explicit negative test. Removing the test is removing the i
    caller which check failed helps an attacker more than a developer.
 9. **Structural config errors are startup failures.** Never deferred to the first request.
 10. **The bind address is not configurable.** See "Exposure model" in ARCHITECTURE.md.
+11. **A sink escapes for how its destination renders.** `render_html` where the destination
+    renders rich text, `render` where it does not. Verification proves a payload's origin, never
+    that its content is safe. Do not "fix" this by escaping globally — that corrupts chat
+    messages and JSON bodies, and `tests/test_sink_escaping.py` fails on it.
 
 ## Adding things
 

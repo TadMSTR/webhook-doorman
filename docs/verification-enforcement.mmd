@@ -1,0 +1,59 @@
+%% How a request is admitted or refused. Every branch that is not "verified" ends in a refusal;
+%% there is no path from a missing secret to an accepted request.
+flowchart TB
+    START([POST /webhook/&lt;source&gt;]) --> SIZE{"Content-Length<br/>&le; max_body_bytes?"}
+    SIZE -->|no| R413["413 Payload too large<br/><i>before a byte is buffered</i>"]
+    SIZE -->|yes| STREAM{"streamed body<br/>stayed under the cap?"}
+    STREAM -->|no| R413
+    STREAM -->|yes| ENABLED{"source enabled?"}
+
+    ENABLED -->|"no — secret unset,<br/>or disabled in config"| R503["503 Source unavailable<br/><i>never 'verification skipped'</i>"]
+    ENABLED -->|yes| STRAT{"verify.strategy"}
+
+    STRAT -->|hmac_sha256| H1{"credential header<br/>present?"}
+    H1 -->|no| R401
+    H1 -->|yes| H2{"prefix matches?"}
+    H2 -->|no| R401
+    H2 -->|yes| H3["HMAC-SHA256 over the<br/><b>raw bytes as received</b>"]
+    H3 --> H4{"compare_digest<br/>matches?"}
+    H4 -->|no| R401
+    H4 -->|yes| OK
+
+    STRAT -->|bearer| B1{"header present<br/>and compare_digest<br/>matches?"}
+    B1 -->|no| R401
+    B1 -->|yes| OK
+
+    STRAT -->|basic| C1{"decodes, and both<br/>halves match in<br/>constant time?"}
+    C1 -->|no| R401
+    C1 -->|yes| OK
+
+    STRAT -->|none| N1{"socket peer in<br/>allow_from?"}
+    N1 -->|no| R401
+    N1 -->|yes| OKU["accepted, verified = false"]
+
+    STRAT -->|"anything unrecognised"| R401
+
+    R401["401 Unauthorized<br/><i>no reason in the response;<br/>it goes to the log</i>"]
+    OK["accepted, verified = true"]
+
+    OK --> NEXT([redact → parse → store])
+    OKU --> NEXT
+
+    classDef refuse fill:#7f1d1d,stroke:#ef4444,color:#fff
+    classDef admit fill:#14532d,stroke:#22c55e,color:#fff
+    class R401,R413,R503 refuse
+    class OK,OKU admit
+
+%% Notes that are not obvious from the shapes:
+%%
+%% 1. The `none` branch matches the SOCKET PEER, never X-Forwarded-For. The packaged entry point
+%%    runs uvicorn with proxy_headers=False so this stays true. It also requires three startup
+%%    guards that are not drawn here: server.allow_unverified, a per-source unverified_reason,
+%%    and a non-empty allow_from. The server refuses to boot without all three.
+%%
+%% 2. Every strategy function returns False for an empty secret, independently of the "source
+%%    enabled" check above it. The two are redundant on purpose: a misordered call still fails
+%%    closed.
+%%
+%% 3. The unrecognised-strategy branch is the fallthrough at the end of verify(). It must stay a
+%%    refusal, so a future config shape can never reach "accepted" by default.

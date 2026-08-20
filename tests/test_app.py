@@ -272,6 +272,25 @@ class TestDeliveryId:
         client.post("/webhook/github", content=BODY, headers=headers)
         assert captured[0].delivery_id.startswith("sha256:")
 
+    def test_an_overlong_delivery_header_is_truncated_not_rejected(self, base_config, base_env):
+        """The header is producer-controlled and lands in a unique index and every log line."""
+        from webhook_doorman.app import MAX_DELIVERY_ID_LENGTH
+
+        captured: list = []
+        client = build(base_config, base_env, captured)
+        resp = client.post(
+            "/webhook/github", content=BODY, headers=github_headers(BODY, "x" * 5000)
+        )
+        assert resp.status_code == 200
+        assert len(captured[0].delivery_id) == MAX_DELIVERY_ID_LENGTH
+
+    def test_truncation_is_deterministic_so_dedup_still_works(self, base_config, base_env):
+        captured: list = []
+        client = build(base_config, base_env, captured)
+        for _ in range(2):
+            client.post("/webhook/github", content=BODY, headers=github_headers(BODY, "y" * 5000))
+        assert captured[0].delivery_id == captured[1].delivery_id
+
     def test_identical_bodies_produce_the_same_fallback_id(self, base_config, base_env):
         captured: list = []
         client = build(base_config, base_env, captured)
