@@ -66,6 +66,66 @@ jobs:
           webhook-doorman --version
           webhook-doorman --config config.example.yml --check
 
+  image:
+    name: Image build and contents check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # amd64 only here — this job is a correctness gate on every PR, and the arm64 leg is
+      # emulated and slow. The publish workflow builds both.
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          load: true
+          tags: webhook-doorman:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The published image is public. A .dockerignore entry that stops matching does so
+      # silently, so this asserts on the actual filesystem of the built image.
+      #
+      # Vendored paths are excluded first: the base image ships a CA bundle full of .pem files
+      # and several dependencies vendor their own tests/ directory. Matching those would make
+      # the check noisy enough to be disabled, which is worse than not having it.
+      - name: Assert no secrets, config or tests reached the image
+        run: |
+          docker create --name probe webhook-doorman:ci >/dev/null
+          docker export probe > image.tar
+          docker rm probe >/dev/null
+          tar -tf image.tar > all.txt
+
+          grep -vE '^(etc/ssl/|usr/(lib|share|local)/|opt/venv/lib/python[0-9.]+/site-packages/[^w])' \
+            all.txt > own.txt
+
+          if grep -Ei '(^|/)(\.env(\..*)?|config\.ya?ml|secrets\.ya?ml|.*\.key|.*\.pem)$' own.txt; then
+            echo "::error::a secret or config file reached the published image"; exit 1
+          fi
+          if grep -E '(^|/)tests/' own.txt; then
+            echo "::error::test fixtures reached the published image"; exit 1
+          fi
+          # The build context should never have produced a copy of the source tree or the repo
+          # root in the final stage.
+          if grep -E '^(src/|build/|\.git/)' own.txt; then
+            echo "::error::build context leaked into the final stage"; exit 1
+          fi
+          echo "image contents clean ($(wc -l < all.txt) entries, $(wc -l < own.txt) non-vendored)"
+
+      - name: Assert the image does not run as root
+        run: |
+          uid=$(docker run --rm --entrypoint id webhook-doorman:ci -u)
+          echo "runtime uid: $uid"
+          [ "$uid" = "10001" ] || { echo "::error::expected uid 10001, got $uid"; exit 1; }
+
+      - name: Smoke-test the entry point
+        run: |
+          docker run --rm --entrypoint webhook-doorman webhook-doorman:ci --version
+          docker run --rm -v "$PWD/config.example.yml:/config/config.yml:ro" \
+            webhook-doorman:ci --check
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest

@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retryable and permanent sink failures are distinguished: 5xx, 408, 429 and transport errors
   back off; other 4xx and template errors go straight to the DLQ.
 
+- Multi-stage Dockerfile on `python:3.13-slim`, running as a fixed non-root UID 10001, with a
+  stdlib `HEALTHCHECK` on `/health` and `/data` as a volume.
+- Multi-arch publish (amd64 + arm64) to `ghcr.io/tadmstr/webhook-doorman` on push to `main` and
+  on tags, using the workflow's built-in `GITHUB_TOKEN` — no PAT, no repository secret.
+- `docker-compose.yml` with hardened defaults: `read_only`, `no-new-privileges`, `cap_drop: ALL`,
+  and a loopback-only publish.
+- CI job that builds the image and asserts on its actual filesystem that no `.env`, `config.yml`
+  or test fixture reached the published layers, and that the runtime UID is not root.
+
 ### Fixed
 
 - A secret echoed into a payload field could reach the event log through a parser's `context`,
