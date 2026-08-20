@@ -306,7 +306,9 @@ class TestDeliveryId:
 class TestHealth:
     def test_reports_enabled_sources(self, base_config, base_env):
         client = build(base_config, base_env)
-        body = client.get("/health").json()
+        response = client.get("/health")
+        assert response.status_code == 200
+        body = response.json()
         assert body["status"] == "ok"
         assert body["sources"]["github"]["enabled"] is True
         assert body["unverified_sources"] == []
@@ -325,6 +327,115 @@ class TestHealth:
     def test_health_does_not_leak_secret_values(self, base_config, base_env):
         client = build(base_config, base_env)
         assert GITHUB_SECRET not in client.get("/health").text
+
+
+class TestHealthStatusCode:
+    """The status code is what `Dockerfile`'s HEALTHCHECK reads, so it carries the verdict.
+
+    The distinction these tests pin down is partial vs. total. One disabled source out of two is
+    a deliberate operator state on forge right now — a `GITHUB_WEBHOOK_SECRET` that has not been
+    provisioned — and turning that into an unhealthy container would be a worse answer than the
+    unconditional `ok` it replaces.
+    """
+
+    def test_partial_degradation_stays_healthy(self, base_config, base_env):
+        del base_env["GITHUB_WEBHOOK_SECRET"]
+        client = build(base_config, base_env)
+        response = client.get("/health")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body["sources"]["github"]["enabled"] is False
+        assert body["sources"]["internal"]["enabled"] is True
+
+    def test_zero_enabled_sources_is_degraded(self, base_config, base_env):
+        client = build(base_config, {})
+        response = client.get("/health")
+        assert response.status_code == 503
+        body = response.json()
+        assert body["status"] == "degraded"
+        assert "no sources are enabled" in body["degraded"]
+
+    def test_a_router_with_no_working_source_still_reports_why(self, base_config):
+        """Degraded is not a substitute for the detail — the reasons stay in the body."""
+        body = build(base_config, {}).get("/health").json()
+        assert "GITHUB_WEBHOOK_SECRET" in body["sources"]["github"]["reason"]
+        assert "INTERNAL_TOKEN" in body["sources"]["internal"]["reason"]
+
+
+class StubEngine:
+    """The minimum of `EngineLike` that `/health` and app construction touch."""
+
+    def __init__(self, stats: dict | None = None, raises: Exception | None = None) -> None:
+        self._stats = stats or {"events": 3, "deliveries": 5, "dlq": 1}
+        self._raises = raises
+        self.stats_calls = 0
+
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
+
+    async def ingest(self, event):  # pragma: no cover - not exercised by health tests
+        return {"status": "accepted", "delivery_id": event.delivery_id}
+
+    async def replay(self, event_id):  # pragma: no cover - not exercised by health tests
+        return {"status": "replayed", "event_id": event_id}
+
+    async def stats(self) -> dict:
+        self.stats_calls += 1
+        if self._raises is not None:
+            raise self._raises
+        return self._stats
+
+    def check_admin_token(self, presented: str) -> bool:  # pragma: no cover - not exercised
+        return False
+
+
+def build_with_engine(config_data: dict, env: dict, engine) -> TestClient:
+    app = create_app(config=Config.model_validate(config_data), env=env, engine=engine)
+    return TestClient(app, client=("127.0.0.1", 51234))
+
+
+class TestHealthStats:
+    """`stats()` was implemented at three layers and called from nowhere but tests.
+
+    `store/base.py` documents it as being "for `/health` and operator sanity", so the gap was in
+    the wiring rather than the design.
+    """
+
+    def test_stats_are_included_when_an_engine_is_present(self, base_config, base_env):
+        engine = StubEngine({"events": 3, "deliveries": 5, "dlq": 1, "deliveries_pending": 2})
+        body = build_with_engine(base_config, base_env, engine).get("/health").json()
+        assert body["stats"] == {
+            "events": 3,
+            "deliveries": 5,
+            "dlq": 1,
+            "deliveries_pending": 2,
+        }
+        assert engine.stats_calls == 1
+
+    def test_no_engine_means_no_stats_key(self, base_config, base_env):
+        """The log-only path has no store, so an absent key is the honest answer."""
+        response = build(base_config, base_env).get("/health")
+        assert response.status_code == 200
+        assert "stats" not in response.json()
+
+    def test_a_failing_stats_degrades_rather_than_500s(self, base_config, base_env):
+        """An unreachable store reports the same as a dead process if this route 500s."""
+        engine = StubEngine(raises=RuntimeError("store is not connected; call connect() first"))
+        response = build_with_engine(base_config, base_env, engine).get("/health")
+        assert response.status_code == 503
+        body = response.json()
+        assert body["status"] == "degraded"
+        assert "store is unavailable" in body["degraded"]
+        assert "stats" not in body
+        # The rest of the report survives a store failure — it is resolved config, not storage.
+        assert body["sources"]["github"]["enabled"] is True
+
+    def test_a_failing_stats_does_not_leak_the_exception_to_the_client(self, base_config, base_env):
+        engine = StubEngine(raises=RuntimeError(f"connection string: {GITHUB_SECRET}"))
+        text = build_with_engine(base_config, base_env, engine).get("/health").text
+        assert GITHUB_SECRET not in text
 
 
 class TestAppConstruction:

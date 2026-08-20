@@ -6,13 +6,15 @@ sleep produces a suite that is slow when it passes and confusing when it fails.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import httpx
 import pytest
 
 from webhook_doorman.config import Config
 from webhook_doorman.engine import Engine
 from webhook_doorman.errors import PermanentSinkError, SinkError
-from webhook_doorman.models import InboundEvent
+from webhook_doorman.models import InboundEvent, utcnow
 from webhook_doorman.secrets import resolve
 from webhook_doorman.store import SqliteStore
 
@@ -53,6 +55,21 @@ async def engine(tmp_path):
     await eng.start()
     yield eng
     await eng.stop()
+
+
+async def next_attempt_delay(engine: Engine) -> float:
+    """Seconds from now until the one pending delivery is next due.
+
+    Read from the row rather than from the return value of a helper, because the thing under
+    test is what the *scheduler wrote down* — a delay computed correctly and then stored against
+    the wrong column would pass any assertion made on the computation alone.
+    """
+    cursor = await engine.store.db.execute(
+        "SELECT next_attempt_at FROM deliveries WHERE next_attempt_at IS NOT NULL"
+    )
+    row = await cursor.fetchone()
+    assert row is not None, "no delivery was scheduled for a retry"
+    return (datetime.fromisoformat(row["next_attempt_at"]) - utcnow()).total_seconds()
 
 
 def event(delivery_id: str = "d-1", sinks: list[str] | None = None) -> InboundEvent:
@@ -204,6 +221,99 @@ class TestBackoff:
     def test_never_negative(self, engine):
         engine.config.delivery.jitter = 2.0
         assert all(engine.backoff_seconds(1) >= 0 for _ in range(50))
+
+
+class TestRetryAfter:
+    """A destination's own answer about when to come back, and the bounds on trusting it."""
+
+    def test_overrides_the_backoff_curve(self, engine):
+        engine.config.delivery.jitter = 0.0
+        assert engine.backoff_seconds(1) == 1  # what the curve would have chosen
+        assert engine.retry_delay_seconds(1, 7.0) == 7.0
+
+    def test_is_clamped_to_max_backoff(self, engine):
+        """`Retry-After: 86400` would park the delivery for a day, and because it never runs out
+        of attempts the DLQ would never see it either."""
+        engine.config.delivery.jitter = 0.0
+        engine.config.delivery.max_backoff_seconds = 300
+        assert engine.retry_delay_seconds(1, 86400.0) == 300
+
+    def test_still_jitters(self, engine):
+        """Every queued delivery for one destination is handed the same number, so honouring it
+        to the millisecond is a thundering herd by construction."""
+        engine.config.delivery.jitter = 0.5
+        values = {engine.retry_delay_seconds(1, 8.0) for _ in range(50)}
+        assert len(values) > 1
+        assert all(4 <= v <= 12 for v in values)
+
+    def test_a_negative_value_never_becomes_a_negative_delay(self, engine):
+        engine.config.delivery.jitter = 0.0
+        assert engine.retry_delay_seconds(1, -30.0) == 0.0
+
+    def test_none_falls_back_to_the_curve(self, engine):
+        engine.config.delivery.jitter = 0.0
+        assert engine.retry_delay_seconds(3, None) == engine.backoff_seconds(3)
+
+    async def test_a_429_schedules_at_the_advertised_delay(self, engine, httpx_mock):
+        """End to end: response header -> `SinkError.retry_after` -> `next_attempt_at`."""
+        engine.config.delivery.jitter = 0.0
+        httpx_mock.add_response(url=SINK_URL, status_code=429, headers={"Retry-After": "7"})
+        await engine.ingest(event())
+        await engine.run_once()
+
+        delay = await next_attempt_delay(engine)
+        assert 6 <= delay <= 8  # not the ~1s the exponential curve would have picked
+
+    async def test_without_the_header_the_curve_still_applies(self, engine, httpx_mock):
+        engine.config.delivery.jitter = 0.0
+        httpx_mock.add_response(url=SINK_URL, status_code=429)
+        await engine.ingest(event())
+        await engine.run_once()
+
+        assert await next_attempt_delay(engine) <= 2  # base_backoff_seconds is 1 here
+
+    async def test_a_hostile_delay_cannot_park_a_delivery(self, engine, httpx_mock):
+        engine.config.delivery.jitter = 0.0
+        engine.config.delivery.max_backoff_seconds = 5
+        httpx_mock.add_response(url=SINK_URL, status_code=429, headers={"Retry-After": "86400"})
+        await engine.ingest(event())
+        await engine.run_once()
+
+        assert await next_attempt_delay(engine) <= 6
+
+
+class TestUnicodeFailsFast:
+    async def test_an_unencodable_header_dlqs_on_the_first_attempt(self, tmp_path, httpx_mock):
+        """One attempt and a DLQ row, not `max_attempts` of a failure that cannot change.
+
+        Driven through the generic `http` sink with a non-ASCII configured header, so the error
+        is raised from inside `client.request` exactly as the live ntfy defect raised it.
+        """
+        config = Config.model_validate(
+            {
+                **CONFIG,
+                "sinks": [
+                    {
+                        "name": "notes",
+                        "type": "http",
+                        "url": SINK_URL,
+                        "headers": {"X-Trace": "café"},
+                    }
+                ],
+            }
+        )
+        eng = Engine(resolve(config, ENV), store=SqliteStore(tmp_path / "unicode.db"))
+        await eng.start()
+        try:
+            await eng.ingest(event())
+            await eng.run_once()
+            stats = await eng.stats()
+            assert stats["dlq"] == 1
+            assert stats["deliveries_exhausted"] == 1
+            assert stats.get("deliveries_pending", 0) == 0
+            assert httpx_mock.get_requests() == []
+        finally:
+            await eng.stop()
 
 
 class TestReplay:

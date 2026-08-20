@@ -204,7 +204,7 @@ class Engine:
             )
             await self._exhaust(delivery, str(exc), None, 0)
         except SinkError as exc:
-            await self._schedule_retry(delivery, str(exc), None, 0)
+            await self._schedule_retry(delivery, str(exc), None, 0, retry_after=exc.retry_after)
         except Exception as exc:  # pragma: no cover - defensive; a sink bug is not a lost event
             log.exception("delivery_unexpected_error", delivery=delivery.id, sink=delivery.sink)
             await self._schedule_retry(delivery, repr(exc), None, 0)
@@ -220,7 +220,13 @@ class Engine:
             )
 
     async def _schedule_retry(
-        self, delivery: Delivery, error: str, code: int | None, latency_ms: int
+        self,
+        delivery: Delivery,
+        error: str,
+        code: int | None,
+        latency_ms: int,
+        *,
+        retry_after: float | None = None,
     ) -> None:
         attempts_made = delivery.attempt + 1
         if attempts_made >= self.config.delivery.max_attempts:
@@ -234,7 +240,7 @@ class Engine:
             await self._exhaust(delivery, error, code, latency_ms)
             return
 
-        delay = self.backoff_seconds(attempts_made)
+        delay = self.retry_delay_seconds(attempts_made, retry_after)
         await self.store.mark_retry(
             delivery.id,
             error=error,
@@ -248,6 +254,7 @@ class Engine:
             sink=delivery.sink,
             attempt=attempts_made,
             retry_in_s=round(delay, 2),
+            honoured_retry_after=retry_after is not None,
             error=error,
         )
 
@@ -262,17 +269,37 @@ class Engine:
             exhausted_at=utcnow(),
         )
 
+    def retry_delay_seconds(self, attempt: int, retry_after: float | None = None) -> float:
+        """How long before the next attempt.
+
+        A destination that sent `Retry-After` gets to overrule the backoff curve — it knows when
+        its rate-limit window reopens and the curve is only guessing. Discord rate-limits at
+        roughly 5 requests / 2 seconds per webhook and Slack at roughly 1 message / second per
+        channel, so this is the ordinary case for those, not an exotic one.
+
+        Two things it does not get to do:
+
+        * **Park a delivery.** The value is clamped to `delivery.max_backoff_seconds`. Without
+          that, a hostile or buggy destination answering `Retry-After: 86400` holds a delivery
+          for a day, and because it never exhausts its attempts the DLQ never sees it either.
+        * **Escape the jitter.** A server-supplied delay causes a thundering herd in exactly the
+          way an un-jittered backoff does — more so, because every queued delivery for that
+          destination gets handed the *same* number rather than merely a similar one.
+        """
+        cfg = self.config.delivery
+        if retry_after is None:
+            raw = cfg.base_backoff_seconds * (2 ** max(0, attempt - 1))
+        else:
+            raw = max(0.0, retry_after)
+        return _jittered(min(raw, cfg.max_backoff_seconds), cfg.jitter)
+
     def backoff_seconds(self, attempt: int) -> float:
         """Exponential backoff with jitter, capped.
 
         Jitter is not decoration. After an outage every queued delivery comes due at the same
         moment; firing them in lockstep re-creates the load that caused the outage.
         """
-        cfg = self.config.delivery
-        raw = cfg.base_backoff_seconds * (2 ** max(0, attempt - 1))
-        capped = min(raw, cfg.max_backoff_seconds)
-        spread = capped * cfg.jitter
-        return max(0.0, capped + random.uniform(-spread, spread))
+        return self.retry_delay_seconds(attempt)
 
     # -- retention ---------------------------------------------------------------------
 
@@ -312,6 +339,12 @@ class Engine:
         if not expected or not presented:
             return False
         return hmac.compare_digest(expected, presented)
+
+
+def _jittered(seconds: float, jitter: float) -> float:
+    """Spread a delay by ±`jitter` of itself, never below zero."""
+    spread = seconds * jitter
+    return max(0.0, seconds + random.uniform(-spread, spread))
 
 
 def stored_event_context(event: StoredEvent) -> dict[str, Any]:

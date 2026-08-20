@@ -7,9 +7,19 @@ that could not fail. Each condition gets its own test asserting the *startup* re
 
 from __future__ import annotations
 
-import pytest
+from typing import Annotated, Any, Literal, get_args, get_origin
 
-from webhook_doorman.config import Config, load_config
+import pytest
+from pydantic import BaseModel
+
+from webhook_doorman.config import (
+    Config,
+    SinkSpec,
+    VerifySpec,
+    load_config,
+    secret_env_names,
+    sink_secret_env_names,
+)
 from webhook_doorman.errors import ConfigError
 
 
@@ -202,3 +212,112 @@ class TestLoadConfig:
             "INTERNAL_TOKEN",
             "ADMIN_TOKEN",
         }
+
+
+# --------------------------------------------------------------------------------------
+# Credential discovery
+# --------------------------------------------------------------------------------------
+
+# Fields whose validator constrains the value beyond its type, so a generic sample would be
+# rejected. Keep this as small as it can be — every entry is a place the synthesiser is blind.
+_FIELD_OVERRIDES: dict[str, Any] = {
+    "allow_from": ["127.0.0.1/32"],
+    "project_id": 1,
+}
+
+
+def _union_members(spec: Any) -> tuple[type[BaseModel], ...]:
+    """The concrete models behind a discriminated `Annotated[A | B, Field(...)]` union."""
+    if get_origin(spec) is Annotated:
+        spec = get_args(spec)[0]
+    return get_args(spec)
+
+
+def _sample_value(field_name: str, annotation: Any) -> Any:
+    if field_name in _FIELD_OVERRIDES:
+        return _FIELD_OVERRIDES[field_name]
+    if get_origin(annotation) is Literal:
+        return get_args(annotation)[0]
+    if field_name.endswith("_env"):
+        return f"PROBE_{field_name.upper()}"
+    if annotation is int:
+        return 1
+    return "probe"
+
+
+def _minimal_instance(model: type[BaseModel]) -> BaseModel:
+    """Build the smallest valid instance of `model`, with every `*_env` field populated.
+
+    Optional `*_env` fields are set too, not just required ones: an optional credential that
+    goes undiscovered fails exactly as openly as a required one, and `url_env` on
+    `_EndpointMixin` is optional but is the field Plan 2's Discord and Slack sinks depend on.
+    """
+    values = {
+        name: _sample_value(name, field.annotation)
+        for name, field in model.model_fields.items()
+        if field.is_required() or name.endswith("_env")
+    }
+    return model(**values)
+
+
+def _env_field_values(instance: BaseModel) -> set[str]:
+    return {
+        value
+        for name in type(instance).model_fields
+        if name.endswith("_env") and (value := getattr(instance, name, None))
+    }
+
+
+class TestSinkSecretDiscovery:
+    """`sink_secret_env_names` must see every `*_env` field on every member of the union.
+
+    This is a sentinel, not a regression test. Today's four sinks pass it trivially — the four
+    names the old hardcoded tuple listed happen to be all there are. It exists so that the next
+    sink to carry a differently-named credential (`webhook_url_env`) fails here, in CI, rather
+    than in production as a sink reporting `enabled: true` with its variable unset and its value
+    absent from the redaction set.
+    """
+
+    @pytest.mark.parametrize("model", _union_members(SinkSpec), ids=lambda m: m.__name__)
+    def test_every_env_field_is_discovered(self, model):
+        instance = _minimal_instance(model)
+        expected = _env_field_values(instance)
+        assert expected, f"{model.__name__} has no *_env field — the probe is not testing anything"
+        assert set(sink_secret_env_names(instance)) == expected
+
+    def test_discovers_a_field_name_it_has_never_seen(self):
+        """The mechanism, isolated from today's union.
+
+        `webhook_url_env` is not one of the four names the old implementation knew, and is the
+        exact field Plan 2 adds for Discord and Slack.
+        """
+
+        class ScratchSink(BaseModel):
+            name: str = "scratch"
+            type: Literal["scratch"] = "scratch"
+            webhook_url_env: str = "DISCORD_WEBHOOK_URL"
+            template: str = "{{ summary }}"
+
+        assert sink_secret_env_names(ScratchSink()) == ["DISCORD_WEBHOOK_URL"]
+
+    def test_unset_optional_env_fields_are_omitted(self):
+        """An unset optional credential is not a name — it must not reach `required_env_names`."""
+        ntfy = next(m for m in _union_members(SinkSpec) if m.__name__ == "NtfySink")
+        instance = ntfy(
+            name="push", type="ntfy", url="https://ntfy.example.invalid", topic_env="TOPIC"
+        )
+        assert sink_secret_env_names(instance) == ["TOPIC"]
+
+
+class TestVerifySecretDiscovery:
+    """`secret_env_names` is an `isinstance` chain, so exhaustiveness is the thing at risk.
+
+    It is correct today only because all four union members are named in it. A fifth strategy
+    carrying a `*_env` field would fall through to `return []` and be invisible in precisely the
+    way `sink_secret_env_names` used to be, so assert it rather than re-reading it each review.
+    """
+
+    @pytest.mark.parametrize("model", _union_members(VerifySpec), ids=lambda m: m.__name__)
+    def test_every_env_field_is_discovered(self, model):
+        instance = _minimal_instance(model)
+        assert set(secret_env_names(instance)) == _env_field_values(instance)

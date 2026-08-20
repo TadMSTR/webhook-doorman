@@ -14,8 +14,11 @@ Failure vocabulary, and the distinction is load-bearing:
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 
 import httpx
@@ -55,7 +58,9 @@ class HttpSinkBase:
     """Shared HTTP mechanics: timing, status classification, error translation.
 
     Status handling is the part worth stating explicitly. 4xx is permanent *except* 408 and 429,
-    which are the two the server is explicitly asking you to try again.
+    which are the two the server is explicitly asking you to try again. On those, and on 5xx,
+    a `Retry-After` header is carried back to the engine on the `SinkError` rather than
+    discarded — see `parse_retry_after`.
     """
 
     name: str
@@ -70,6 +75,15 @@ class HttpSinkBase:
         started = time.monotonic()
         try:
             response = await client.request(method, url, **kwargs)
+        except UnicodeError as exc:
+            # httpx encodes header values as ASCII, so a non-ASCII header raises from inside
+            # `client.request` rather than arriving as an HTTP status. Encoding failures are
+            # deterministic — the same bytes fail identically every time — so five attempts with
+            # backoff only delay the moment an operator finds out. Fail to the DLQ on the first.
+            # Sinks that render event content into a header should encode it themselves (see
+            # `NtfySink_`); this is the net under them, and it is what keeps a sink safe by
+            # default when its message routinely carries an em-dash or an emoji.
+            raise PermanentSinkError(f"{self.name}: cannot encode request: {exc}") from exc
         except httpx.TimeoutException as exc:
             raise SinkError(f"{self.name}: timeout after {_elapsed(started)}ms: {exc}") from exc
         except httpx.HTTPError as exc:
@@ -83,8 +97,59 @@ class HttpSinkBase:
 
         detail = response.text[:200]
         if code in (408, 429) or code >= 500:
-            raise SinkError(f"{self.name}: HTTP {code}: {detail}")
+            # A destination that says when to come back is answering the question the backoff
+            # curve is guessing at. Read it on every retryable status rather than only 429 —
+            # `Retry-After` is defined for 503 as well. The value is untrusted; the engine
+            # clamps it, because a sink has no access to `delivery.max_backoff_seconds`.
+            raise SinkError(
+                f"{self.name}: HTTP {code}: {detail}",
+                retry_after=parse_retry_after(response.headers.get("retry-after")),
+            )
         raise PermanentSinkError(f"{self.name}: HTTP {code}: {detail}")
+
+
+def parse_retry_after(value: str | None, *, now: datetime | None = None) -> float | None:
+    """Seconds to wait, read from a `Retry-After` header. `None` if absent or unreadable.
+
+    Both forms in RFC 9110 §10.2.3 are accepted: delta-seconds (`Retry-After: 7`) and an
+    HTTP-date (`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`). A date already in the past gives
+    `0.0` — "come back now" — rather than a negative delay.
+
+    Everything else returns `None`, so the caller falls back to its own backoff curve. That
+    direction is the safe one and it is worth being strict about, because this is the one field
+    in the delivery path whose value comes from the destination:
+
+    * **Non-finite.** `float()` happily accepts `nan`, `inf` and any integer long enough to
+      overflow to `inf`. The engine's clamp would contain all of them today, but a parser that
+      can hand back `inf` is one refactor away from an `inf` reaching an arithmetic that has no
+      clamp — `_jittered(inf)` produces `nan`, and a `nan` delay is a delivery that is never due.
+      Rejecting it here means the guarantee does not rest on the caller remembering to clamp.
+    * **Negative delta-seconds.** Not a valid delta — RFC 9110 defines it as non-negative — and
+      reading one as "retry now" lets a destination *accelerate* our retries at itself, spending
+      the whole attempt budget as fast as the poll loop allows. A past HTTP-date is different:
+      that genuinely means now, and is treated as `0.0`.
+    """
+    if value is None:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+
+    try:
+        seconds = float(raw)
+    except ValueError:
+        pass
+    else:
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        # An HTTP-date is GMT by definition; a naive result means the sender omitted the zone.
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - (now or datetime.now(UTC))).total_seconds())
 
 
 def _elapsed(started: float) -> int:

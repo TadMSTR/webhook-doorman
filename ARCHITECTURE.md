@@ -222,6 +222,24 @@ A model added to the `SinkSpec` union, a class in `sinks/`, an entry in `_BUILDE
 `PermanentSinkError` for failures a retry cannot fix, `SinkError` for ones it can — that
 distinction is what keeps a 400 from burning five attempts and a 503 from being discarded.
 
+Three things the base layer already handles, so a new sink does not have to:
+
+- **Credentials are discovered, not registered.** Any field on the model whose name ends in
+  `_env` is picked up by `sink_secret_env_names()`, which derives them from the model rather
+  than from a list. Name a field `webhook_url_env` and it is automatically required at startup,
+  reported at `/health`, and added to the redaction set — there is no second place to update.
+  (Before 0.1.1 this was a hardcoded tuple of four names, so a sink with any other credential
+  field reported `enabled: true` with its variable unset, and its value was never redacted.)
+- **Header encoding is guarded.** `HttpSinkBase._send` turns a `UnicodeError` into a
+  `PermanentSinkError`, so a non-ASCII header value fails to the DLQ on the first attempt rather
+  than spending the whole retry budget on an error that cannot change. A sink that renders event
+  content into a header should still encode it itself — see `_encoded_word` in
+  `sinks/implementations.py` — because failing fast beats five failures, but delivering beats
+  both.
+- **`Retry-After` is honoured.** A retryable response carrying the header puts the advertised
+  delay on the `SinkError`, and the engine schedules against it — clamped to
+  `delivery.max_backoff_seconds`, and still jittered. A sink does not need to think about it.
+
 ### A different storage backend
 
 `store/base.py` is the seam. Every SQL statement in the project is behind it, and the engine

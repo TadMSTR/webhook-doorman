@@ -27,6 +27,18 @@ class SinkError(WebhookDoormanError):
     a backoff. Raise `PermanentSinkError` instead when a retry cannot possibly succeed.
     """
 
+    def __init__(self, *args: object, retry_after: float | None = None) -> None:
+        super().__init__(*args)
+        self.retry_after = retry_after
+        """Seconds the destination asked us to wait, from its `Retry-After` header.
+
+        **Untrusted and unclamped.** It is whatever the far end sent, and the far end may be
+        hostile, broken, or simply wrong — `Retry-After: 86400` would park a delivery for a day
+        and the DLQ would never see it. `Engine._schedule_retry` is what bounds it, against
+        `delivery.max_backoff_seconds`, because scheduling policy belongs to the engine and a
+        sink has no access to the config. Do not schedule on this value directly.
+        """
+
 
 class PermanentSinkError(SinkError):
     """A sink failed in a way that retrying will not fix (4xx, malformed template, bad config).
