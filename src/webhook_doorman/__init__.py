@@ -4,6 +4,6 @@ Verify, persist, deliver. One ingress, per-source verification declared in YAML,
 delivery with retry and a dead-letter queue.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = ["__version__"]

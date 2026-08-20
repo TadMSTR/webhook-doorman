@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "webhook-doorman"
-version = "0.2.0"
+version = "0.3.0"
 description = "A fail-closed inbound webhook router: verify, persist, deliver."
 readme = "README.md"
 license = { text = "MIT" }

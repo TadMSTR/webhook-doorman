@@ -65,6 +65,24 @@ Two things to decide before writing the model:
   setting got one case wrong and shipped stored XSS. Assert **both halves** — escaped where it
   must be, untouched where it must not — so an over-broad fix fails as loudly as the bug.
 
+**A metric:** a definition in `metrics.py`'s `_HELP` table and an increment at a site that
+*already logs the same event*. That symmetry is the rule — every counter has a corresponding log
+line and vice versa, so a new counter with no log line beside it means one of the two is in the
+wrong place. Two things that are not negotiable:
+
+- **Counter or gauge, decided before you name it.** Anything read from `store.stats()` is a
+  point-in-time count that goes *down* when the retention sweep runs. It is a gauge, and naming
+  it `_total` makes every `rate()` over it silently wrong. There is a test asserting no gauge is
+  named `_total`; do not delete it to make room for a convenient name.
+- **No producer-controlled label, ever.** `source`, `sink` and `strategy` come from
+  `config.yml`; `reason` and `outcome` are closed vocabularies in `metrics.py`. `event_type` and
+  `response_code` are unbounded and belong in the log line — a producer varying either turns
+  `/metrics` into an out-of-memory.
+
+`metrics.py` emits the exposition format by hand, so assert against `prometheus_client`'s parser
+(a dev dependency) rather than against a string you wrote. An assertion agreeing with the emitter
+proves nothing about whether a real scraper can read it.
+
 **A parser:** a function in `parsers.py` plus a registry entry. Parsers must not raise on
 malformed input — webhook payloads are documented optimistically and delivered otherwise, and a
 parser that throws turns a cosmetic upstream change into a rejected delivery. Use defensive

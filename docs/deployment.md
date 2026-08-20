@@ -87,8 +87,20 @@ The `config.yml` mount is fine as a bind mount: it holds no secrets and should b
 
 ## Reverse proxy
 
-`/admin/replay/{event_id}` re-fires stored events at their real destinations. It requires a
-token, and it should also be unreachable from outside.
+Two prefixes should be unreachable from outside.
+
+`/admin/` re-fires stored events at their real destinations (`/admin/replay/{event_id}`) and
+lists the dead-letter queue (`/admin/dlq`). It requires a token.
+
+`/metrics` is **unauthenticated by default** — that is the Prometheus scrape convention, and
+requiring a token breaks a stock `scrape_config`. It exposes no payload, header or secret, but
+it does expose your source and sink *names* and your traffic volume, which is topology. Deny it
+at the edge and scrape it from inside the network. If you would rather gate it, set
+`metrics.token_env`; note that a token shorter than 32 characters is treated as absent and
+leaves the endpoint **open**, which is logged as `metrics_unauthenticated` at boot.
+
+A source `path` may not start with `/admin` or `/metrics`, so neither deny rule below can
+accidentally shadow an ingest path.
 
 **nginx:**
 
@@ -99,6 +111,10 @@ server {
 
     location /admin/ {
         return 404;          # 404, not 403 — do not confirm it exists
+    }
+
+    location /metrics {
+        return 404;
     }
 
     location / {
@@ -113,6 +129,9 @@ server {
 ```caddy
 hooks.example.com {
     handle /admin/* {
+        respond 404
+    }
+    handle /metrics* {
         respond 404
     }
     handle {
@@ -196,6 +215,74 @@ Events worth alerting on:
 | `delivery_exhausted` | A delivery gave up and went to the DLQ. |
 | `deliveries_requeued` | Recovery after an unclean shutdown. Expected after a restart. |
 | `health_stats_failed` | `/health` could not read the store. The container is reporting 503. |
+| `metrics_unauthenticated` | `metrics.token_env` is set but the value is missing or too short. **`/metrics` is serving without a token.** |
+| `tracing_unavailable` | `OTEL_EXPORTER_OTLP_ENDPOINT` is set but the `[otel]` extra is not installed. No spans are being exported. |
+
+---
+
+## Metrics
+
+`GET /metrics` serves the Prometheus text exposition format. See the Reverse proxy section above
+for why it should be denied at the edge and scraped from inside the network.
+
+```yaml
+scrape_configs:
+  - job_name: webhook-doorman
+    static_configs:
+      - targets: ["webhook-doorman:8080"]
+```
+
+Two things to know before writing a query against it:
+
+- **The gauges are point-in-time**, not cumulative. `webhook_doorman_events_stored`,
+  `webhook_doorman_deliveries` and `webhook_doorman_dlq_size` are `COUNT(*)` at scrape time and
+  go *down* when the retention sweep runs. None of them is named `_total`, and none should be
+  wrapped in `rate()`.
+- **The counters reset when the process restarts.** That is correct Prometheus semantics —
+  `rate()` and `increase()` handle it — and `process_start_time_seconds` tells you when it
+  happened, so a restart is distinguishable from a genuine drop to zero.
+
+The metric worth alerting on is `webhook_doorman_verification_failures_total`. For a fail-closed
+router the rejection rate is the security signal, not a curiosity:
+
+```promql
+sum by (source) (rate(webhook_doorman_verification_failures_total[5m])) > 0.1
+```
+
+`webhook_doorman_delivery_attempts_total{outcome="exhausted"}` rising means events are reaching
+the DLQ; `/admin/dlq` is where you find out which.
+
+A scrape runs `COUNT(*)` over three tables. That is nothing at this volume — note it if you ever
+run this at a hundred times the traffic. If the store cannot be read, the scrape degrades to
+counters-only rather than failing: a 500 here would tell the scraper the target is down, which
+is less true than the gauges being briefly absent.
+
+---
+
+## Tracing
+
+Optional and off unless configured. Install the extra and set an endpoint:
+
+```yaml
+environment:
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://signoz-otel-collector:4318
+  OTEL_SERVICE_NAME: webhook-doorman
+```
+
+The published image already includes `[otel]`, so on Docker this is the whole configuration. On
+a pip install, `pip install 'webhook-doorman[otel]'` first — setting the endpoint without the
+extra logs `tracing_unavailable` at boot and the router serves traffic normally.
+
+One span per ingest and one per delivery attempt. They are **not** parent and child: a retry
+runs in the background worker minutes after the request has finished, so the delivery span is a
+root and `delivery_id` is the correlation key across both.
+
+**Do not add `--workers` to the entry point.** The SDK is configured in-process, and its
+`BatchSpanProcessor` thread does not survive a fork — adding workers would silently stop
+exporting spans from the children, with no error and no log line. SQLite has a single writer
+anyway, so more workers is not the scaling lever it looks like.
+
+---
 
 **Backups.** The database holds the event log — no credentials, by design, and there is a test
 asserting exactly that against the raw file. Back up `/data` if you want the replay history;
