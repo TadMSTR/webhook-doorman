@@ -202,6 +202,11 @@ class SourceConfig(_Strict):
                 "path must not live under /admin — that prefix is reserved for the "
                 "authenticated admin API and is expected to be blocked at the reverse proxy"
             )
+        if v.startswith("/metrics"):
+            raise ValueError(
+                "path must not live under /metrics — that prefix is reserved for the Prometheus "
+                "endpoint and is expected to be blocked at the reverse proxy"
+            )
         return v
 
     @field_validator("name")
@@ -459,6 +464,30 @@ class AdminConfig(_Strict):
     min_token_length: int = 32
 
 
+class MetricsConfig(_Strict):
+    """The Prometheus endpoint.
+
+    **Unauthenticated by default, unlike everything else here.** That is a deliberate exception
+    to this project's fail-closed posture and it is worth stating why: an unauthenticated
+    `/metrics` is the scrape convention, and requiring a token breaks a stock Prometheus
+    `scrape_config`, which is a real adoption cost paid by every operator to protect something
+    that is not a credential.
+
+    What it does expose is topology — the *names* of your sources and sinks, and your traffic
+    volume. Never a payload, a header or a secret. Three things bound that:
+
+    * `/metrics` is expected to be denied at the reverse proxy, exactly like `/admin/`, and
+      `SourceConfig.path` refuses to shadow either prefix so the deny rule cannot be
+      accidentally routed around.
+    * `token_env` gates it for an operator who wants that, at the cost of a non-standard
+      scrape config.
+    * The endpoint is read-only and has no parameters.
+    """
+
+    token_env: str | None = None
+    min_token_length: int = 32
+
+
 class Config(_Strict):
     sources: list[SourceConfig]
     sinks: list[SinkSpec]
@@ -466,6 +495,7 @@ class Config(_Strict):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     delivery: DeliveryConfig = Field(default_factory=DeliveryConfig)
     admin: AdminConfig = Field(default_factory=AdminConfig)
+    metrics: MetricsConfig = Field(default_factory=MetricsConfig)
 
     @model_validator(mode="after")
     def _cross_check(self):
@@ -517,6 +547,8 @@ class Config(_Strict):
             names.update(sink_secret_env_names(sink))
         if self.admin.token_env:
             names.add(self.admin.token_env)
+        if self.metrics.token_env:
+            names.add(self.metrics.token_env)
         return names
 
 

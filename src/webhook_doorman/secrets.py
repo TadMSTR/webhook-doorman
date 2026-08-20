@@ -84,6 +84,23 @@ class Resolved:
             return None
         return value
 
+    def metrics_token(self) -> str | None:
+        """The optional `/metrics` token, or None when the endpoint is ungated.
+
+        `None` here means **open**, which is the opposite of `admin_token()` — there, `None`
+        disables the endpoint. The asymmetry is deliberate and is the one place this project
+        does not fail closed: see `MetricsConfig` for why, and note that a token *configured*
+        but too short still returns `None`, so a typo'd gate silently opens the endpoint rather
+        than closing it. `log_startup_state` says so out loud at boot for exactly that reason.
+        """
+        name = self.config.metrics.token_env
+        if not name:
+            return None
+        value = self.secrets.get(name, "")
+        if len(value) < self.config.metrics.min_token_length:
+            return None
+        return value
+
 
 def _missing(names: list[str], env: Mapping[str, str]) -> tuple[str, ...]:
     return tuple(n for n in names if not env.get(n, "").strip())

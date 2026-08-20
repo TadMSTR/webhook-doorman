@@ -121,10 +121,19 @@ class HttpSinkBase:
             # `NtfySink_`); this is the net under them, and it is what keeps a sink safe by
             # default when its message routinely carries an em-dash or an emoji.
             raise PermanentSinkError(f"{self.name}: cannot encode request: {exc}") from exc
+        # Both failure paths carry the elapsed time, not just the message. A timeout is the
+        # slowest thing a sink does and a connect failure can take seconds to give up; recording
+        # either as 0ms would put the worst latencies in the fastest bucket and flatter the
+        # histogram exactly when the destination is at its worst.
         except httpx.TimeoutException as exc:
-            raise SinkError(f"{self.name}: timeout after {_elapsed(started)}ms: {exc}") from exc
+            raise SinkError(
+                f"{self.name}: timeout after {_elapsed(started)}ms: {exc}",
+                latency_ms=_elapsed(started),
+            ) from exc
         except httpx.HTTPError as exc:
-            raise SinkError(f"{self.name}: transport error: {exc}") from exc
+            raise SinkError(
+                f"{self.name}: transport error: {exc}", latency_ms=_elapsed(started)
+            ) from exc
 
         latency = _elapsed(started)
         code = response.status_code
@@ -147,8 +156,9 @@ class HttpSinkBase:
             raise SinkError(
                 f"{self.name}: HTTP {code}: {detail}",
                 retry_after=parse_retry_after(response.headers.get("retry-after")),
+                latency_ms=latency,
             )
-        raise PermanentSinkError(f"{self.name}: HTTP {code}: {detail}")
+        raise PermanentSinkError(f"{self.name}: HTTP {code}: {detail}", latency_ms=latency)
 
     def _classify(self, response: httpx.Response) -> Verdict:
         """What this response means. Override to correct a destination that disagrees with HTTP.

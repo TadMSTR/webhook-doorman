@@ -15,7 +15,10 @@ WORKDIR /src
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 
-RUN python -m venv /opt/venv && /opt/venv/bin/pip install .
+# `[otel]` is included in the image so enabling tracing is one environment variable rather than
+# a derived image. An adopter who never sets OTEL_EXPORTER_OTLP_ENDPOINT pays image size and
+# nothing else — tracing.py imports none of it unless that variable is set.
+RUN python -m venv /opt/venv && /opt/venv/bin/pip install '.[otel]'
 
 # --- runtime ----------------------------------------------------------------------------------
 FROM python:3.13-slim AS runtime
