@@ -534,8 +534,10 @@ def create_app(
     app.state.engine = engine
 
     # No-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set *and* the [otel] extra is installed.
-    # Never raises for either — see tracing.py.
-    tracing.configure(app)
+    # Never raises for either — see tracing.py. `secret_values` is not optional in practice:
+    # without it the httpx auto-instrumentation exports Discord and Slack webhook URLs, which
+    # are themselves the credential.
+    tracing.configure(app, secret_values=resolved.secret_values)
 
     METRICS.initialise(
         sources={name: s.config.verify.strategy for name, s in resolved.sources.items()},

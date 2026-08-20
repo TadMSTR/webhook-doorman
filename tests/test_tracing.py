@@ -10,10 +10,12 @@ deterministically, and therefore tests the same thing whether or not OTel is ins
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import sys
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -36,6 +38,9 @@ def _otel_installed() -> bool:
 
 OTEL_INSTALLED = _otel_installed()
 ENDPOINT = "http://collector.example.invalid:4318"
+
+#: Shaped like a Discord webhook token — the case where the URL *is* the credential.
+SINK_CREDENTIAL = "tok-0123456789abcdef-SECRET"
 
 BODY = json.dumps(
     {
@@ -155,6 +160,67 @@ class TestExtraMissing:
 
 @pytest.mark.skipif(not OTEL_INSTALLED, reason="the [otel] extra is not installed")
 class TestExtraPresent:
+    @staticmethod
+    def trace_one_request(path: str, *, secret_values: list[str]) -> list:
+        """Configure tracing, POST once over a real socket, return the exported spans.
+
+        A real listener rather than `httpx.MockTransport`: the instrumentation wraps the real
+        transport, so a mock transport produces **no client span at all** and every assertion
+        about span contents would pass vacuously.
+
+        The port is assigned by the OS. A fixed one collides between consecutive tests in this
+        class, and the resulting bind error looks like a tracing failure rather than a test-harness
+        one.
+        """
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        from opentelemetry import trace as otel_trace
+        from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        url = f"http://127.0.0.1:{server.server_address[1]}{path}"
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        # `set_tracer_provider` is one-shot per process: the second call logs "Overriding of
+        # current TracerProvider is not allowed" and *keeps the first one*, so without clearing
+        # the once-flag too this harness silently exports into an earlier test's provider and
+        # every assertion below passes vacuously against zero spans. Both internals are reset.
+        otel_trace._TRACER_PROVIDER = None
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = False
+        otel_trace.set_tracer_provider(provider)
+
+        HTTPXClientInstrumentor().uninstrument()
+        tracing._instrument(None, secret_values)
+        try:
+
+            async def go():
+                async with httpx.AsyncClient() as client:
+                    await client.post(url, json={"content": "x"})
+
+            asyncio.run(go())
+        finally:
+            HTTPXClientInstrumentor().uninstrument()
+            server.shutdown()
+            server.server_close()
+
+        return list(exporter.get_finished_spans())
+
     def test_an_endpoint_plus_the_extra_enables_tracing(self):
         assert tracing.configure(env={"OTEL_EXPORTER_OTLP_ENDPOINT": ENDPOINT}) is True
         assert tracing.enabled() is True
@@ -175,6 +241,52 @@ class TestExtraPresent:
         tracing.configure(env={"OTEL_EXPORTER_OTLP_ENDPOINT": ENDPOINT})
         with tracing.span("deliver", sink="notes", response_code=None) as current:
             assert "response_code" not in current.attributes
+
+    def test_an_auto_instrumented_httpx_span_does_not_export_a_sink_credential(self):
+        """The auto-instrumentation is a second span source, and it captures the request URL.
+
+        For Discord and Slack the webhook URL *is* the credential — the same fact that makes
+        `follow_redirects=False` load-bearing and that the DLQ redaction fix exists to protect.
+        Enabling tracing without scrubbing would export it to the collector on every delivery
+        attempt, outside this project's redaction boundary entirely.
+
+        This drives a **real request through a real socket** and reads the **exported** span,
+        because `httpx.MockTransport` bypasses the instrumented transport entirely and would
+        make this test pass by recording nothing at all.
+        """
+        spans = self.trace_one_request(
+            f"/api/webhooks/1/{SINK_CREDENTIAL}", secret_values=[SINK_CREDENTIAL]
+        )
+
+        assert spans, "expected an auto-instrumented client span — the probe proves nothing if not"
+        leaked = [
+            (s.name, k, v)
+            for s in spans
+            for k, v in s.attributes.items()
+            if isinstance(v, str) and SINK_CREDENTIAL in v
+        ]
+        assert not leaked, f"sink credential exported on a span attribute: {leaked}"
+
+    def test_the_url_survives_redaction_minus_the_secret(self):
+        """Redaction must not become deletion — the host and path are useful topology.
+
+        The apprise sink is the case that matters: its credential is one path segment, so
+        scrubbing by value leaves a legible URL, where blanking the whole attribute would not.
+        """
+        spans = self.trace_one_request(
+            f"/notify/{SINK_CREDENTIAL}", secret_values=[SINK_CREDENTIAL]
+        )
+
+        urls = [v for s in spans for k, v in s.attributes.items() if k.endswith("url")]
+        assert urls, "no url attribute found"
+        assert any("/notify/" in u and "127.0.0.1" in u for u in urls), urls
+
+    def test_a_non_secret_url_is_left_alone(self):
+        """A plain endpoint is topology, not a credential, and stays readable."""
+        spans = self.trace_one_request("/notify/public", secret_values=[SINK_CREDENTIAL])
+
+        urls = [v for s in spans for k, v in s.attributes.items() if k.endswith("url")]
+        assert any(u.endswith("/notify/public") for u in urls), urls
 
     def test_the_service_name_can_be_overridden(self):
         assert (

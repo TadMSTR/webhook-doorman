@@ -288,6 +288,36 @@ Spans carry only config-derived and structural attributes. No payload content, n
 rendered template output — the redaction work above exists precisely because that material
 leaks, and a span exporter is simply another egress.
 
+**That rule has to cover the spans this project does not author.** Enabling tracing also enables
+OTel's automatic `httpx` instrumentation, a second and independent span source, and it records
+the full request URL. For Discord and Slack the webhook URL *is* the credential — the same fact
+that makes `follow_redirects=False` load-bearing — and for Apprise it is the `key` path segment.
+Holding the invariant only for the hand-written spans would have left the auto-instrumented ones
+exporting exactly what the DLQ fix in this same release was written to stop.
+
+So every resolved secret is scrubbed from span attributes at instrumentation time, and the scrub
+**matches by value, not by attribute name**. Scrubbing a known key like `http.url` would be a
+denylist against a moving target: the instrumentation is mid-migration from `http.url` to
+`url.full`, and the rename would silently reopen the leak while the code still read as correct.
+Matching the secret values themselves covers a renamed or newly added attribute the day it
+appears, and it redacts at the right granularity — an Apprise span keeps its base URL and loses
+only the key.
+
+Two traps worth recording, both found by testing rather than reading:
+
+* **The async hook is a different parameter.** The delivery client is an `httpx.AsyncClient`, and
+  the async path consults only `async_request_hook`. Passing `request_hook` alone is accepted
+  silently and never fires — a fix that looks applied and leaks anyway. Both are registered.
+* **A mock transport produces no client span at all.** `httpx.MockTransport` bypasses the
+  instrumented transport, so a test written against it asserts "no credential in zero spans" and
+  passes no matter what. The regression test drives a real request over a real socket, and was
+  confirmed red against both the unhooked and the sync-hook-only variants.
+
+The guard depends on the credential reaching `resolved.secret_values`, which is why
+`sink_secret_env_names` derives `*_env` fields from the model rather than a hardcoded list. A
+credential written inline as `url:` is not a resolved secret and is redacted nowhere — in the
+event log, the DLQ, or a span.
+
 The SDK is configured in-process. Its `BatchSpanProcessor` runs a background thread that is not
 fork-safe, which is why SigNoz's Python docs recommend Gunicorn-with-Uvicorn-workers for
 multi-worker ASGI servers. That hazard does not apply here because `__main__.py` calls

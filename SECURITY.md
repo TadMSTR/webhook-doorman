@@ -65,9 +65,15 @@ vulnerability, not a feature request.
 1. There is no code path where a missing or empty secret results in a request being accepted.
 2. Every credential comparison is constant-time.
 3. HMAC is computed over the raw request bytes, before any decoding.
-4. Credentials are redacted before anything is written to storage or a log. **That includes a
-   destination's own response body**, which reaches the DLQ inside a delivery error message —
-   redacted at the engine boundary since 0.3.0.
+4. Credentials are redacted before anything is written to storage, a log, **or an exported
+   trace span**. That includes two boundaries beyond the ingest path: a destination's own
+   response body, which reaches the DLQ inside a delivery error message; and the request URL
+   captured by OpenTelemetry's automatic `httpx` instrumentation, which for a Discord or Slack
+   sink *is* the credential. Both are redacted as of 0.3.0.
+
+   This holds for credentials declared in a `*_env` field, which is how every bundled sink
+   declares one. A URL containing a credential written inline as `url:` is not a resolved secret
+   and is redacted nowhere — use `url_env`.
 5. A verification failure tells the caller nothing about why.
 6. A bundled sink escapes webhook content for the way its destination renders it. Verification
    proves a payload's *origin*, never that its *content* is safe — an issue title on a public

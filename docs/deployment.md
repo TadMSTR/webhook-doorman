@@ -277,6 +277,20 @@ One span per ingest and one per delivery attempt. They are **not** parent and ch
 runs in the background worker minutes after the request has finished, so the delivery span is a
 root and `delivery_id` is the correlation key across both.
 
+**Sink credentials are scrubbed from client spans.** Enabling tracing also enables OTel's
+automatic `httpx` instrumentation, which records the full destination URL on every client span.
+For Discord and Slack the webhook URL *is* the credential, and for Apprise it is the `key` path
+segment — so without scrubbing, turning on tracing would export those to your collector on every
+delivery attempt. Every resolved secret is stripped from span attributes before export, matching
+by value rather than by attribute name so the guard survives OTel's in-progress `http.url` →
+`url.full` rename. Non-secret parts of the URL are left readable: an Apprise span still shows the
+base URL and `/notify/`, with only the key replaced.
+
+This depends on the credential being in a `*_env` field, which is how every bundled sink declares
+one. A `type: http` sink with an authenticated URL written **inline** as `url:` is not a resolved
+secret, is not redacted anywhere else either, and would be exported — use `url_env` for any URL
+that carries a credential.
+
 **Do not add `--workers` to the entry point.** The SDK is configured in-process, and its
 `BatchSpanProcessor` thread does not survive a fork — adding workers would silently stop
 exporting spans from the children, with no error and no log line. SQLite has a single writer

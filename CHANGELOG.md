@@ -79,6 +79,16 @@ successful delivery, which is a behaviour change for every sink.
   file. Redaction now also runs at the engine boundary, on both store-writing paths and on the
   log line. Fixed **before** `GET /admin/dlq` shipped, so the column was never exposed over HTTP
   unredacted.
+- **Sink credentials would have been exported on trace spans.** Enabling tracing also enables
+  OTel's automatic `httpx` instrumentation, which records the full request URL on every client
+  span — and for Discord and Slack the webhook URL *is* the credential, while for Apprise it is
+  the `key` path segment. Resolved secrets are now scrubbed from span attributes before export,
+  matching by value rather than by attribute name so the guard survives OTel's in-progress
+  `http.url` → `url.full` rename. Found in the pre-release audit; never shipped.
+
+  Note the limit: this covers credentials declared through a `*_env` field, which is how every
+  bundled sink declares one. A `type: http` sink with an authenticated URL written inline as
+  `url:` is not a resolved secret and is redacted nowhere — use `url_env`.
 
 ## [0.2.0] — 2026-08-20
 

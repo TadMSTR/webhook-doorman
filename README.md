@@ -258,6 +258,12 @@ router runs normally — telemetry is not worth taking a router down for. Spans 
 config-derived and structural attributes; no payload content, headers or rendered template
 output are ever exported.
 
+Enabling tracing also enables OTel's automatic `httpx` instrumentation, which records the full
+destination URL. For Discord and Slack that URL *is* the credential, so every resolved secret is
+scrubbed from span attributes before export. Declare any credential-bearing URL through `*_env`
+(`webhook_url_env`, `key_env`, `url_env`) rather than inline — an inline `url:` is not a resolved
+secret and is redacted nowhere.
+
 ## Alternatives
 
 The consumer-side projects worth knowing about, and where this one differs.
