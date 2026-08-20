@@ -22,7 +22,7 @@ import httpx
 
 from ..config import HttpSink, MatrixSink, NtfySink, VikunjaTaskSink
 from ..errors import PermanentSinkError
-from ..templating import render, validate
+from ..templating import render, render_html, validate
 from .base import DeliveryOutcome, HttpSinkBase
 
 
@@ -101,7 +101,24 @@ class NtfySink_(HttpSinkBase):
 
 
 class VikunjaTaskSink_(HttpSinkBase):
-    """Create a task in a Vikunja project."""
+    """Create a task in a Vikunja project.
+
+    The only bundled sink whose destination renders rich text, and therefore the only one that
+    escapes. The two fields are treated differently on purpose:
+
+    * **`description` renders as HTML** in Vikunja's editor, so it goes through `render_html`
+      and every interpolated value is escaped. Without this, an issue body from a public repo
+      is stored XSS against whoever opens the task — the exact defect this sink's predecessor
+      was audited for and fixed.
+    * **`title` is a plain-text field.** Escaping it would put literal `&amp;` in front of every
+      user for the ordinary case of an ampersand in an issue title — a visible, everyday bug
+      traded for no gain, since a text field does not execute markup. This matches the split the
+      earlier fix settled on.
+
+    If Vikunja ever renders titles as rich text, that assumption is wrong and this is the single
+    call site to change. `tests/test_sink_escaping.py` asserts both halves so the decision is
+    visible rather than inferred.
+    """
 
     def __init__(self, spec: VikunjaTaskSink, secrets: dict[str, str]) -> None:
         self.name = spec.name
@@ -123,7 +140,7 @@ class VikunjaTaskSink_(HttpSinkBase):
             headers={"Authorization": f"Bearer {token}"},
             json={
                 "title": render(self.spec.title_template, context),
-                "description": render(self.spec.description_template, context),
+                "description": render_html(self.spec.description_template, context),
             },
         )
 

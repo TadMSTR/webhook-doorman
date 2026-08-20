@@ -25,6 +25,8 @@ The latest released version. There are no maintained backport branches.
 - Anything that lets a caller reach `/admin/` without a valid token.
 - Template sandbox escape: reaching the filesystem, the environment, or arbitrary code execution
   through a sink template.
+- Webhook content reaching a bundled sink's destination without escaping appropriate to how that
+  destination renders it — for example unescaped HTML reaching a rich-text field.
 - Denial of service through unbounded resource use — an unbounded body read, unbounded storage
   growth, a retry loop that never terminates.
 
@@ -51,3 +53,15 @@ vulnerability, not a feature request.
 3. HMAC is computed over the raw request bytes, before any decoding.
 4. Credentials are redacted before anything is written to storage or a log.
 5. A verification failure tells the caller nothing about why.
+6. A bundled sink escapes webhook content for the way its destination renders it. Verification
+   proves a payload's *origin*, never that its *content* is safe — an issue title on a public
+   repo is written by a stranger and is authentically signed by GitHub either way.
+
+## Escaping in your own templates
+
+The bundled sinks handle this: the Vikunja sink escapes its description, because Vikunja renders
+that field as HTML, and the chat sinks do not, because escaping a chat message corrupts it.
+
+A `type: http` sink is yours. If you point one at something that renders HTML, escape explicitly
+with Jinja's `| e` filter — the generic sink cannot know how your endpoint treats its input.
+For JSON bodies use `| tojson`, which is the correct escaping for that context.

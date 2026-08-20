@@ -124,14 +124,27 @@ sinks:
     # Templates are Jinja2 in a sandboxed, text-only environment. Available variables:
     #   source, event_type, summary, delivery_id, received_at, payload (the decoded body),
     #   plus whatever the source's parser adds.
+    #
+    # `| tojson` for a value going into a JSON body: it handles quotes and control characters
+    # that would otherwise produce invalid JSON. Note it emits the surrounding quotes itself.
     template: |
-      {"text": "{{ summary }}", "source": "{{ source }}"}
+      {"text": {{ summary | tojson }}, "source": "{{ source }}"}
 
   # A task tracker sink, for reference.
+  #
+  # Webhook content is attacker-controlled — an issue title or body on a public repo is written
+  # by whoever opened it. The `description` field is rendered as HTML by Vikunja, so this sink
+  # escapes every interpolated value automatically; markup you write in the template itself is
+  # left alone. Nothing to do here, but do not assume the same for a `type: http` sink pointed
+  # at an HTML destination — there, escape explicitly with `| e`.
+  #
   # - name: tickets
   #   type: vikunja_task
   #   url_env: VIKUNJA_API_URL
   #   token_env: VIKUNJA_API_TOKEN
   #   project_id: 1
   #   title_template: "{{ summary }}"
-  #   description_template: "{{ payload.issue.body | default('') }}"
+  #   description_template: |
+  #     <p>Opened by <strong>{{ author }}</strong> — <a href="{{ url }}">{{ repo }}#{{ number }}</a></p>
+  #     <hr>
+  #     <p>{{ body }}</p>

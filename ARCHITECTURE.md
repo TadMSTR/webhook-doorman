@@ -112,6 +112,31 @@ The regression test for this reads the SQLite file **and its WAL sidecar** as ra
 earlier version passed a test that checked the redaction function was called, while the GitHub
 parser was quietly writing the secret into `context_json`.
 
+### Escaping belongs to the destination, not the data
+
+Verification proves where a payload came from. It says nothing about whether the payload's
+*content* is safe — an issue title on a public repo is written by a stranger and is authentically
+signed by GitHub either way. So content that reaches a destination has to be escaped for the way
+that destination renders it.
+
+That is a property of the sink, which is why there are two template environments rather than one
+global setting. `render()` leaves output alone: chat messages, push notifications and JSON
+bodies, where HTML-escaping is corruption rather than hardening. `render_html()` escapes every
+interpolated value, for destinations that render rich text — today, the Vikunja sink's
+`description`.
+
+The first version of this module had one environment with autoescape off, and a GitHub issue
+body reached a Vikunja task description unescaped: stored XSS against whoever opened the task.
+It was a recurrence — the service this replaced had the identical defect and fixed it with
+`html.escape()` **in its parser**. Porting to templates dropped the fix silently, because a
+parser is shared across sinks and cannot know how any of them render. Putting the decision back
+where the rendering context is actually known is what stops it recurring a third time.
+
+The Vikunja sink's `title` is deliberately *not* escaped: it is a plain-text field, and escaping
+it would show a literal `&amp;` for the ordinary case of an ampersand in an issue title. Both
+halves are asserted in `tests/test_sink_escaping.py`, so an over-broad "escape everything" fix
+fails just as loudly as the original bug.
+
 ### No scripting engine
 
 Templates are Jinja2 in a `SandboxedEnvironment`, text only. The comparable projects all took on

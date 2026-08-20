@@ -52,6 +52,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real hostname, address or room ID — the public-repo guard runs on every PR rather than at
   review time, because a leaked value stays in the git history whatever the next commit does.
 
+### Security
+
+- **Webhook content reaching a rich-text destination is now escaped.** The `vikunja_task` sink
+  rendered its `description` — which Vikunja renders as HTML — with autoescape off, so a GitHub
+  issue title or body from a public repo became stored XSS against whoever opened the task.
+  Templating now has two environments: `render_html` (autoescape on) for destinations that
+  render rich text, and `render` (autoescape off) for chat, push and JSON bodies, where escaping
+  would corrupt the output. The Vikunja `title` remains unescaped — it is a plain-text field.
+  Found by security audit `forge-webhook-router-2026-08` (Medium, the only finding).
+
 ### Fixed
 
 - A secret echoed into a payload field could reach the event log through a parser's `context`,
