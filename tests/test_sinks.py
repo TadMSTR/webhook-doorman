@@ -97,6 +97,29 @@ class TestHttpSink:
         assert outcome.response_code == 204
         assert httpx_mock.get_requests()[0].read() == b'{"text": "[o/r#7] Something broke"}'
 
+    async def test_a_redirect_is_permanent_not_a_silent_success(self, client, httpx_mock):
+        """A 3xx delivers nothing, because the engine does not follow redirects.
+
+        The engine sets `follow_redirects=False` deliberately — a webhook URL embeds its own
+        credential. So an operator who typed `http://` against an instance that redirects to
+        `https://` gets a sink that notifies nobody, and before this it was recorded as a
+        successful delivery: no retry, no DLQ row, nothing above debug.
+        """
+        httpx_mock.add_response(
+            url="https://sink.example.invalid/notes",
+            status_code=301,
+            headers={"Location": "https://sink.example.invalid/moved"},
+        )
+        with pytest.raises(PermanentSinkError, match="redirected") as exc:
+            await self.sink().deliver(CONTEXT, client)
+        assert "https://sink.example.invalid/moved" in str(exc.value)
+
+    async def test_a_redirect_without_a_location_still_fails(self, client, httpx_mock):
+        """`Location` is destination-controlled, so its absence must not break the message."""
+        httpx_mock.add_response(url="https://sink.example.invalid/notes", status_code=302)
+        with pytest.raises(PermanentSinkError, match="redirected"):
+            await self.sink().deliver(CONTEXT, client)
+
     async def test_invalid_rendered_json_is_permanent(self, client):
         """Catch it here rather than reading the destination's 400 back as an opaque failure."""
         sink = self.sink(template='{"text": {{ summary }}}')

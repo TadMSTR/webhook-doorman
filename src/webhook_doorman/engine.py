@@ -33,7 +33,8 @@ import structlog
 
 from .config import Config
 from .errors import PermanentSinkError, SinkError
-from .models import Delivery, InboundEvent, StoredEvent, utcnow
+from .models import Delivery, DlqEntry, InboundEvent, StoredEvent, utcnow
+from .redaction import redact_text
 from .secrets import Resolved
 from .sinks import Sink, build_sink
 from .store import SqliteStore, Store
@@ -154,6 +155,10 @@ class Engine:
     async def stats(self) -> dict[str, int]:
         return await self.store.stats()
 
+    async def list_dlq(self, *, limit: int, before_id: int | None = None) -> list[DlqEntry]:
+        """Dead-lettered deliveries, newest first. The clamp on `limit` belongs to the caller."""
+        return await self.store.list_dlq(limit=limit, before_id=before_id)
+
     # -- delivery ----------------------------------------------------------------------
 
     async def _delivery_loop(self) -> None:
@@ -200,7 +205,7 @@ class Engine:
                 "delivery_permanent_failure",
                 delivery=delivery.id,
                 sink=delivery.sink,
-                error=str(exc),
+                error=self._redact_error(str(exc)),
             )
             await self._exhaust(delivery, str(exc), None, 0)
         except SinkError as exc:
@@ -228,6 +233,7 @@ class Engine:
         *,
         retry_after: float | None = None,
     ) -> None:
+        error = self._redact_error(error)
         attempts_made = delivery.attempt + 1
         if attempts_made >= self.config.delivery.max_attempts:
             log.warning(
@@ -258,12 +264,28 @@ class Engine:
             error=error,
         )
 
+    def _redact_error(self, error: str) -> str:
+        """Strip resolved secrets from a delivery error before it is persisted or logged.
+
+        `redaction.py` runs at the *ingest* boundary — it covers what a producer sent us. It has
+        never covered what a *destination* sent back, and `HttpSinkBase._send` puts part of that
+        response body into the error message. A destination that echoes a submitted credential
+        into its 400 page therefore writes that credential into the DLQ verbatim, where it
+        survives every backup of the SQLite file.
+
+        This runs at the engine boundary rather than inside the sink deliberately: `sinks/base.py`
+        has no business knowing about resolved secrets, and `ARCHITECTURE.md` requires that
+        `redaction.py` not know about sinks. Redacting here keeps both true. It is idempotent, so
+        the two store-writing paths can each apply it without coordinating.
+        """
+        return redact_text(error, self.resolved.secret_values)
+
     async def _exhaust(
         self, delivery: Delivery, error: str, code: int | None, latency_ms: int
     ) -> None:
         await self.store.mark_exhausted(
             delivery.id,
-            error=error,
+            error=self._redact_error(error),
             response_code=code,
             latency_ms=latency_ms,
             exhausted_at=utcnow(),

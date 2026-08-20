@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse
 
 from . import __version__
 from .config import Config, NoneVerify, load_config
-from .models import InboundEvent
+from .models import DlqEntry, InboundEvent
 from .parsers import get_parser, parse
 from .redaction import redact_bytes, redact_headers, redact_json, redact_text
 from .secrets import Resolved, SourceState, resolve
@@ -49,6 +49,7 @@ class EngineLike(Protocol):
     async def ingest(self, event: InboundEvent) -> dict[str, Any]: ...
     async def replay(self, event_id: int) -> dict[str, Any]: ...
     async def stats(self) -> dict[str, int]: ...
+    async def list_dlq(self, *, limit: int, before_id: int | None = None) -> list[DlqEntry]: ...
     def check_admin_token(self, presented: str) -> bool: ...
 
 
@@ -217,8 +218,14 @@ def _safe_json(body: bytes) -> Any:
         return None
 
 
+#: Server-side ceiling on `GET /admin/dlq?limit=`, applied whatever the caller asks for. A cap
+#: the caller can raise is not a cap; this is the one that holds.
+DLQ_MAX_LIMIT = 100
+DLQ_DEFAULT_LIMIT = 50
+
+
 def build_admin_router(engine: EngineLike) -> APIRouter:
-    """The replay API.
+    """The replay and DLQ-triage API.
 
     Two independent controls, because replay re-fires real events at real destinations:
 
@@ -242,6 +249,51 @@ def build_admin_router(engine: EngineLike) -> APIRouter:
             return await engine.replay(event_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="Event not found") from exc
+
+    @router.get("/dlq")
+    async def list_dlq(
+        limit: int = DLQ_DEFAULT_LIMIT,
+        before_id: int | None = None,
+        authorization: str = Header(default=""),
+    ) -> dict[str, Any]:
+        """What is in the dead-letter queue, newest first.
+
+        This is the other half of `POST /admin/replay/{event_id}`, which until now pointed at
+        ids an operator had no way to discover short of opening the SQLite file.
+
+        The response carries **failure metadata only** — see `DlqEntry`. `next_before_id` is the
+        cursor for the following page and is `None` on the last one; feeding it back as
+        `before_id` is stable across a concurrent retention sweep in a way `OFFSET` is not.
+        """
+        presented = authorization.removeprefix("Bearer ").strip()
+        if not engine.check_admin_token(presented):
+            # Before the query, like `replay` above: an unauthenticated caller must not be able
+            # to tell a populated DLQ from an empty one by response timing or shape.
+            log.warning("admin_auth_failed", path="/admin/dlq")
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        effective = max(1, min(limit, DLQ_MAX_LIMIT))
+        entries = await engine.list_dlq(limit=effective, before_id=before_id)
+        return {
+            "count": len(entries),
+            "limit": effective,
+            # Only offer a cursor on a full page. A short page means the DLQ is exhausted, and
+            # handing back a cursor there invites a client to loop on an empty result forever.
+            "next_before_id": entries[-1].id if len(entries) == effective else None,
+            "entries": [
+                {
+                    "id": e.id,
+                    "event_id": e.event_id,
+                    "source": e.source,
+                    "sink": e.sink,
+                    "attempt": e.attempt,
+                    "response_code": e.response_code,
+                    "error": e.error,
+                    "exhausted_at": e.exhausted_at.isoformat(),
+                }
+                for e in entries
+            ],
+        }
 
     return router
 

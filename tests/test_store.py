@@ -145,6 +145,65 @@ class TestDeliveries:
         assert (await store.get_event(event_id)).status is EventStatus.FAILED
 
 
+class TestListDlq:
+    @staticmethod
+    async def dead_letter(store, n: int, *, sink: str = "chat") -> None:
+        for i in range(n):
+            event_id, _ = await store.record_event(make_event(f"d-{i}"))
+            [delivery_id] = await store.enqueue_deliveries(event_id, [sink])
+            await store.mark_exhausted(
+                delivery_id,
+                error=f"failure {i}",
+                response_code=400,
+                latency_ms=i,
+                exhausted_at=utcnow(),
+            )
+
+    async def test_newest_first(self, store):
+        await self.dead_letter(store, 3)
+        ids = [e.id for e in await store.list_dlq(limit=10)]
+        assert ids == sorted(ids, reverse=True)
+
+    async def test_joins_source_and_sink_onto_the_row(self, store):
+        """`dlq` holds only a delivery_id — everything an operator triages by is a join away."""
+        await self.dead_letter(store, 1, sink="push")
+        [entry] = await store.list_dlq(limit=10)
+        assert (entry.source, entry.sink, entry.response_code) == ("github", "push", 400)
+        assert entry.error == "failure 0"
+
+    async def test_limit_is_honoured(self, store):
+        await self.dead_letter(store, 5)
+        assert len(await store.list_dlq(limit=2)) == 2
+
+    async def test_keyset_paging_skips_nothing_when_rows_are_swept_mid_page(self, store):
+        """This is the whole reason the cursor is `id` and not `OFFSET`.
+
+        The retention sweep runs on its own timer and does not pause for a paging operator.
+        Under `OFFSET 2`, deleting the two rows *behind* the cursor shifts the window forward by
+        two and silently drops two unread rows — in the queue of things that already failed,
+        which is the worst place to lose one.
+
+        Both already-read rows are deleted here, **including the one the cursor names**. The
+        cursor is a value compared with `<`, not a row that has to still exist, so losing the
+        anchor row is survivable; an implementation that re-looked-up `before_id` would break
+        exactly here.
+        """
+        await self.dead_letter(store, 6)
+        page = await store.list_dlq(limit=2)
+        cursor = page[-1].id
+
+        await store.db.execute("DELETE FROM dlq WHERE id >= ?", (cursor,))
+        await store.db.commit()
+
+        rest = await store.list_dlq(limit=10, before_id=cursor)
+        assert [e.id for e in rest] == sorted([e.id for e in rest], reverse=True)
+        assert all(e.id < cursor for e in rest), "the cursor still anchors the page boundary"
+        assert len(rest) == 4, "every unread row survived the concurrent delete"
+
+    async def test_an_empty_queue_is_an_empty_list(self, store):
+        assert await store.list_dlq(limit=10) == []
+
+
 class TestCrashRecovery:
     async def test_in_flight_deliveries_are_requeued(self, store):
         """A process killed mid-delivery leaves in_flight rows with nothing running to finish

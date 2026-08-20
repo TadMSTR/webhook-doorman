@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
-from ..models import Delivery, InboundEvent, StoredEvent
+from ..models import Delivery, DlqEntry, InboundEvent, StoredEvent
 
 
 @runtime_checkable
@@ -75,6 +75,22 @@ class Store(Protocol):
 
     async def get_event(self, event_id: int) -> StoredEvent | None:
         """Read one event back, for replay."""
+        ...
+
+    async def list_dlq(self, *, limit: int, before_id: int | None = None) -> list[DlqEntry]:
+        """Dead-lettered deliveries, newest first, for `GET /admin/dlq`.
+
+        Args:
+            limit: maximum rows to return. The caller is expected to have clamped this; an
+                implementation must not treat it as unbounded.
+            before_id: return only rows with a lower `id` than this — the cursor from the last
+                row of the previous page.
+
+        **Keyset pagination, not `OFFSET`.** The sweep deletes DLQ rows on a retention timer
+        while an operator is paging, and under `OFFSET` every deletion behind the cursor shifts
+        the window and silently skips a row. Skipping rows in the queue of things that failed is
+        the one place that is least acceptable.
+        """
         ...
 
     async def requeue_incomplete(self) -> int:

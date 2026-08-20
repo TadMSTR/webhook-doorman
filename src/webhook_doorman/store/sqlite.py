@@ -29,6 +29,7 @@ import structlog
 from ..models import (
     Delivery,
     DeliveryStatus,
+    DlqEntry,
     EventStatus,
     InboundEvent,
     StoredEvent,
@@ -325,6 +326,49 @@ class SqliteStore:
             status=EventStatus(row["status"]),
             received_at=datetime.fromisoformat(row["received_at"]),
         )
+
+    async def list_dlq(self, *, limit: int, before_id: int | None = None) -> list[DlqEntry]:
+        # Keyset, not OFFSET: the retention sweep deletes DLQ rows underneath a paging client,
+        # and OFFSET would skip a row for every deletion behind the cursor. `id` is an
+        # AUTOINCREMENT primary key, so it is unique, stable and monotonic in insertion order —
+        # everything a cursor needs. Ordering by `exhausted_at` instead would be neither unique
+        # nor a usable tiebreak.
+        sql = """
+            SELECT dlq.id          AS id,
+                   dlq.exhausted_at AS exhausted_at,
+                   dlq.last_error   AS last_error,
+                   d.event_id       AS event_id,
+                   d.sink           AS sink,
+                   d.attempt        AS attempt,
+                   d.response_code  AS response_code,
+                   e.source         AS source
+              FROM dlq
+              JOIN deliveries d ON d.id = dlq.delivery_id
+              JOIN events     e ON e.id = d.event_id
+        """
+        params: list[object] = []
+        if before_id is not None:
+            sql += " WHERE dlq.id < ?"
+            params.append(before_id)
+        sql += " ORDER BY dlq.id DESC LIMIT ?"
+        params.append(limit)
+
+        cursor = await self.db.execute(sql, tuple(params))
+        return [
+            DlqEntry(
+                id=int(row["id"]),
+                event_id=int(row["event_id"]),
+                source=row["source"],
+                sink=row["sink"],
+                attempt=int(row["attempt"]),
+                response_code=(
+                    int(row["response_code"]) if row["response_code"] is not None else None
+                ),
+                error=row["last_error"],
+                exhausted_at=datetime.fromisoformat(row["exhausted_at"]),
+            )
+            for row in await cursor.fetchall()
+        ]
 
     async def stats(self) -> dict[str, int]:
         out: dict[str, int] = {}
