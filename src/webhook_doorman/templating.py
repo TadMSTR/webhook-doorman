@@ -15,15 +15,31 @@ a producer that stops sending an optional field should not turn every subsequent
 retry loop. `ChainableUndefined` extends that through attribute chains, so
 `{{ payload.issue.title }}` renders empty instead of exploding when `issue` is absent.
 
-## Two environments, because escaping belongs to the destination
+## Four environments, because escaping belongs to the destination
 
 Escaping is a property of where the output is rendered, not of the data. A single global setting
-gets one of the two cases wrong:
+gets most of the cases wrong:
 
 * `render()` — autoescape **off**. Chat messages, push notifications, JSON bodies. HTML-escaping
   these is not hardening, it is corruption: `Fix A & B` arrives in a Matrix room as
   `Fix A &amp; B`, and escaping a JSON body breaks it outright.
 * `render_html()` — autoescape **on**. Destinations that render their input as rich text.
+* `render_slack()` — Slack's own three-character escape, which is neither of the above.
+* `render_markdown()` — angle brackets only, for Markdown that a destination converts to HTML.
+
+Note that two of these four are Markdown destinations that need *opposite* treatment, which is
+the clearest statement of why this is not a per-format setting. Discord's message content is
+Markdown and takes `render()`, because Discord's flavour does not render raw HTML and escaping
+would corrupt ordinary messages. apprise-api's Markdown mode takes `render_markdown()`, because
+it feeds Python-Markdown, which passes raw HTML straight through. The format is the same; the
+renderer behind it is not, and the renderer is what decides.
+
+Slack is the case that proves the split is about destinations rather than about a boolean.
+Its `mrkdwn` is not HTML and not plain text: it interprets `<http://evil|click here>` as a
+link and `<!channel>` as a broadcast, and it documents an escape set of exactly three
+characters — `&` → `&amp;`, `<` → `&lt;`, `>` → `&gt;`. HTML autoescape is the wrong tool
+even though it looks close enough: it also rewrites `"` and `'` to entities, which Slack
+renders literally, so every quoted issue title arrives full of `&#34;`.
 
 The split exists because getting it wrong in the other direction was a real finding. Webhook
 content is attacker-controlled on any public repo, and the first version of this module rendered
@@ -41,6 +57,7 @@ own text and passes through, which is what makes `<p>{{ body }}</p>` both useful
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from jinja2 import ChainableUndefined, TemplateError
@@ -49,12 +66,54 @@ from jinja2.sandbox import SandboxedEnvironment
 from .errors import PermanentSinkError
 
 
-def _build(autoescape: bool) -> SandboxedEnvironment:
+def _build(autoescape: bool, finalize: Callable[[Any], str] | None = None) -> SandboxedEnvironment:
     return SandboxedEnvironment(
         autoescape=autoescape,
         undefined=ChainableUndefined,
         keep_trailing_newline=False,
+        finalize=finalize,
     )
+
+
+# The three characters Slack documents as needing escaping in message text. Order matters:
+# `&` must go first, or the ampersands introduced by the other two get double-escaped and
+# `<` arrives as `&amp;lt;`.
+_SLACK_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
+
+# Markdown needs only the angle brackets. See `render_markdown` for why `&` is not here —
+# it is a deliberate exclusion, not an oversight, so do not "complete the set".
+_MARKDOWN_ESCAPES = (("<", "&lt;"), (">", "&gt;"))
+
+
+def _slack_escape(value: Any) -> str:
+    """Escape one interpolated value for Slack `mrkdwn`.
+
+    Used as the Jinja `finalize` hook rather than as an autoescape policy, because Jinja's
+    autoescape is hardwired to `markupsafe.escape` and that escapes more than Slack wants.
+    `finalize` runs on every `{{ ... }}` expression and is bypassed for literal template text
+    (`nodes.TemplateData` in Jinja's code generator), which is the same interpolated-values-only
+    guarantee autoescape gives — so `*{{ summary }}*` keeps the operator's bold markers while
+    the summary itself cannot open a link or a broadcast.
+
+    Escaping `<` and `>` neutralises `<!channel>` and `<!here>` as a side effect: Slack only
+    resolves a broadcast written with literal angle brackets. One rule does both jobs.
+    """
+    text = str(value)
+    for char, replacement in _SLACK_ESCAPES:
+        text = text.replace(char, replacement)
+    return text
+
+
+def _markdown_escape(value: Any) -> str:
+    """Escape one interpolated value for a Markdown destination that emits HTML.
+
+    Same `finalize` mechanism as `_slack_escape`, and the same reason: literal markup in the
+    operator's template is theirs, and interpolated payload content is not.
+    """
+    text = str(value)
+    for char, replacement in _MARKDOWN_ESCAPES:
+        text = text.replace(char, replacement)
+    return text
 
 
 # Plain text: chat, push, JSON bodies. Read the module docstring before changing this.
@@ -62,6 +121,12 @@ _text_env = _build(autoescape=False)
 
 # HTML: destinations that render their input as rich text.
 _html_env = _build(autoescape=True)
+
+# Slack `mrkdwn`: autoescape off, per-value escaping via `finalize`.
+_slack_env = _build(autoescape=False, finalize=_slack_escape)
+
+# Markdown bound for an HTML renderer: autoescape off, angle brackets escaped via `finalize`.
+_markdown_env = _build(autoescape=False, finalize=_markdown_escape)
 
 
 def _render(env: SandboxedEnvironment, template: str, context: dict[str, Any]) -> str:
@@ -98,10 +163,61 @@ def render_html(template: str, context: dict[str, Any]) -> str:
     return _render(_html_env, template, context)
 
 
+def render_slack(template: str, context: dict[str, Any]) -> str:
+    """Render `template` for Slack, escaping `&`, `<` and `>` in interpolated values.
+
+    Not `render_html` with a different name. Slack's `mrkdwn` is its own rendering context: it
+    reads `<url|label>` as a link and `<!channel>` as a broadcast, so the three characters have
+    to go — but it renders `"` and `'` literally, so HTML escaping would corrupt every quoted
+    title for no gain. See the module docstring.
+
+    Only interpolated values are escaped; markup written in the template itself is the
+    operator's own text and passes through, so `*{{ source }}*` still renders bold.
+
+    Raises:
+        PermanentSinkError: the template is malformed or its rendering raised.
+    """
+    return _render(_slack_env, template, context)
+
+
+def render_markdown(template: str, context: dict[str, Any]) -> str:
+    """Render `template` as Markdown, escaping `<` and `>` in interpolated values.
+
+    **Markdown is not a safe format by default.** Standard Markdown passes raw inline and block
+    HTML straight through to its output — that is a specified feature, not a bug — so a
+    destination that converts Markdown to HTML will happily emit any `<script>` an interpolated
+    value contained. Verified against apprise-api, the one such destination here: its
+    `markdown_to_html` calls Python-Markdown with only the `nl2br` and `tables` extensions and
+    no sanitiser, and `<script>alert(1)</script>` survives verbatim. Its plain-*text* path, by
+    contrast, calls `escape_html` server-side — which is why `render()` remains correct there
+    and is wrong here.
+
+    Escaping the angle brackets is sufficient and is checked both ways: an escaped
+    `&lt;script&gt;` renders as literal text through the same converter.
+
+    **`&` is deliberately not escaped**, unlike `render_slack`. Markdown-to-HTML converts a bare
+    `&` to `&amp;` itself, so nothing is gained, and the two fates of this content are the only
+    two there are — apprise-api's converter table is single-step, with no chain that would
+    decode an entity back into a tag. Escaping it would instead corrupt every ampersand on the
+    passthrough path, where a plugin renders Markdown natively and the reader would see a
+    literal `&amp;`. That is the everyday visible bug this module's docstring warns against.
+
+    Not to be confused with `render()`, which is correct for a Markdown destination that does
+    **not** render HTML — Discord's message content is the example, and escaping it there would
+    put literal `&lt;` in chat messages for no gain.
+
+    Raises:
+        PermanentSinkError: the template is malformed or its rendering raised.
+    """
+    return _render(_markdown_env, template, context)
+
+
 def validate(template: str) -> None:
     """Compile a template without rendering it, to fail at startup rather than at delivery.
 
-    Compilation is independent of autoescape, so one check covers both environments.
+    Compilation is independent of both autoescape and `finalize` — neither can turn a
+    well-formed template into a syntax error — so one check against `_text_env` covers all
+    four environments, including `_slack_env` and `_markdown_env`.
 
     Raises:
         PermanentSinkError: the template does not compile.

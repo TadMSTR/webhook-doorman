@@ -63,6 +63,9 @@ flowchart LR
     W --> S2[ntfy]
     W --> S3[vikunja_task]
     W --> S4[http]
+    W --> S5[discord]
+    W --> S6[slack]
+    W --> S7[apprise]
 ```
 
 The request handler's job ends at the database. Dispatch belongs to the worker, so a slow sink
@@ -119,6 +122,33 @@ sinks:
 
 See [`config.example.yml`](config.example.yml) for a fully commented file and
 [`examples/`](examples/) for worked configurations.
+
+### Sinks
+
+| Type | Credential | Notes |
+|---|---|---|
+| `matrix` | `token_env`, `room_env` | `url`/`url_env` is the homeserver base |
+| `ntfy` | `topic_env`, optional `token_env` | non-ASCII titles are RFC 2047 encoded |
+| `vikunja_task` | `token_env` | `description` is HTML-escaped; `title` is not |
+| `http` | optional `token_env` | the escape hatch — any endpoint that speaks JSON |
+| `discord` | **`webhook_url_env`** | mentions disabled on every message; 2000-char truncation |
+| `slack` | **`webhook_url_env`** | `&<>` escaped in interpolated values |
+| `apprise` | `key_env` | `url`/`url_env` is the apprise-api base; 204 and 424 dead-letter; escaping follows `body_format` |
+
+Discord and Slack take `webhook_url_env` rather than `url`/`url_env`, and have no inline form:
+their webhook URL embeds its own token, so the URL *is* the credential and belongs in the
+environment with the rest of them.
+
+Escaping is per-sink and not configurable, because it is a property of the destination rather
+than of the data — Discord disables mention resolution, Slack escapes `&`, `<` and `>`, Vikunja
+escapes its HTML description field, and the chat sinks escape nothing. Webhook content is
+attacker-authored on any public repo; a flag that defaults safe still lets someone switch it off
+without knowing what it was for.
+
+It follows the *renderer*, not the format. Discord's content is Markdown and is left unescaped
+because Discord does not render raw HTML; Apprise's `body_format: markdown` is escaped because
+apprise-api converts it through an unsanitised Markdown-to-HTML step. Same format, opposite
+rule. `ARCHITECTURE.md` has the reasoning.
 
 ### Verification strategies
 

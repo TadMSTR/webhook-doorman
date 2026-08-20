@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import base64
+import json
 from datetime import UTC, datetime
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
-from webhook_doorman.config import HttpSink, MatrixSink, NtfySink, VikunjaTaskSink
+from webhook_doorman.config import (
+    AppriseSink,
+    DiscordSink,
+    HttpSink,
+    MatrixSink,
+    NtfySink,
+    SlackSink,
+    VikunjaTaskSink,
+)
 from webhook_doorman.errors import ConfigError, PermanentSinkError, SinkError
 from webhook_doorman.sinks import build_sink
 from webhook_doorman.sinks.base import parse_retry_after
@@ -386,6 +396,300 @@ class TestVikunjaTaskSink:
         request = httpx_mock.get_requests()[0]
         assert request.method == "PUT"
         assert b"Something broke" in request.read()
+
+
+DISCORD_URL = "https://discord.com/api/webhooks/1/tok"
+SLACK_URL = "https://hooks.slack.com/services/T0/B0/xxx"
+
+
+class TestDiscordSink:
+    @staticmethod
+    def sink(secrets=None, **overrides):
+        spec = DiscordSink.model_validate(
+            {
+                "name": "team-discord",
+                "type": "discord",
+                "webhook_url_env": "DISCORD_WEBHOOK_URL",
+                **overrides,
+            }
+        )
+        if secrets is None:
+            secrets = {"DISCORD_WEBHOOK_URL": DISCORD_URL}
+        return build_sink(spec, secrets)
+
+    async def test_posts_the_rendered_content(self, client, httpx_mock):
+        httpx_mock.add_response(url=DISCORD_URL, status_code=204)
+        outcome = await self.sink().deliver(CONTEXT, client)
+        assert outcome.response_code == 204
+        assert json.loads(httpx_mock.get_requests()[0].read())["content"] == (
+            "[o/r#7] Something broke"
+        )
+
+    async def test_unset_webhook_url_env_is_permanent(self, client):
+        with pytest.raises(PermanentSinkError, match="DISCORD_WEBHOOK_URL is unset"):
+            await self.sink(secrets={}).deliver(CONTEXT, client)
+
+    async def test_transport_error_is_retryable(self, client, httpx_mock):
+        httpx_mock.add_exception(httpx.ConnectError("refused"))
+        with pytest.raises(SinkError) as exc:
+            await self.sink().deliver(CONTEXT, client)
+        assert not isinstance(exc.value, PermanentSinkError)
+
+    async def test_allowed_mentions_is_present_on_every_request(self, client, httpx_mock):
+        """Not on the default template only — on every request this sink can be made to send.
+
+        A test that only checks the default would pass an implementation that dropped
+        `allowed_mentions` whenever any optional field was set.
+        """
+        httpx_mock.add_response(url=DISCORD_URL, status_code=204)
+        httpx_mock.add_response(url=DISCORD_URL, status_code=204)
+        httpx_mock.add_response(url=f"{DISCORD_URL}?thread_id=42", status_code=204)
+
+        await self.sink().deliver(CONTEXT, client)
+        await self.sink(username="doorman", avatar_url="https://x.example/a.png").deliver(
+            CONTEXT, client
+        )
+        await self.sink(thread_id="42").deliver(CONTEXT, client)
+
+        for request in httpx_mock.get_requests():
+            assert json.loads(request.read())["allowed_mentions"] == {"parse": []}
+
+    async def test_an_everyone_mention_in_the_summary_cannot_resolve(self, client, httpx_mock):
+        """The payload field is attacker-authored on any public repo.
+
+        The `@everyone` text survives in `content` — Discord shows it as literal text — and
+        that is correct. What must not survive is its *resolution*, which `allowed_mentions`
+        governs. Asserting the text is gone would be asserting the wrong fix.
+        """
+        httpx_mock.add_response(url=DISCORD_URL, status_code=204)
+        await self.sink().deliver({**CONTEXT, "summary": "@everyone pwned"}, client)
+
+        body = json.loads(httpx_mock.get_requests()[0].read())
+        assert body["content"] == "@everyone pwned"
+        assert body["allowed_mentions"] == {"parse": []}
+
+    async def test_an_over_long_body_is_truncated_rather_than_400d(self, client, httpx_mock):
+        """Discord answers 400 over 2000 characters, and 400 is permanent — straight to the DLQ.
+
+        An ordinary long release-notes payload would hit this, so truncation is the difference
+        between a slightly short message and a lost one.
+        """
+        httpx_mock.add_response(url=DISCORD_URL, status_code=204)
+        await self.sink().deliver({**CONTEXT, "summary": "x" * 5000}, client)
+
+        content = json.loads(httpx_mock.get_requests()[0].read())["content"]
+        assert len(content) <= 2000
+        assert content.endswith("…")
+
+    async def test_a_body_at_the_limit_is_left_alone(self, client, httpx_mock):
+        """The boundary in the other direction — truncating an exactly-legal message would be
+        a silent, permanent corruption of every message that happened to be 2000 long."""
+        httpx_mock.add_response(url=DISCORD_URL, status_code=204)
+        await self.sink().deliver({**CONTEXT, "summary": "x" * 2000}, client)
+
+        content = json.loads(httpx_mock.get_requests()[0].read())["content"]
+        assert content == "x" * 2000
+        assert "…" not in content
+
+    async def test_optional_identity_fields_are_omitted_when_unset(self, client, httpx_mock):
+        """An explicit null `username` overrides the webhook's configured name in Discord."""
+        httpx_mock.add_response(url=DISCORD_URL, status_code=204)
+        await self.sink().deliver(CONTEXT, client)
+
+        body = json.loads(httpx_mock.get_requests()[0].read())
+        assert "username" not in body
+        assert "avatar_url" not in body
+
+    async def test_optional_identity_fields_are_sent_when_set(self, client, httpx_mock):
+        httpx_mock.add_response(url=DISCORD_URL, status_code=204)
+        await self.sink(username="doorman", avatar_url="https://x.example/a.png").deliver(
+            CONTEXT, client
+        )
+        body = json.loads(httpx_mock.get_requests()[0].read())
+        assert body["username"] == "doorman"
+        assert body["avatar_url"] == "https://x.example/a.png"
+
+    async def test_thread_id_becomes_a_query_parameter(self, client, httpx_mock):
+        httpx_mock.add_response(url=f"{DISCORD_URL}?thread_id=42", status_code=204)
+        await self.sink(thread_id="42").deliver(CONTEXT, client)
+        assert httpx_mock.get_requests()[0].url.params["thread_id"] == "42"
+
+    def test_there_is_no_inline_url_form(self):
+        """The URL embeds the token, so an inline form would invite committing a live
+        credential — and would keep it out of the redaction set."""
+        with pytest.raises(ValidationError):
+            DiscordSink.model_validate({"name": "d", "type": "discord", "url": DISCORD_URL})
+
+
+class TestSlackSink:
+    @staticmethod
+    def sink(secrets=None, **overrides):
+        spec = SlackSink.model_validate(
+            {
+                "name": "team-slack",
+                "type": "slack",
+                "webhook_url_env": "SLACK_WEBHOOK_URL",
+                **overrides,
+            }
+        )
+        return build_sink(spec, {"SLACK_WEBHOOK_URL": SLACK_URL} if secrets is None else secrets)
+
+    async def test_posts_the_rendered_text(self, client, httpx_mock):
+        httpx_mock.add_response(url=SLACK_URL, status_code=200)
+        outcome = await self.sink().deliver(CONTEXT, client)
+        assert outcome.response_code == 200
+        assert json.loads(httpx_mock.get_requests()[0].read()) == {
+            "text": "[o/r#7] Something broke"
+        }
+
+    async def test_unset_webhook_url_env_is_permanent(self, client):
+        with pytest.raises(PermanentSinkError, match="SLACK_WEBHOOK_URL is unset"):
+            await self.sink(secrets={}).deliver(CONTEXT, client)
+
+    async def test_transport_error_is_retryable(self, client, httpx_mock):
+        httpx_mock.add_exception(httpx.ConnectError("refused"))
+        with pytest.raises(SinkError) as exc:
+            await self.sink().deliver(CONTEXT, client)
+        assert not isinstance(exc.value, PermanentSinkError)
+
+    async def test_a_429_carries_retry_after_to_the_engine(self, client, httpx_mock):
+        """Slack rate-limits incoming webhooks at roughly one message per second per channel,
+        so this is the ordinary path on a burst rather than an exotic one."""
+        httpx_mock.add_response(url=SLACK_URL, status_code=429, headers={"Retry-After": "7"})
+        with pytest.raises(SinkError) as exc:
+            await self.sink().deliver(CONTEXT, client)
+        assert not isinstance(exc.value, PermanentSinkError)
+        # Raw and unclamped: the engine owns the clamp, because a sink cannot see
+        # `delivery.max_backoff_seconds`.
+        assert exc.value.retry_after == 7.0
+
+    def test_there_is_no_inline_url_form(self):
+        with pytest.raises(ValidationError):
+            SlackSink.model_validate({"name": "s", "type": "slack", "url": SLACK_URL})
+
+
+class TestAppriseSink:
+    @staticmethod
+    def sink(secrets=None, **overrides):
+        spec = AppriseSink.model_validate(
+            {
+                "name": "fanout",
+                "type": "apprise",
+                "url": "https://apprise.example.invalid",
+                "key_env": "APPRISE_KEY",
+                **overrides,
+            }
+        )
+        return build_sink(spec, {"APPRISE_KEY": "mykey"} if secrets is None else secrets)
+
+    URL = "https://apprise.example.invalid/notify/mykey"
+
+    async def test_posts_to_the_stateful_key_endpoint(self, client, httpx_mock):
+        httpx_mock.add_response(url=self.URL, status_code=200)
+        outcome = await self.sink().deliver(CONTEXT, client)
+        assert outcome.response_code == 200
+
+        body = json.loads(httpx_mock.get_requests()[0].read())
+        assert body["body"] == "[o/r#7] Something broke"
+        assert body["title"] == "github"
+        assert body["type"] == "info"
+        assert body["format"] == "text"
+
+    async def test_no_downstream_urls_are_ever_sent(self, client, httpx_mock):
+        """The stateless form would carry every downstream credential in the request body.
+
+        Stateful keeps them in Apprise's own store, which is the whole reason for choosing it.
+        """
+        httpx_mock.add_response(url=self.URL, status_code=200)
+        await self.sink().deliver(CONTEXT, client)
+        assert "urls" not in json.loads(httpx_mock.get_requests()[0].read())
+
+    async def test_unset_key_env_is_permanent(self, client):
+        with pytest.raises(PermanentSinkError, match="APPRISE_KEY is unset"):
+            await self.sink(secrets={}).deliver(CONTEXT, client)
+
+    async def test_transport_error_is_retryable(self, client, httpx_mock):
+        httpx_mock.add_exception(httpx.ConnectError("refused"))
+        with pytest.raises(SinkError) as exc:
+            await self.sink().deliver(CONTEXT, client)
+        assert not isinstance(exc.value, PermanentSinkError)
+
+    async def test_204_is_permanent_not_a_silent_success(self, client, httpx_mock):
+        """The finding this sink exists for.
+
+        `204` is below 400, so the default classification calls it delivered. Apprise means
+        "I notified nothing" — an unknown key, or a key whose config has no valid URLs. Read as
+        success, a typo'd key swallows every event and the DLQ stays empty.
+        """
+        httpx_mock.add_response(url=self.URL, status_code=204)
+        with pytest.raises(PermanentSinkError, match="notified nothing"):
+            await self.sink().deliver(CONTEXT, client)
+
+    async def test_424_is_permanent_deliberately(self, client, httpx_mock):
+        """ "At least one notification failed." Retrying re-notifies the ones that succeeded,
+        so the DLQ row is the honest outcome. A judgement call, asserted so it stays one."""
+        httpx_mock.add_response(url=self.URL, status_code=424)
+        with pytest.raises(PermanentSinkError, match="re-notifies"):
+            await self.sink().deliver(CONTEXT, client)
+
+    async def test_500_is_still_retryable(self, client, httpx_mock):
+        """The override must not swallow the codes it does not know about."""
+        httpx_mock.add_response(url=self.URL, status_code=500)
+        with pytest.raises(SinkError) as exc:
+            await self.sink().deliver(CONTEXT, client)
+        assert not isinstance(exc.value, PermanentSinkError)
+
+    async def test_accept_json_is_set(self, client, httpx_mock):
+        """So an error response carries a structured `error` field rather than text/plain,
+        which is what makes the excerpt in the SinkError message worth reading."""
+        httpx_mock.add_response(url=self.URL, status_code=200)
+        await self.sink().deliver(CONTEXT, client)
+        assert httpx_mock.get_requests()[0].headers["accept"] == "application/json"
+
+    async def test_html_body_format_escapes_the_body(self, client, httpx_mock):
+        httpx_mock.add_response(url=self.URL, status_code=200)
+        await self.sink(body_format="html").deliver(
+            {**CONTEXT, "summary": "<script>alert(1)</script>"}, client
+        )
+        body = json.loads(httpx_mock.get_requests()[0].read())["body"]
+        assert "<script>" not in body
+        assert "&lt;script&gt;" in body
+
+    async def test_text_body_format_does_not_escape(self, client, httpx_mock):
+        """The other half. Escaping a plain-text notification is corruption, not hardening."""
+        httpx_mock.add_response(url=self.URL, status_code=200)
+        await self.sink().deliver({**CONTEXT, "summary": "Fix A & B < C"}, client)
+        assert json.loads(httpx_mock.get_requests()[0].read())["body"] == "Fix A & B < C"
+
+    async def test_tag_is_omitted_when_unset(self, client, httpx_mock):
+        """An empty `tag` is not the same as no tag — Apprise routes on it."""
+        httpx_mock.add_response(url=self.URL, status_code=200)
+        await self.sink().deliver(CONTEXT, client)
+        assert "tag" not in json.loads(httpx_mock.get_requests()[0].read())
+
+    async def test_tag_is_sent_when_set(self, client, httpx_mock):
+        httpx_mock.add_response(url=self.URL, status_code=200)
+        await self.sink(tag="ops").deliver(CONTEXT, client)
+        assert json.loads(httpx_mock.get_requests()[0].read())["tag"] == "ops"
+
+    async def test_notify_type_and_body_format_are_sent(self, client, httpx_mock):
+        httpx_mock.add_response(url=self.URL, status_code=200)
+        await self.sink(notify_type="warning", body_format="markdown").deliver(CONTEXT, client)
+        body = json.loads(httpx_mock.get_requests()[0].read())
+        assert body["type"] == "warning"
+        assert body["format"] == "markdown"
+
+    async def test_a_key_with_url_metacharacters_is_quoted(self, client, httpx_mock):
+        """Assert on `raw_path`, not `path`.
+
+        `path` is a decoded convenience property and reports `/notify/a/../b` even when the
+        bytes on the wire are correctly escaped — so a test written against it fails on
+        working code, and would pass on broken code if the expectation were flipped to match.
+        `raw_path` is what the server actually receives.
+        """
+        httpx_mock.add_response(status_code=200)
+        await self.sink(secrets={"APPRISE_KEY": "a/../b"}).deliver(CONTEXT, client)
+        assert httpx_mock.get_requests()[0].url.raw_path == b"/notify/a%2F..%2Fb"
 
 
 class TestRegistry:

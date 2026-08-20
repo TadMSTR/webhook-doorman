@@ -7,13 +7,25 @@ model with no builder fails at startup, which is the right time to find out.
 
 from __future__ import annotations
 
-from ..config import HttpSink, MatrixSink, NtfySink, SinkSpec, VikunjaTaskSink
+from ..config import (
+    AppriseSink,
+    DiscordSink,
+    HttpSink,
+    MatrixSink,
+    NtfySink,
+    SinkSpec,
+    SlackSink,
+    VikunjaTaskSink,
+)
 from ..errors import ConfigError
 from .base import DeliveryOutcome, Sink
 from .implementations import (
+    AppriseNotifySink,
+    DiscordWebhookSink,
     GenericHttpSink,
     MatrixMessageSink,
     NtfySink_,
+    SlackWebhookSink,
     VikunjaTaskSink_,
 )
 
@@ -22,6 +34,9 @@ _BUILDERS = {
     NtfySink: NtfySink_,
     VikunjaTaskSink: VikunjaTaskSink_,
     HttpSink: GenericHttpSink,
+    DiscordSink: DiscordWebhookSink,
+    SlackSink: SlackWebhookSink,
+    AppriseSink: AppriseNotifySink,
 }
 
 

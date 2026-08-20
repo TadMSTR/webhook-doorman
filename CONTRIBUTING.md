@@ -46,7 +46,24 @@ for empty secret, missing header, and wrong credential.
 **A sink:** a model added to the `SinkSpec` union, a class in `sinks/`, an entry in `_BUILDERS`.
 Raise `PermanentSinkError` when a retry cannot possibly help (4xx, bad template) and `SinkError`
 when it can (5xx, timeout). Getting that backwards either burns five attempts on a guaranteed
-failure or throws away a recoverable one.
+failure or throws away a recoverable one. If the destination overloads a status code — Apprise
+answers `204` for "I notified nothing" — override `_classify` rather than special-casing it
+inside `deliver`.
+
+Two things to decide before writing the model:
+
+- **Does the endpoint URL contain a credential?** If it does, as Discord's and Slack's webhook
+  URLs do, **do not inherit `_EndpointMixin`.** Its inline `url` form exists because a plain
+  endpoint is topology rather than a secret; offering it for a URL that embeds a token invites
+  committing a live credential to `config.yml`, and keeps that value out of the redaction set.
+  Use a single required `webhook_url_env` instead. Any field ending in `_env` is discovered
+  automatically — there is no second place to register it.
+- **How does the destination render your text?** Escaping belongs to the sink, because only the
+  sink knows the rendering context. `render()` for plain text and markdown, `render_html()` for
+  rich text, `render_slack()` for Slack. If your destination needs a fourth rule, add a fourth
+  environment rather than widening an existing one; the split exists because a single global
+  setting got one case wrong and shipped stored XSS. Assert **both halves** — escaped where it
+  must be, untouched where it must not — so an over-broad fix fails as loudly as the bug.
 
 **A parser:** a function in `parsers.py` plus a registry entry. Parsers must not raise on
 malformed input — webhook payloads are documented optimistically and delivered otherwise, and a
