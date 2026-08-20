@@ -5,7 +5,9 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] — 2026-08-20
+
+First release. Security-audited before tagging: one Medium finding, resolved below.
 
 ### Added
 
@@ -72,3 +74,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `dedup.id_header` naming a credential header is now a startup error. It would have been
   redacted before storage, collapsing every event onto one dedup id and silently discarding all
   but the first.
+
+[0.1.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.1.0
