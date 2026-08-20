@@ -1,0 +1,50 @@
+# Backstop for a public repo. The rules that matter here are not the generic token patterns
+# gitleaks already ships — they are the deployment-specific values that look harmless in a diff.
+# A real room ID or internal hostname committed once stays in the history until someone runs
+# filter-repo.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "matrix-room-id"
+description = "Matrix room ID (deployment topology)"
+regex = '''![A-Za-z0-9]{16,}:[A-Za-z0-9.-]+\.[A-Za-z]{2,}'''
+tags = ["topology"]
+
+[[rules]]
+id = "matrix-access-token"
+description = "Matrix access token"
+regex = '''(?i)syt_[A-Za-z0-9_-]{20,}'''
+tags = ["secret"]
+
+[[rules]]
+id = "private-ipv4-literal"
+description = "RFC1918 address outside documentation ranges"
+# No lookahead: gitleaks uses Go's RE2, which does not support (?!...). Exclusions live in
+# the allowlist below instead.
+regex = '''\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b'''
+tags = ["topology"]
+
+[allowlist]
+description = "Documentation ranges, loopback, and example values are intentional"
+# Test fixtures are allowlisted by VALUE, not by path. Allowlisting tests/ wholesale would hide
+# a real credential pasted into a fixture — which is the most likely way one reaches this repo.
+regexes = [
+  '''test-(github|bearer|admin)-[a-z]+-[0-9a-z]+''',
+  '''abcdefgh12345678''',
+  '''s3cret-value''',
+  '''127\.0\.0\.1''',
+  '''0\.0\.0\.0''',
+  '''192\.0\.2\.\d{1,3}''',
+  '''198\.51\.100\.\d{1,3}''',
+  '''203\.0\.113\.\d{1,3}''',
+  '''10\.9\.0\.\d{1,3}''',
+  '''10\.9\.1\.\d{1,3}''',
+  '''example\.(com|org|net|invalid)''',
+]
+paths = [
+  '''\.gitleaks\.toml$''',
+  '''(^|/)\.venv/''',   # local virtualenv; never committed, but it drowns a local scan
+  '''(^|/)\.git/''',
+]

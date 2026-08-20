@@ -1,0 +1,137 @@
+# webhook-doorman — example configuration
+#
+# Copy to config.yml and edit. This file holds topology only: which sources exist, how each is
+# verified, and where its events go. It is safe to commit.
+#
+# Secrets are NEVER written here. Every credential field ends in `_env` and holds the *name* of
+# an environment variable. Put the values in .env (see .env.example) and keep that file out of
+# version control.
+#
+# Validate a config without binding a port:
+#     webhook-doorman --config config.yml --check
+
+server:
+  # Bodies larger than this are rejected with 413 before verification runs.
+  max_body_bytes: 1048576   # 1 MiB
+
+  # Must be true before ANY source may use `strategy: none`. Startup fails otherwise, naming
+  # every offending source. See the `internal` example at the bottom of this file.
+  allow_unverified: false
+
+storage:
+  path: /data/webhook-doorman.db   # SQLite, WAL mode. Mount /data as a volume.
+  retention_days: 30               # delivered events are swept after this long
+  dlq_retention_days: 90           # dead-lettered deliveries are kept longer, on purpose
+  sweep_interval_seconds: 3600
+
+delivery:
+  max_attempts: 5            # then the delivery moves to the DLQ
+  base_backoff_seconds: 2    # 2s, 4s, 8s, 16s ... capped below
+  max_backoff_seconds: 300
+  jitter: 0.25               # +/- 25%, so retries after an outage do not synchronise
+  timeout_seconds: 10
+  poll_interval_seconds: 1
+
+admin:
+  # POST /admin/replay/{event_id} re-fires a stored event. Disabled unless this variable is set
+  # AND holds at least `min_token_length` characters. Never route /admin/ through a public proxy.
+  token_env: ADMIN_TOKEN
+  min_token_length: 32
+
+# ---------------------------------------------------------------------------------------------
+# Sources — one entry per producer. Adding a producer is an entry here, not a code change.
+# ---------------------------------------------------------------------------------------------
+sources:
+  # --- GitHub: HMAC-SHA256, hex, "sha256=" prefix -------------------------------------------
+  - name: github
+    path: /webhook/github
+    parser: github          # understands issue/PR payloads; use `generic` for anything else
+    verify:
+      strategy: hmac_sha256
+      header: X-Hub-Signature-256
+      prefix: "sha256="
+      encoding: hex
+      secret_env: GITHUB_WEBHOOK_SECRET
+    dedup:
+      # GitHub sends a unique delivery ID per event. Without a header here, the ID falls back
+      # to a digest of the body, so dedup still works — it is just coarser.
+      id_header: X-GitHub-Delivery
+    sinks: [team-chat]
+
+  # --- A vendor that signs with a bare hex digest and no prefix ------------------------------
+  - name: tracker
+    path: /webhook/tracker
+    verify:
+      strategy: hmac_sha256
+      header: X-Tracker-Signature
+      encoding: hex
+      secret_env: TRACKER_WEBHOOK_SECRET
+    sinks: [team-chat, push]
+
+  # --- Grafana: does not sign payloads at all, only bearer / basic / custom headers ----------
+  - name: grafana
+    path: /webhook/grafana
+    verify:
+      strategy: bearer
+      secret_env: GRAFANA_WEBHOOK_TOKEN
+      # header: Authorization    # the default
+      # prefix: "Bearer "        # the default
+    sinks: [alerts]
+
+  # --- An internal producer with no signing support ------------------------------------------
+  # `strategy: none` accepts on reachability alone. It needs THREE things and the server refuses
+  # to start without all of them:
+  #   1. server.allow_unverified: true   (above)
+  #   2. unverified_reason               (write down why, for the next person)
+  #   3. a non-empty allow_from          (there is no allow-all form)
+  #
+  # allow_from is matched against the socket peer address, never X-Forwarded-For. Behind a
+  # reverse proxy the peer is the proxy, so use a real strategy instead of widening this.
+  #
+  # - name: internal
+  #   path: /webhook/internal
+  #   verify:
+  #     strategy: none
+  #     unverified_reason: "host-side agent daemon; cannot sign, reaches us over loopback only"
+  #     allow_from: ["127.0.0.1/32"]
+  #   sinks: [team-chat]
+
+# ---------------------------------------------------------------------------------------------
+# Sinks — where events go. A sink never knows which source sent it anything.
+# ---------------------------------------------------------------------------------------------
+sinks:
+  - name: team-chat
+    type: matrix
+    url_env: MATRIX_HOMESERVER   # or: url: https://matrix.example.com
+    token_env: MATRIX_TOKEN
+    room_env: MATRIX_ROOM        # a room ID is deployment topology — keep it in the environment
+    template: "{{ summary }}"
+
+  - name: push
+    type: ntfy
+    url: https://ntfy.sh
+    topic_env: NTFY_TOPIC
+    token_env: NTFY_TOKEN        # optional; omit for an open topic
+    title_template: "{{ source }}"
+    template: "{{ summary }}"
+    tags: bell
+
+  - name: alerts
+    type: http
+    url_env: ALERT_WEBHOOK_URL
+    method: POST
+    content_type: application/json
+    # Templates are Jinja2 in a sandboxed, text-only environment. Available variables:
+    #   source, event_type, summary, delivery_id, received_at, payload (the decoded body),
+    #   plus whatever the source's parser adds.
+    template: |
+      {"text": "{{ summary }}", "source": "{{ source }}"}
+
+  # A task tracker sink, for reference.
+  # - name: tickets
+  #   type: vikunja_task
+  #   url_env: VIKUNJA_API_URL
+  #   token_env: VIKUNJA_API_TOKEN
+  #   project_id: 1
+  #   title_template: "{{ summary }}"
+  #   description_template: "{{ payload.issue.body | default('') }}"

@@ -1,0 +1,37 @@
+# The published image is public. Nothing that could carry a credential, a real
+# endpoint or a test fixture may reach the final layer.
+.env
+.env.*
+config.yml
+secrets.yaml
+secrets.yml
+*.key
+*.pem
+data/
+*.db
+*.db-wal
+*.db-shm
+
+.git
+.github
+.gitignore
+.gitleaks.toml
+.pre-commit-config.yaml
+
+tests/
+docs/
+examples/
+*.md
+!README.md
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/

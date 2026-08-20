@@ -1,0 +1,52 @@
+# --- secrets: nothing here is ever committed ---
+.env
+.env.*
+!.env.example
+config.yml
+!config.example.yml
+secrets.yaml
+secrets.yml
+*.key
+*.pem
+*.p12
+*.pfx
+
+# --- data ---
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+data/
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.tox/
+.nox/
+
+# --- test / lint caches ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# --- editors / os ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# --- crash artefacts (a core dump can contain a live secret) ---
+core
+core.*
+*.core
