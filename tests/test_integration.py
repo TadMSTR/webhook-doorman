@@ -37,7 +37,9 @@ BODY = json.dumps(
 def config_data(**overrides) -> dict:
     return {
         "admin": {"token_env": "ADMIN_TOKEN"},
-        "delivery": {"max_attempts": 2, "poll_interval_seconds": 0.01},
+        # See test_engine.CONFIG: delivery is driven through `run_batch`, so the background
+        # loop must not race it. A short tick here failed on CI and passed locally.
+        "delivery": {"max_attempts": 2, "poll_interval_seconds": 3600},
         "sources": [
             {
                 "name": "github",

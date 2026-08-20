@@ -103,6 +103,104 @@ class TestGenericParser:
         assert parse("generic", json.dumps({"event": 42}).encode(), {}).event_type == "webhook"
 
 
+class TestVikunjaParser:
+    @staticmethod
+    def vk(payload: dict):
+        return parse("vikunja", json.dumps(payload).encode(), {})
+
+    def test_task_created(self):
+        result = self.vk({"event_name": "task.created", "data": {"task": {"id": 3, "title": "T"}}})
+        assert result.event_type == "task.created"
+        assert "T" in result.summary
+        assert result.context["task_id"] == 3
+
+    def test_completion_arrives_as_task_updated_with_done_true(self):
+        """There is no task.done event in Vikunja — this is the shape completion actually has."""
+        result = self.vk(
+            {"event_name": "task.updated", "data": {"task": {"id": 3, "title": "T", "done": True}}}
+        )
+        assert result.event_type == "task.done"
+        assert result.summary == "Task completed: T"
+
+    def test_an_ordinary_update_is_not_reported_as_done(self):
+        result = self.vk(
+            {"event_name": "task.updated", "data": {"task": {"id": 3, "title": "T", "done": False}}}
+        )
+        assert result.event_type == "task.updated"
+
+    def test_comment_names_the_author(self):
+        result = self.vk(
+            {
+                "event_name": "task.comment.created",
+                "data": {"task": {"title": "T"}, "comment": {"author": {"username": "ann"}}},
+            }
+        )
+        assert "ann" in result.summary
+
+    def test_comment_without_an_author_does_not_raise(self):
+        result = self.vk({"event_name": "task.comment.created", "data": {"task": {"title": "T"}}})
+        assert "someone" in result.summary
+
+    def test_missing_data_does_not_raise(self):
+        assert self.vk({"event_name": "task.created"}).summary.endswith("(untitled)")
+
+    def test_non_dict_payload_is_not_actionable(self):
+        assert not parse("vikunja", b"[1]", {}).actionable
+
+
+class TestGrafanaParser:
+    @staticmethod
+    def gf(payload: dict):
+        return parse("grafana", json.dumps(payload).encode(), {})
+
+    def test_firing_alert(self):
+        result = self.gf(
+            {
+                "status": "firing",
+                "title": "Disk almost full",
+                "alerts": [{"status": "firing"}, {"status": "firing"}],
+            }
+        )
+        assert result.event_type == "grafana.firing"
+        assert result.summary.startswith("[FIRING] Disk almost full")
+        assert result.context["firing_count"] == 2
+
+    def test_resolved_alert(self):
+        result = self.gf({"status": "resolved", "title": "Disk almost full"})
+        assert result.summary.startswith("[RESOLVED]")
+
+    def test_falls_back_to_common_labels_for_a_title(self):
+        result = self.gf({"status": "firing", "commonLabels": {"alertname": "HighLatency"}})
+        assert "HighLatency" in result.summary
+
+    def test_falls_back_to_the_first_alert_label(self):
+        result = self.gf({"status": "firing", "alerts": [{"labels": {"alertname": "FromAlert"}}]})
+        assert "FromAlert" in result.summary
+
+    def test_message_is_appended_when_present(self):
+        result = self.gf({"status": "firing", "title": "T", "message": "details here"})
+        assert result.summary == "[FIRING] T — details here"
+
+    def test_annotation_summary_is_used_when_message_is_absent(self):
+        result = self.gf(
+            {"status": "firing", "title": "T", "commonAnnotations": {"summary": "from annotation"}}
+        )
+        assert "from annotation" in result.summary
+
+    def test_an_empty_payload_does_not_raise(self):
+        """Every Grafana field is optional in practice. A thin summary beats a rejected delivery."""
+        result = self.gf({})
+        assert result.actionable
+        assert result.summary == "[UNKNOWN] Grafana alert"
+
+    def test_alerts_of_the_wrong_type_do_not_raise(self):
+        result = self.gf({"status": "firing", "alerts": "not-a-list"})
+        assert result.context["alert_count"] == 0
+
+    def test_non_dict_payload_is_not_actionable(self):
+        assert not parse("grafana", b'"a string"', {}).actionable
+
+
 class TestRegistry:
     def test_unknown_parser_raises_config_error(self):
         with pytest.raises(ConfigError, match="unknown parser"):

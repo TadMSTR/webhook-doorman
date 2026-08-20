@@ -18,8 +18,12 @@ from webhook_doorman.store import SqliteStore
 
 SINK_URL = "https://sink.example.invalid/notes"
 
+# poll_interval is deliberately enormous. These tests drive delivery through `run_once()` so
+# they are deterministic; a live background loop on a short tick competes for the same rows and
+# turns every assertion into a race the suite wins locally and loses on a slower CI runner.
+# The loop still runs one empty claim at startup, which is harmless.
 CONFIG: dict = {
-    "delivery": {"max_attempts": 3, "base_backoff_seconds": 1, "poll_interval_seconds": 0.01},
+    "delivery": {"max_attempts": 3, "base_backoff_seconds": 1, "poll_interval_seconds": 3600},
     "sources": [
         {
             "name": "internal",
