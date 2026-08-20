@@ -1,0 +1,59 @@
+# Example — Grafana alerts into chat and a push notification.
+#
+# Grafana does not sign its webhook payloads. It offers Basic auth, a bearer token, or custom
+# headers, and nothing else. That is exactly the mismatch a per-source verification layer exists
+# to absorb: it costs a `bearer` block here and no code anywhere.
+#
+#   .env:
+#     GRAFANA_WEBHOOK_TOKEN=<generate one: openssl rand -hex 32>
+#     MATRIX_HOMESERVER=https://matrix.example.invalid
+#     MATRIX_TOKEN=<bot access token>
+#     MATRIX_ROOM=!alerts:example.invalid
+#     NTFY_TOPIC=<your topic>
+#
+# In Grafana: Alerting → Contact points → Add contact point → Webhook.
+#   URL:  https://hooks.example.invalid/webhook/grafana
+#   Auth: Bearer, with the same value as GRAFANA_WEBHOOK_TOKEN.
+#
+# Then point a notification policy at that contact point, or nothing will ever be sent — a fresh
+# Grafana ships with a root policy whose receiver is empty.
+
+sources:
+  - name: grafana
+    path: /webhook/grafana
+    parser: grafana
+    verify:
+      strategy: bearer
+      secret_env: GRAFANA_WEBHOOK_TOKEN
+      # header and prefix default to Authorization / "Bearer ".
+      #
+      # Prefer `basic` instead? Swap the block for:
+      #   strategy: basic
+      #   user_env: GRAFANA_WEBHOOK_USER
+      #   pass_env: GRAFANA_WEBHOOK_PASS
+    dedup:
+      # Grafana sends no delivery-id header, so the id falls back to a digest of the body. That
+      # is coarser but still real: an identical re-post is collapsed. A re-fire whose payload
+      # differs (a changed alert count, a new timestamp) is correctly treated as a new event.
+      enabled: true
+    sinks: [alert-room, phone]
+
+sinks:
+  - name: alert-room
+    type: matrix
+    url_env: MATRIX_HOMESERVER
+    token_env: MATRIX_TOKEN
+    room_env: MATRIX_ROOM
+    # The grafana parser exposes: status, title, message, alert_count, firing_count, external_url.
+    template: |
+      {{ summary }}
+      {{ firing_count }} of {{ alert_count }} firing
+      {{ external_url }}
+
+  - name: phone
+    type: ntfy
+    url: https://ntfy.sh
+    topic_env: NTFY_TOPIC
+    title_template: "Grafana: {{ title }}"
+    template: "{{ message or summary }}"
+    tags: rotating_light

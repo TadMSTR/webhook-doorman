@@ -159,6 +159,27 @@ Control exposure at the boundary that actually has it:
 characters and is disabled entirely without one — and it should never be routed through a public
 reverse proxy.
 
+## Alternatives
+
+The consumer-side projects worth knowing about, and where this one differs.
+
+| Project | Stack | Verification | Persistence |
+|---|---|---|---|
+| **webhook-doorman** | Python, SQLite | **Per-source, declarative, fail-closed** | Event log, dedup, retry, DLQ, replay |
+| [event-bridge](https://github.com/fangzhengmei/event-bridge) | Python, SQLite | None — its README says to do HMAC "at the application layer" | Persist, retry, DLQ, dashboard |
+| [notify-proxy](https://github.com/muhkuh2005/notify-proxy) | Python, SQLite | Per-destination filters, not per-source verification | SQLAlchemy store |
+| [adnanh/webhook](https://github.com/adnanh/webhook) | Go, stateless | Declarative trigger rules with HMAC | None — fire and forget |
+| [WebhookHub](https://github.com/Paramoshka/WebhookHub) | — | — | Inspect, replay, forward |
+| [WebhookX](https://github.com/webhookx-io/webhookx) | Go, Postgres + Redis | Multi-tenant, **license-gated** | Full |
+
+The design borrows shapes from several of them — event-bridge's single-container SQLite
+persist-retry-DLQ, `adnanh/webhook`'s declarative hook definitions, WebhookHub's replay. What
+none of them offer is the thing this exists for: every one either treats the ingest endpoint as
+unauthenticated by design or ties verification to a specific vendor.
+
+Sending webhooks rather than receiving them is a different problem — use
+[Convoy](https://getconvoy.io/) or [Svix](https://www.svix.com/).
+
 ## Non-goals
 
 - **Outbound webhook delivery.** This is a consumer-side router. If you need to *send* webhooks
@@ -174,8 +195,12 @@ reverse proxy.
 | Document | Contents |
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Design decisions, extension points, what is protected and what is not |
+| [docs/deployment.md](docs/deployment.md) | Exposure model, file-permission traps, reverse proxy, migrating from an existing receiver |
 | [SECURITY.md](SECURITY.md) | Reporting a vulnerability, threat model boundaries |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Adding a source, sink or strategy; code style; tests |
+| [examples/](examples/) | Worked configs: GitHub → chat, Grafana alerts, generic HMAC and bearer |
+| [docs/verification-enforcement.mmd](docs/verification-enforcement.mmd) | Every path from a request to admitted or refused |
+| [docs/delivery-lifecycle.mmd](docs/delivery-lifecycle.mmd) | Delivery states, retry, DLQ, crash recovery |
 
 ## License
 

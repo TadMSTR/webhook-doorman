@@ -1,0 +1,176 @@
+# Deployment
+
+Everything here is about the boundary between the container and the things around it. The
+in-process design is in [ARCHITECTURE.md](../ARCHITECTURE.md).
+
+---
+
+## Exposure
+
+**The container always binds `0.0.0.0:8080`, and that is not a setting.** Reach is decided by the
+port publish and network membership, not by the bind address, so a `HOST` variable would read as
+a control while enforcing nothing.
+
+```mermaid
+flowchart LR
+    subgraph internet [Internet]
+        GH[GitHub]
+    end
+    subgraph host [Your host]
+        PROXY[reverse proxy<br/>TLS · rate limit · deny /admin/]
+        subgraph net [container network]
+            DM[webhook-doorman:8080]
+        end
+        LOCAL[host-side producer]
+    end
+
+    GH -->|https| PROXY
+    PROXY -->|http, container name| DM
+    LOCAL -->|"127.0.0.1:8080"| DM
+```
+
+| Goal | How |
+|---|---|
+| Host-side producers only | `ports: ["127.0.0.1:8080:8080"]` |
+| Reverse proxy only | join the proxy's network; publish **nothing** |
+| Both | do both — they are independent |
+
+Publishing `8080:8080` with no address prefix exposes the router on every interface. That is
+occasionally what you want and never what you want by accident.
+
+---
+
+## Two file-permission traps
+
+Both come from the same place: the container runs as **UID 10001**, and the host does not.
+
+### The data directory must be owned by 10001
+
+```bash
+mkdir -p /path/to/appdata/webhook-doorman/data
+chown -R 10001:10001 /path/to/appdata/webhook-doorman/data
+```
+
+SQLite does not just create the database file — WAL mode writes `-wal` and `-shm` siblings
+*beside* it, so the container needs write permission on the **directory**, not only the file.
+Relying on Docker to auto-create the volume path gives you a root-owned directory and a service
+that fails at boot.
+
+Verify:
+
+```bash
+docker compose exec webhook-doorman ls -la /data
+# -rw-r--r-- 1 10001 10001 ... webhook-doorman.db
+# -rw-r--r-- 1 10001 10001 ... webhook-doorman.db-wal
+# -rw-r--r-- 1 10001 10001 ... webhook-doorman.db-shm
+```
+
+### Pass `.env` with `env_file:`, not a bind mount
+
+```yaml
+env_file: .env          # correct
+```
+
+```yaml
+volumes:
+  - ./.env:/app/.env    # wrong, if .env is 0600
+```
+
+`env_file:` is read by the **Docker daemon, as root**, at container start. The file can stay
+`0600` and owned by you while the container runs unprivileged. Bind-mount it instead and UID
+10001 cannot open it — the service fails closed at boot with an error that reads like a bug.
+
+The `config.yml` mount is fine as a bind mount: it holds no secrets and should be world-readable
+(`0644`).
+
+---
+
+## Reverse proxy
+
+`/admin/replay/{event_id}` re-fires stored events at their real destinations. It requires a
+token, and it should also be unreachable from outside.
+
+**nginx:**
+
+```nginx
+server {
+    server_name hooks.example.com;
+    client_max_body_size 1m;
+
+    location /admin/ {
+        return 404;          # 404, not 403 — do not confirm it exists
+    }
+
+    location / {
+        limit_req zone=webhooks burst=10 nodelay;
+        proxy_pass http://webhook-doorman:8080;
+    }
+}
+```
+
+**Caddy:**
+
+```caddy
+hooks.example.com {
+    handle /admin/* {
+        respond 404
+    }
+    handle {
+        reverse_proxy webhook-doorman:8080
+    }
+}
+```
+
+Two things worth setting either way:
+
+- **A body limit** at the proxy as well as in `config.yml`. The router's own cap rejects
+  oversized bodies before buffering them, but stopping them a hop earlier is cheaper.
+- **Rate limiting.** Deliberately not built in: the proxy already does it better, and doing it
+  in-process would mean either shared state or a limit that multiplies by replica count.
+
+Do **not** enable proxy header forwarding on the router itself. `allow_from` on an unverified
+source matches the socket peer, and trusting `X-Forwarded-For` would hand a caller the allowlist.
+
+---
+
+## Migrating from an existing receiver
+
+Cut over in this order. The failure mode of getting it wrong is webhooks that stop silently.
+
+1. **Run in parallel first.** Publish the router on a spare loopback port and leave the old
+   receiver serving real traffic. Nothing external points at the router yet.
+2. **Keep the existing hostname.** Repoint the proxy at the container rather than renaming the
+   endpoint. A rename touches producer configuration at GitHub, Grafana and everywhere else — do
+   it separately, later, or not at all. Two moving parts in one change is how a webhook goes
+   quiet for a week.
+3. **Verify with a real producer event**, not a hand-rolled `curl`. A synthesised payload proves
+   the parser works. It does not prove the producer can reach you, that its secret matches, or
+   that the proxy forwards the signature header.
+4. **Then** stop the old receiver.
+
+`GET /health` after each step. It reports every source, whether it is enabled, and the reason if
+not — a source silently disabled by a missing environment variable is the most likely way a
+cutover looks fine and delivers nothing.
+
+---
+
+## Operating
+
+**Logs** are JSON on stdout. `LOG_LEVEL=DEBUG` for more. Events worth alerting on:
+
+| Event | Meaning |
+|---|---|
+| `source_disabled` | A source has no secret. It is rejecting every request. |
+| `source_unverified` | A `none` source is live. Logged at boot, every boot, on purpose. |
+| `verification_failed` | Someone sent an unsigned or mis-signed request. |
+| `delivery_exhausted` | A delivery gave up and went to the DLQ. |
+| `deliveries_requeued` | Recovery after an unclean shutdown. Expected after a restart. |
+
+**Backups.** The database holds the event log — no credentials, by design, and there is a test
+asserting exactly that against the raw file. Back up `/data` if you want the replay history;
+losing it costs you the log and any deliveries still in backoff, not your configuration.
+
+To copy it safely while running, use `sqlite3 /data/webhook-doorman.db ".backup /tmp/out.db"`
+rather than `cp` — a plain copy of a WAL-mode database can catch it mid-transaction.
+
+**Upgrades** are a pull and a recreate. The schema migrates forward on startup.

@@ -44,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a loopback-only publish.
 - CI job that builds the image and asserts on its actual filesystem that no `.env`, `config.yml`
   or test fixture reached the published layers, and that the runtime UID is not root.
+- Parsers for `vikunja` and `grafana` alongside `github` and `generic`.
+- `ARCHITECTURE.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `docs/deployment.md`, Mermaid
+  diagrams for verification enforcement and the delivery lifecycle, three worked examples,
+  `.pre-commit-config.yaml`, and issue and PR templates.
+- Tests that every shipped example config loads, contains no inline credential, and contains no
+  real hostname, address or room ID — the public-repo guard runs on every PR rather than at
+  review time, because a leaked value stays in the git history whatever the next commit does.
 
 ### Fixed
 
