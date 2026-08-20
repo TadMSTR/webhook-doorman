@@ -2,6 +2,7 @@
 # endpoint or a test fixture may reach the final layer.
 .env
 .env.*
+*.env
 config.yml
 secrets.yaml
 secrets.yml

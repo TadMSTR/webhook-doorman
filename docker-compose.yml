@@ -11,9 +11,15 @@
 
 services:
   webhook-doorman:
-    image: ghcr.io/tadmstr/webhook-doorman:latest
+    # Pinned, not :latest. A floating tag means `docker compose pull` can change what is running
+    # without anything in this file changing — including across a breaking release.
+    image: ghcr.io/tadmstr/webhook-doorman:0.1.0
     container_name: webhook-doorman
     restart: unless-stopped
+
+    # The image already sets USER 10001. Stating it here means a future base-image change cannot
+    # silently promote the container to root.
+    user: "10001:10001"
 
     # env_file, not a bind mount. The Docker daemon reads this as root at container start, so
     # the file stays 0600 and owned by you while the container runs as a non-root user. Bind-
@@ -38,6 +44,12 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+    # Generous for the workload — the router idles in single-digit MB and this is a ceiling, not
+    # a reservation. Its job is to stop a runaway retry loop or a pathological payload from
+    # taking the host down with it.
+    mem_limit: 256m
+    cpus: 0.5
 
     logging:
       driver: json-file

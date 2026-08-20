@@ -96,6 +96,14 @@ def peer_address(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
+# A delivery ID is a producer's opaque handle — GitHub's is a UUID, most are shorter. This is
+# the value that goes into a unique index and every log line for the event, and it arrives in a
+# header we do not control, so it gets an upper bound. Anything longer is truncated rather than
+# rejected: the truncation is deterministic, so dedup still works, and refusing the delivery
+# over a long header would be a worse outcome than a coarser key.
+MAX_DELIVERY_ID_LENGTH = 200
+
+
 def compute_delivery_id(state: SourceState, headers: Mapping[str, str], body: bytes) -> str:
     """Derive the ID that dedup keys on.
 
@@ -107,7 +115,7 @@ def compute_delivery_id(state: SourceState, headers: Mapping[str, str], body: by
     if header_name:
         value = headers.get(header_name.lower(), "").strip()
         if value:
-            return value
+            return value[:MAX_DELIVERY_ID_LENGTH]
     return "sha256:" + hashlib.sha256(body).hexdigest()
 
 

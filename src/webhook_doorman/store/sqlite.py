@@ -109,7 +109,10 @@ class SqliteStore:
         if self._db is not None:
             return
         if self.path.parent and str(self.path.parent) not in ("", "."):
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Explicit mode. Left to the default, the directory ACL is whatever the process
+            # umask happens to be, which is not something a container image should decide by
+            # accident for a directory holding the event log.
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
         self._db = await aiosqlite.connect(self.path, isolation_level=None)
         self._db.row_factory = aiosqlite.Row

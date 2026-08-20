@@ -1,6 +1,7 @@
 # --- secrets: nothing here is ever committed ---
 .env
 .env.*
+*.env
 !.env.example
 config.yml
 !config.example.yml
