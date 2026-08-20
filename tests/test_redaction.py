@@ -1,4 +1,18 @@
-"""Redaction — the control that keeps the event log from becoming a secret store."""
+"""Redaction — the control that keeps the event log from becoming a secret store.
+
+**This file unit-tests the `redact_*` functions in isolation. The property they exist to
+guarantee — that a secret never reaches disk — is asserted in
+`tests/test_integration.py::TestSecretsNeverReachDisk`,** which drives a real request through
+verification, storage and delivery and then reads the SQLite file *and its WAL sidecar* as raw
+bytes. That is where a secret would actually be found, and reading only the main file would
+miss one sitting in an uncheckpointed WAL frame.
+
+Look there for the per-credential cases: the webhook secret, the signature header, a secret
+echoed back in the payload, the admin token, and a Discord `webhook_url_env` value — the last
+being the shape where the URL *is* the credential. The split is deliberate, but it is not
+obvious from either file's name; a 2026-08-20 audit looked for the Discord case here and
+reported it missing.
+"""
 
 from __future__ import annotations
 

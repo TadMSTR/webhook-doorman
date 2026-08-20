@@ -44,7 +44,7 @@ from ..config import (
     VikunjaTaskSink,
 )
 from ..errors import PermanentSinkError
-from ..templating import render, render_html, render_slack, validate
+from ..templating import render, render_html, render_markdown, render_slack, validate
 from .base import DeliveryOutcome, Disposition, HttpSinkBase, Verdict
 
 
@@ -320,6 +320,16 @@ class SlackWebhookSink(HttpSinkBase):
         )
 
 
+# One entry per member of `AppriseSink.body_format`. Keyed rather than branched so that adding
+# a format to the Literal without deciding its escaping raises a KeyError at delivery instead
+# of silently inheriting a neighbour's rule.
+_APPRISE_BODY_RENDERERS = {
+    "text": render,
+    "markdown": render_markdown,
+    "html": render_html,
+}
+
+
 class AppriseNotifySink(HttpSinkBase):
     """Fan out a notification through an apprise-api instance.
 
@@ -341,6 +351,15 @@ class AppriseNotifySink(HttpSinkBase):
     Apprise's store rather than in doorman's config. `Accept: application/json` is set so an
     error response carries a structured `error` field, which is what makes the `response.text`
     excerpt in the `SinkError` message worth reading.
+
+    **Escaping is per `body_format`, and all three modes are decided rather than defaulted.**
+    `html` escapes as HTML; `markdown` escapes angle brackets, because apprise-api converts
+    Markdown to HTML with an unsanitised Python-Markdown that passes raw tags through; `text`
+    is not escaped, because apprise-api runs its own `escape_html` on the text-to-HTML path.
+    An audit found `markdown` originally sharing the `text` rule — the format's name made it
+    look like a plain-text sibling when its renderer makes it a rich-text one. See
+    `render_markdown` for the evidence, and `tests/test_sink_escaping.py` for all three
+    asserted, including the negative halves.
     """
 
     def __init__(self, spec: AppriseSink, secrets: dict[str, str]) -> None:
@@ -373,10 +392,17 @@ class AppriseNotifySink(HttpSinkBase):
 
         # The body's rendering context is chosen by config, so the escaping has to be too —
         # this is the per-field doctrine applied to a field whose destination is a variable.
+        # All three modes are named explicitly rather than defaulting: the first version of
+        # this sink wrote `render_html if body_format == "html" else render`, which put
+        # `markdown` in the plain-text bucket without checking whether it belonged there. It
+        # does not — see `render_markdown`. A dict keyed on every member of the Literal fails
+        # loudly if a fourth format is ever added, where a two-way branch would silently
+        # inherit whichever side it fell through to.
+        #
         # The title is left unescaped in every mode: Apprise maps it onto plain-text slots
         # (an email subject, a push notification title), the same split `VikunjaTaskSink_`
         # settled on for its own title.
-        render_body = render_html if self.spec.body_format == "html" else render
+        render_body = _APPRISE_BODY_RENDERERS[self.spec.body_format]
         payload: dict[str, Any] = {
             "body": render_body(self.spec.template, context),
             "title": render(self.spec.title_template, context),

@@ -119,11 +119,27 @@ Verification proves where a payload came from. It says nothing about whether the
 signed by GitHub either way. So content that reaches a destination has to be escaped for the way
 that destination renders it.
 
-That is a property of the sink, which is why there are three template environments rather than
+That is a property of the sink, which is why there are four template environments rather than
 one global setting. `render()` leaves output alone: chat messages, push notifications and JSON
 bodies, where HTML-escaping is corruption rather than hardening. `render_html()` escapes every
 interpolated value, for destinations that render rich text — today, the Vikunja sink's
 `description`. `render_slack()` applies Slack's own three-character escape.
+`render_markdown()` escapes angle brackets, for Markdown a destination converts to HTML.
+
+**The renderer decides, not the format.** Two of the four serve Markdown destinations and they
+need opposite treatment. Discord's message content is Markdown and takes `render()`, because
+Discord's flavour does not render raw HTML and escaping would put a literal `&lt;` in front of
+users. apprise-api's `body_format: markdown` takes `render_markdown()`, because it feeds
+Python-Markdown — with `nl2br` and `tables` and no sanitiser — and standard Markdown passes raw
+inline HTML straight through by design. Same format, opposite rule, because the thing on the
+other end is different. An audit caught this sink treating `markdown` as a plain-text sibling
+of `text` on the strength of the name; the fix names all three formats explicitly in a lookup
+table, so a fourth can never inherit a neighbour's rule by falling through a branch.
+
+apprise-api is also the reason `text` is *not* escaped there: its text-to-HTML path calls
+`escape_html` server-side, so escaping locally would double up and show entities to the reader.
+Knowing that required reading the destination's source, which is the level of evidence this
+decision needs — "it looks like plain text" is what produced the defect.
 
 Slack is the case that shows the split is about destinations rather than about a boolean. Its
 `mrkdwn` is neither HTML nor plain text: it reads `<http://evil|your bank>` as a link whose

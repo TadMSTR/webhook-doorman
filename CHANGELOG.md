@@ -30,8 +30,17 @@ Nothing existing changes behaviour. Upgrading is a version bump.
   works as expected.
 - **`apprise` sink.** Fans out through an apprise-api instance via the stateful
   `POST {base}/notify/{key}` endpoint, so downstream credentials stay in Apprise's store rather
-  than in doorman's config and in every outbound request. Options: `notify_type`, `body_format`
-  (`text`/`markdown`/`html`, and the body is HTML-escaped only in `html` mode), `tag`.
+  than in doorman's config and in every outbound request. Options: `notify_type`, `body_format`,
+  `tag`.
+
+  **Each `body_format` gets the escaping its renderer needs, and all three were checked rather
+  than defaulted.** `html` is HTML-escaped. `markdown` has its angle brackets escaped, because
+  apprise-api converts Markdown to HTML through an unsanitised Python-Markdown and standard
+  Markdown passes raw HTML through by design — an unescaped `<script>` in an issue title would
+  otherwise arrive intact at every destination the key fans out to. `text` is left alone,
+  because apprise-api runs its own `escape_html` on that path and escaping twice would show
+  entities to the reader. Note that Discord's Markdown content is *not* escaped, for the same
+  reason inverted: its flavour does not render raw HTML.
 
   **Two response codes are reclassified, and this is the substance of the sink.** `204` means
   Apprise notified *nothing* — an unknown key, or a key with no valid URLs — and because it is
@@ -39,10 +48,14 @@ Nothing existing changes behaviour. Upgrading is a version bump.
   every event with no retry, no DLQ row and nothing above debug in the log. It is now permanent.
   `424` ("at least one notification failed") is permanent too, deliberately: retrying re-notifies
   the destinations that already succeeded, so the DLQ row is the honest outcome.
-- `render_slack()` in `templating.py`, a third template environment alongside `render()` and
-  `render_html()`. Implemented as Jinja's `finalize` hook rather than an autoescape policy,
-  because autoescape is hardwired to `markupsafe.escape` and that also rewrites `"` and `'`,
-  which Slack renders literally.
+- `render_slack()` and `render_markdown()` in `templating.py`, joining `render()` and
+  `render_html()`. Both are implemented as Jinja's `finalize` hook rather than an autoescape
+  policy, because autoescape is hardwired to `markupsafe.escape` and that rewrites more than
+  either destination wants — `"` and `'` for Slack, which renders them literally.
+
+  Two of the four environments now serve Markdown destinations that need opposite treatment
+  (Discord unescaped, apprise-api escaped), which is the clearest available statement that
+  escaping follows the renderer rather than the format.
 - `HttpSinkBase._classify()`, an overridable hook returning a `Verdict`, for destinations whose
   status codes disagree with HTTP's. Also the right seam for a destination that reports failure
   in the body of a `200` — Slack's `chat.postMessage` Web API does, should token posting ever

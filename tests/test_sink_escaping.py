@@ -22,7 +22,14 @@ import json
 import httpx
 import pytest
 
-from webhook_doorman.config import HttpSink, MatrixSink, NtfySink, SlackSink, VikunjaTaskSink
+from webhook_doorman.config import (
+    AppriseSink,
+    HttpSink,
+    MatrixSink,
+    NtfySink,
+    SlackSink,
+    VikunjaTaskSink,
+)
 from webhook_doorman.sinks import build_sink
 
 XSS_TITLE = '<script>alert("xss")</script>'
@@ -259,6 +266,102 @@ class TestSlackIsNotHtmlEscaped:
         assert text == 'it\'s a "quoted" title'
         assert "&#34;" not in text
         assert "&#39;" not in text
+
+
+APPRISE_URL = "https://apprise.example.invalid/notify/mykey"
+
+
+def apprise_sink(**overrides):
+    spec = AppriseSink.model_validate(
+        {
+            "name": "fanout",
+            "type": "apprise",
+            "url": "https://apprise.example.invalid",
+            "key_env": "APPRISE_KEY",
+            **overrides,
+        }
+    )
+    return build_sink(spec, {"APPRISE_KEY": "mykey"})
+
+
+class TestAppriseBodyFormatChoosesTheEscape:
+    """One field, three rendering contexts, chosen by config. All three asserted.
+
+    `markdown` originally shared the `text` rule, on the assumption that a format called
+    "markdown" is a plain-text sibling of a format called "text". It is not: apprise-api
+    converts Markdown to HTML with `markdown(content, extensions=["nl2br", "tables"])` and no
+    sanitiser, and standard Markdown passes raw HTML through by design — so `<script>` arrived
+    intact at whatever the operator's Apprise key fans out to. Its plain-*text* path, by
+    contrast, runs `escape_html` server-side, which is why `text` is correctly left alone here.
+
+    Third occurrence of the OE-01 pattern in this repo (Vikunja description, then this).
+    """
+
+    async def test_markdown_body_cannot_carry_a_script_tag(self, client, httpx_mock):
+        httpx_mock.add_response(url=APPRISE_URL, status_code=200)
+        await apprise_sink(body_format="markdown").deliver(CONTEXT, client)
+
+        body = json.loads(httpx_mock.get_requests()[0].read())["body"]
+        assert "<script>" not in body
+        assert "&lt;script&gt;" in body
+
+    async def test_markdown_body_cannot_carry_an_event_handler_attribute(self, client, httpx_mock):
+        httpx_mock.add_response(url=APPRISE_URL, status_code=200)
+        await apprise_sink(body_format="markdown", template="{{ body }}").deliver(CONTEXT, client)
+
+        body = json.loads(httpx_mock.get_requests()[0].read())["body"]
+        # As in the Vikunja tests: assert on the angle brackets, not on `onerror=`. The
+        # attribute text survives harmlessly once there is no tag for it to attach to.
+        assert "<" not in body
+        assert "&lt;img" in body
+
+    async def test_markdown_leaves_an_ampersand_alone(self, client, httpx_mock):
+        """The deliberate exclusion, asserted so nobody "completes the set" later.
+
+        Markdown-to-HTML escapes a bare `&` itself, so escaping it here buys nothing — and it
+        would show a literal `&amp;` to every reader on a plugin that renders Markdown natively
+        rather than converting it.
+        """
+        httpx_mock.add_response(url=APPRISE_URL, status_code=200)
+        await apprise_sink(body_format="markdown").deliver(
+            {**CONTEXT, "summary": "Fix A & B"}, client
+        )
+
+        assert json.loads(httpx_mock.get_requests()[0].read())["body"] == "Fix A & B"
+
+    async def test_markdown_leaves_operator_markup_alone(self, client, httpx_mock):
+        """Interpolated values only — the operator's own template is their own."""
+        httpx_mock.add_response(url=APPRISE_URL, status_code=200)
+        await apprise_sink(
+            body_format="markdown", template="**{{ source }}** <https://runbook.example>"
+        ).deliver(CONTEXT, client)
+
+        body = json.loads(httpx_mock.get_requests()[0].read())["body"]
+        assert body == "**github** <https://runbook.example>"
+
+    async def test_html_body_escapes(self, client, httpx_mock):
+        httpx_mock.add_response(url=APPRISE_URL, status_code=200)
+        await apprise_sink(body_format="html").deliver(CONTEXT, client)
+
+        body = json.loads(httpx_mock.get_requests()[0].read())["body"]
+        assert "<script>" not in body
+        assert "&lt;script&gt;" in body
+
+    async def test_text_body_is_not_escaped(self, client, httpx_mock):
+        """apprise-api runs `escape_html` on its own text-to-HTML path, so escaping here would
+        double up and show entities to the reader."""
+        httpx_mock.add_response(url=APPRISE_URL, status_code=200)
+        await apprise_sink().deliver({**CONTEXT, "summary": "Fix A & B < C"}, client)
+
+        assert json.loads(httpx_mock.get_requests()[0].read())["body"] == "Fix A & B < C"
+
+    async def test_every_declared_body_format_has_a_renderer(self):
+        """A fourth format added to the Literal without an escaping decision must not
+        silently inherit a neighbour's rule."""
+        from webhook_doorman.sinks.implementations import _APPRISE_BODY_RENDERERS
+
+        declared = set(AppriseSink.model_fields["body_format"].annotation.__args__)
+        assert declared == set(_APPRISE_BODY_RENDERERS)
 
 
 class TestEscapeFilterIsAvailableToOperators:

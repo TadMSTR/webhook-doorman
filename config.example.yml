@@ -183,7 +183,9 @@ sinks:
   #   template: "{{ summary }}"
   #   title_template: "{{ source }}"
   #   notify_type: warning         # info | success | warning | failure
-  #   body_format: markdown        # text | markdown | html
+  #   body_format: markdown        # text | markdown | html — each escapes for its own renderer:
+  #                                # markdown and html escape interpolated values, text does not
+  #                                # (apprise-api escapes that path itself).
   #   tag: ops                     # optional: routes to a subset of the key's URLs
 
   # A task tracker sink, for reference.
