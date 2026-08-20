@@ -294,8 +294,20 @@ class TestParseRetryAfter:
         to throw the value away and wait the full backoff instead."""
         assert parse_retry_after("0.75") == 0.75
 
-    def test_negative_delta_becomes_zero(self):
-        assert parse_retry_after("-5") == 0.0
+    def test_zero_is_a_valid_delay(self):
+        assert parse_retry_after("0") == 0.0
+
+    def test_a_negative_delta_is_rejected(self):
+        """Not a valid delta-seconds, and reading it as "retry now" would let a destination
+        accelerate our retries at itself until the attempt budget is gone."""
+        assert parse_retry_after("-5") is None
+
+    @pytest.mark.parametrize("value", ["nan", "inf", "-inf", "infinity", "1e400", "9" * 400])
+    def test_non_finite_values_are_rejected(self, value):
+        """`float()` accepts all of these. The engine's clamp would contain them today, but a
+        parser that can hand back `inf` is one refactor away from an unclamped arithmetic —
+        and `_jittered(inf)` is `nan`, which is a delivery that never comes due."""
+        assert parse_retry_after(value) is None
 
     def test_http_date(self):
         now = datetime(2026, 10, 21, 7, 28, 0, tzinfo=UTC)

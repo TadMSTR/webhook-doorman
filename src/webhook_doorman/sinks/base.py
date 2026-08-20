@@ -14,6 +14,7 @@ Failure vocabulary, and the distinction is load-bearing:
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -114,9 +115,19 @@ def parse_retry_after(value: str | None, *, now: datetime | None = None) -> floa
     HTTP-date (`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`). A date already in the past gives
     `0.0` — "come back now" — rather than a negative delay.
 
-    An unparseable value returns `None`, so the caller falls back to its own backoff curve. That
-    direction matters: a destination sending garbage should end up with the normal backoff, not
-    with a delay that rounds to zero and turns a retry budget into a tight loop.
+    Everything else returns `None`, so the caller falls back to its own backoff curve. That
+    direction is the safe one and it is worth being strict about, because this is the one field
+    in the delivery path whose value comes from the destination:
+
+    * **Non-finite.** `float()` happily accepts `nan`, `inf` and any integer long enough to
+      overflow to `inf`. The engine's clamp would contain all of them today, but a parser that
+      can hand back `inf` is one refactor away from an `inf` reaching an arithmetic that has no
+      clamp — `_jittered(inf)` produces `nan`, and a `nan` delay is a delivery that is never due.
+      Rejecting it here means the guarantee does not rest on the caller remembering to clamp.
+    * **Negative delta-seconds.** Not a valid delta — RFC 9110 defines it as non-negative — and
+      reading one as "retry now" lets a destination *accelerate* our retries at itself, spending
+      the whole attempt budget as fast as the poll loop allows. A past HTTP-date is different:
+      that genuinely means now, and is treated as `0.0`.
     """
     if value is None:
         return None
@@ -125,9 +136,11 @@ def parse_retry_after(value: str | None, *, now: datetime | None = None) -> floa
         return None
 
     try:
-        return max(0.0, float(raw))
+        seconds = float(raw)
     except ValueError:
         pass
+    else:
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
     try:
         when = parsedate_to_datetime(raw)
