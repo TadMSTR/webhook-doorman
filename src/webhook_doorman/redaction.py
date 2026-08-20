@@ -22,6 +22,7 @@ Two passes, because credentials arrive by two routes:
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from typing import Any
 
 REDACTED = "<redacted>"
 
@@ -77,6 +78,31 @@ def redact_bytes(body: bytes, secret_values: Iterable[str]) -> bytes:
         if encoded and encoded in body:
             body = body.replace(encoded, REDACTED.encode("ascii"))
     return body
+
+
+def redact_json(value: Any, secret_values: Iterable[str]) -> Any:
+    """Recursively redact secret values inside a decoded JSON structure.
+
+    Used on a parser's `context`, which lifts nested payload fields into their own columns. A
+    redaction pass that covers the body but not the fields derived from it leaves the secret on
+    disk in the place nobody thought to look.
+    """
+    values = _redactable(secret_values)
+    if not values:
+        return value
+    return _walk(value, values)
+
+
+def _walk(value: Any, values: list[str]) -> Any:
+    if isinstance(value, str):
+        for secret in values:
+            value = value.replace(secret, REDACTED)
+        return value
+    if isinstance(value, dict):
+        return {k: _walk(v, values) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_walk(v, values) for v in value]
+    return value
 
 
 def redact_headers(

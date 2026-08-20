@@ -21,8 +21,10 @@ import uvicorn
 from . import __version__
 from .app import create_app
 from .config import load_config
+from .engine import Engine
 from .errors import ConfigError
 from .logging import configure_logging
+from .secrets import resolve
 
 log = structlog.get_logger(__name__)
 
@@ -72,7 +74,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    app = create_app(config=config)
+    # Resolve once and share: the app's `/health` and the engine's sink table must be the same
+    # view of the environment, not two independent reads of it.
+    resolved = resolve(config)
+    engine = Engine(resolved)
+    app = create_app(resolved=resolved, engine=engine)
 
     log.info("starting", version=__version__, port=args.port, config=args.config)
     uvicorn.run(app, host="0.0.0.0", port=args.port, proxy_headers=False, access_log=False)

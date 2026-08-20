@@ -128,6 +128,26 @@ class TestStructuralValidation:
         with pytest.raises(ValueError, match="/admin"):
             Config.model_validate(base_config)
 
+    def test_dedup_may_not_key_on_the_verify_header(self, base_config):
+        """Redaction would collapse every event onto one dedup id and discard the rest."""
+        base_config["sources"][0]["dedup"] = {"id_header": "X-Hub-Signature-256"}
+        with pytest.raises(ValueError, match="credential header"):
+            Config.model_validate(base_config)
+
+    def test_dedup_may_not_key_on_authorization(self, base_config):
+        base_config["sources"][0]["dedup"] = {"id_header": "Authorization"}
+        with pytest.raises(ValueError, match="credential header"):
+            Config.model_validate(base_config)
+
+    def test_dedup_header_check_is_case_insensitive(self, base_config):
+        base_config["sources"][0]["dedup"] = {"id_header": "authorization"}
+        with pytest.raises(ValueError, match="credential header"):
+            Config.model_validate(base_config)
+
+    def test_an_ordinary_delivery_header_is_fine(self, base_config):
+        base_config["sources"][0]["dedup"] = {"id_header": "X-GitHub-Delivery"}
+        assert Config.model_validate(base_config).sources[0].dedup.id_header
+
     def test_sink_requires_exactly_one_url_form(self, base_config):
         base_config["sinks"][0]["url_env"] = "SINK_URL"
         with pytest.raises(ValueError, match="exactly one"):
