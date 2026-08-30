@@ -57,3 +57,13 @@ class PermanentSinkError(SinkError):
     Sends the delivery straight to the DLQ instead of burning `max_attempts` on a request that
     is guaranteed to fail identically each time.
     """
+
+
+class StoreError(WebhookDoormanError):
+    """The event store cannot be opened or used as it stands.
+
+    Distinct from `ConfigError` because nothing in `config.yml` is wrong: the file on disk is.
+    The case this exists for is a database whose `user_version` is *newer* than this binary
+    understands — a downgrade. Writing to it with an older schema is how a rollback turns into
+    silent corruption, so opening it is refused rather than attempted.
+    """

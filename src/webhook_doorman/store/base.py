@@ -23,7 +23,19 @@ class Store(Protocol):
     """Durable storage for events, delivery attempts and the dead-letter queue."""
 
     async def connect(self) -> None:
-        """Open the store and apply any schema migrations. Idempotent."""
+        """Open the store and apply any schema migrations. Idempotent.
+
+        An implementation that versions its schema must **read** the stored version before
+        acting on it, and must decide by structure rather than by the version field alone. Until
+        v0.4.0 the SQLite implementation did neither: it wrote its version number
+        unconditionally, so an existing database reported a schema it had never been given. A
+        version field that can lie is worse than no version field, because the next migrator
+        trusts it and skips the work.
+
+        Raises:
+            StoreError: the stored schema is newer than this build understands. Opening it
+                anyway is a downgrade, and a downgrade that writes is silent corruption.
+        """
 
     async def close(self) -> None:
         """Release resources. Safe to call when never connected."""
