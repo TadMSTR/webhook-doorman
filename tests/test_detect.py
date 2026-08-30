@@ -621,7 +621,10 @@ class TestHealthAndMetrics:
         body = response.json()
         assert body["status"] == "ok"
         assert body["detector"]["available"] is False
-        assert "on fire" in body["detector"]["last_error"]
+        # The class name, not the message. `/health` is unauthenticated, and a backend's
+        # exception text is not ours to publish — an HTTP backend's repr carries its URL.
+        assert body["detector"]["last_error"] == "RuntimeError"
+        assert "on fire" not in response.text
 
     def test_the_verdict_series_exist_from_boot(self, stack):
         _, client = stack()
@@ -739,3 +742,65 @@ class TestReleaseAfterAConfigChange:
             assert await delivery_count(engine, event_id) == 0
             stored = await engine.store.get_event(event_id)
             assert stored.status is EventStatus.RECEIVED, "it must not stay stuck in quarantine"
+
+
+class TestHealthDoesNotLeakBackendDetail:
+    async def test_a_secret_in_a_backend_exception_never_reaches_the_health_body(
+        self, stack, monkeypatch
+    ):
+        """`/health` is unauthenticated — it is what the container HEALTHCHECK polls.
+
+        `app.py` already holds this line for the store, because a store exception can carry a
+        connection string. A detector backend is the same shape and worse: a future HTTP
+        backend's `repr` carries its URL, and a URL can carry a credential. The class name is
+        enough to tell a timeout from a refused connection; the message is not ours to publish.
+        """
+        engine, client = stack()
+        secret = "sk-super-secret-detector-key-0123456789"
+
+        class Leaky:
+            name = "leaky"
+
+            async def score(self, text):
+                raise RuntimeError(f"POST https://detector.invalid/?token={secret} failed")
+
+        monkeypatch.setattr(engine, "_detector", Leaky())
+        with client:
+            client.post(
+                "/webhook/github", content=CLEAN_BODY, headers=headers(CLEAN_BODY, "leak-1")
+            )
+            response = client.get("/health")
+
+        assert secret not in response.text
+        assert "detector.invalid" not in response.text
+        assert response.json()["detector"]["last_error"] == "RuntimeError"
+
+
+class TestRulesAreLinear:
+    def test_no_rule_backtracks_catastrophically(self):
+        """Every rule runs over attacker-controlled text, so a bad pattern is a denial of service.
+
+        The ceiling is deliberately loose — measured worst case across all eight rules on a full
+        1 MiB body is ~70ms, and this allows 3s. It is not a performance assertion; it is a
+        shape assertion. Catastrophic backtracking is exponential, so a rule that had it would
+        blow a 3s budget by orders of magnitude on these inputs while a merely slow rule would
+        not. A tight threshold here would be flaky on a loaded CI runner and would say less.
+        """
+        import time
+
+        from webhook_doorman.detect import _RULES
+
+        cases = [
+            "ignore " + "a" * 100_000,
+            ("ignore previous " + "x" * 39) * 5_000,
+            "A" * 500_000,
+            "![" + "a" * 200_000 + "]",
+            "<|im_" * 100_000,
+            ("The deploy failed. " * 55_000)[:1_048_576],
+        ]
+        started = time.monotonic()
+        for text in cases:
+            for _name, _weight, pattern in _RULES:
+                pattern.search(text)
+        elapsed = time.monotonic() - started
+        assert elapsed < 3.0, f"a rule may backtrack catastrophically ({elapsed:.1f}s)"

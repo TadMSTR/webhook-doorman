@@ -227,11 +227,20 @@ class Engine:
             return None
 
         started = time.monotonic()
+        error_detail: BaseException | None = None
         try:
             result = await detector.score(text)
         except Exception as exc:  # A backend's failure is this engine's problem, not the event's.
             result = None
-            self._detector_last_error = repr(exc)
+            # The **class name only**. `/health` is unauthenticated — it is what the container
+            # HEALTHCHECK polls — and this field is reported there. An exception message from a
+            # backend is not ours: a future HTTP backend's `repr` carries its URL, and a URL can
+            # carry a credential. `app.py` already holds this line for the store, where a
+            # connection string in a `/health` body is a tested-against defect; a detector must
+            # not be the exception to it. The full repr goes to the log, which is where
+            # diagnostic detail belongs and where redaction already runs.
+            self._detector_last_error = type(exc).__name__
+            error_detail = exc
         elapsed = time.monotonic() - started
         METRICS.observe("webhook_doorman_detection_latency_seconds", elapsed, backend=detector.name)
 
@@ -243,7 +252,8 @@ class Engine:
                 f"degrade:detector:{detector.name}",
                 "detector_unavailable",
                 backend=detector.name,
-                error=self._detector_last_error,
+                error=self._redact_error(repr(error_detail)) if error_detail else None,
+                error_type=self._detector_last_error,
                 action=action,
             )
         elif result.score >= cfg.threshold:
@@ -319,6 +329,7 @@ class Engine:
             "configured": cfg.backend != "none",
             "backend": cfg.backend,
             "available": self._detector is not None and self._detector_last_error is None,
+            # An exception *class name*, never a message. See `_screen` for why.
             "last_error": self._detector_last_error,
         }
 

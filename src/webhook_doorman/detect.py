@@ -93,6 +93,13 @@ class Detector(Protocol):
 #: The set is small on purpose. False positives are the expected failure mode - a security repo's
 #: issue tracker carries "ignore all previous instructions" as ordinary content - which is why
 #: `annotate` is the default disposition and why this table is easier to read than to tune.
+#:
+#: **Every quantifier here is bounded, and none is nested.** These patterns run over
+#: attacker-controlled text on the request path, so a rule that backtracks catastrophically is a
+#: denial of service rather than a slow rule. Measured worst case across all eight on a full
+#: 1 MiB body is ~70ms, scaling linearly; `test_no_rule_backtracks_catastrophically` pins the
+#: shape. A new rule that needs an unbounded or nested quantifier needs a different design.
+#: `filter.max_field_bytes` is the operator-facing control on this input size.
 _RULES: tuple[tuple[str, float, re.Pattern[str]], ...] = (
     (
         "imperative_override",
