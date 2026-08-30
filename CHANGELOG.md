@@ -5,6 +5,110 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-08-30
+
+A content-safety layer for destinations that feed an LLM agent, and the schema migration path
+this project never had.
+
+Everything in the safety layer is **opt-in**. `agent_readable` defaults false, `detector.backend`
+defaults `none`, `filter` is empty, and `trust` defaults to `untrusted` — which is safe to
+default precisely because it does nothing until a sink opts in. An existing 0.3.0 config renders
+byte-identically on 0.4.0.
+
+### Migration
+
+**This release contains the first schema migration in the project's history, and it is applied
+automatically on first start.** Read this section before upgrading.
+
+`SqliteStore.connect()` had no migration path. It ran `CREATE TABLE IF NOT EXISTS` and then wrote
+`PRAGMA user_version` without ever reading it — so on an existing database a new column was never
+created *and* the version was bumped anyway. Any database written by 0.1.0 through 0.3.0 reports
+a version it does not necessarily have.
+
+0.4.0 replaces that with a real migrator:
+
+- The version is **read** first, and a database with an `events` table but a zero `user_version`
+  is treated as version 1 rather than as fresh. Structure decides, because the version field
+  written by earlier releases cannot be trusted.
+- Each migration runs in its own transaction with the `user_version` write inside it. SQLite
+  journals the pragma with the DDL, so a crash mid-upgrade rolls both back and the next start
+  re-runs that step cleanly.
+- **A database whose version is newer than the running build now refuses to open**, raising
+  `StoreError`. Rolling back from 0.4.0 to 0.3.0 will therefore fail to start rather than writing
+  0.3.0 statements to a 0.4.0 file. That is deliberate: a downgrade that writes is silent
+  corruption. Restore a backup taken before the upgrade, or stay on 0.4.0.
+
+Three nullable/defaulted columns are added to `events`. Existing rows are preserved and read
+back with sane defaults; no data is rewritten. **Take a copy of your database file before
+upgrading**, as you would for any first-of-its-kind migration.
+
+### Added
+
+- **Structural event filtering.** `filter.event_types` allowlists against the parser's
+  `event_type`; `filter.require` and `filter.deny` match dotted paths into the *decoded payload*,
+  so they work under `parser: generic` too. A path that does not resolve **fails** a `require`
+  and **passes** a `deny` — the asymmetry is what makes both usable. `deny` is evaluated first.
+  A filtered event is stored with status `filtered` and zero deliveries, and answered **200**:
+  a non-2xx makes a well-behaved producer retry harder over a decision that will not change.
+- **`filter.max_field_bytes`**, a per-string-field byte cap on the stored summary and parser
+  context, cut on a UTF-8 character boundary. Deliberately not applied to `payload`, which is
+  re-derived from the stored body on every read.
+- **Source `trust` and sink `agent_readable`.** Together they fence attacker-authored fields in
+  rendered output as `<untrusted source="..." field="...">`. Structural fields — `source`,
+  `event_type`, `delivery_id`, `event_id`, and parser-derived values like `repo` — stay outside
+  the fence. A forged closing tag is removed before wrapping.
+- **`{{ event_id }}`** in the template context, as a stable idempotency key for a downstream
+  agent.
+- **Unicode sanitization** on any `untrusted` source, regardless of destination: the tag block
+  `U+E0000-U+E007F`, bidi overrides, zero-width characters, and C0/C1 controls other than tab,
+  newline and return are removed, and the text is NFKC-normalised.
+- **A pluggable detector interface** with a dependency-free heuristic backend. `score()` returns
+  `None` for "could not evaluate", which is surfaced as `verdict="unavailable"` and **never**
+  conflated with `clean`. `on_error` has no `drop` member — discarding an event because the
+  detector failed is not something the config language can express.
+- **`GET /admin/held`** and **`POST /admin/release/{event_id}`**, behind the existing admin
+  bearer token. `/admin/held` returns failure metadata only, on the same rule as `/admin/dlq`.
+  Releasing an already-released event is a no-op, not a second enqueue.
+- **`/health` gains a `detector` block** (`configured`, `backend`, `available`, `last_error`). A
+  degraded detector stays **200** — a router whose detector is down still routes, and the
+  documented 503 conditions are unchanged.
+- **Five new metric series**, all with bounded label cardinality:
+  `webhook_doorman_events_filtered_total{source,reason}`,
+  `webhook_doorman_content_sanitized_total{source,class}`,
+  `webhook_doorman_detection_total{source,verdict}`,
+  `webhook_doorman_detection_latency_seconds{backend}`,
+  `webhook_doorman_events_quarantined_total{source,rule}`, and the
+  `webhook_doorman_held_events` **gauge**. Nothing producer-controlled is ever a label — a
+  detector reports rule *names*, never matched text.
+- **`examples/github-to-agent.yml`**, a worked agent-facing configuration.
+
+### Changed
+
+- `EventStatus` gains `filtered`, `quarantined` and `dropped`. `quarantined` is releasable;
+  `dropped` deliberately is not, which is the whole difference between them.
+- `Store` gains `record_detection`, `release_event` and `list_held`. `store.stats()` gains
+  `events_quarantined`.
+- `Metrics.observe()` generalises the histogram machinery to more than one family.
+  `Metrics.initialise()` gains optional `untrusted_sources` and `detector_enabled` arguments, so
+  series are only created where they can be non-zero.
+- `Engine.replay` and the new `Engine.release` share sink resolution, so they cannot disagree
+  after a config change.
+
+### Fixed
+
+- **`SqliteStore` applies schema migrations.** See the Migration section above.
+  `SCHEMA_VERSION` is now derived from the migration table rather than declared beside it, so
+  the two cannot drift — which was the defect the migrator was added to fix.
+- `store/base.py` documented a migration contract that nothing implemented, for three releases.
+  The docstring and the implementation now agree.
+
+### Security
+
+- No new runtime dependencies. The image is unchanged in size.
+- `SECURITY.md` gains a section stating the boundary plainly: the detector is defence in depth
+  and is evadable, and a detector miss is expected rather than a vulnerability. The fence being
+  escapable *is* a vulnerability, and is now a listed design commitment.
+
 ## [0.3.0] — 2026-08-20
 
 Observability. The logging half of this project was always good — structured JSON, stable event
@@ -273,6 +377,7 @@ First release. Security-audited before tagging: one Medium finding, resolved bel
   redacted before storage, collapsing every event onto one dedup id and silently discarding all
   but the first.
 
+[0.4.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.4.0
 [0.3.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.3.0
 [0.2.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.2.0
 [0.1.1]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.1.1

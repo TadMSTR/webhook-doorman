@@ -52,12 +52,64 @@ admin:
 #                                # `metrics_unauthenticated`.
 
 # ---------------------------------------------------------------------------------------------
+# Detector — prompt-injection screening for destinations that feed an LLM. OFF by default.
+#
+# This is defence in depth and it is evadable. Read SECURITY.md before you rely on it, and read
+# the "Agent-facing destinations" section of the README before you turn `on_detect: quarantine`
+# on: the heuristic backend is noisy, and a security repo's issue tracker carries "ignore all
+# previous instructions" as ordinary content.
+#
+# detector:
+#   backend: heuristic       # none (default) | heuristic
+#   threshold: 0.8           # a score at or above this is `flagged`
+#   on_detect: annotate      # annotate (default) | quarantine | drop
+#   on_error: annotate       # annotate (default) | quarantine
+#
+# `on_detect: drop` is a footgun and is named one on purpose: the event is stored with its
+# verdict and is NOT releasable, so a false positive is a delivery you never find out about.
+# `quarantine` is the same protection with a way back — GET /admin/held then
+# POST /admin/release/{event_id}.
+#
+# `on_error` has no `drop`, and that absence is the design. Discarding an event because the
+# *detector* failed turns a dependency's outage into silent data loss, which is the same shape
+# as skipping verification when a secret is missing. The config language cannot express it.
+
+# ---------------------------------------------------------------------------------------------
 # Sources — one entry per producer. Adding a producer is an entry here, not a code change.
 # ---------------------------------------------------------------------------------------------
 sources:
   # --- GitHub: HMAC-SHA256, hex, "sha256=" prefix -------------------------------------------
   - name: github
     path: /webhook/github
+    # --- Content safety (all optional, all no-ops unless you opt in) ---------------------
+    #
+    # `trust` says whether the CONTENT is yours, which a signature cannot tell you: HMAC proves
+    # GitHub sent the request, not that a stranger did not write the issue body inside it.
+    # Defaults to `untrusted`, which is safe to default because on its own it changes nothing —
+    # a source is only treated differently when a sink sets `agent_readable: true`.
+    #
+    #   trust: untrusted           # untrusted (default) | trusted
+    #
+    # `filter` is admission control, and it is the half of this that is deterministic. It
+    # removes more real risk than the detector does.
+    #
+    #   filter:
+    #     event_types: [push, workflow_run]   # allowlist against the parser's event_type
+    #     require:                            # dotted path into the DECODED PAYLOAD -> values
+    #       issue.author_association: [OWNER, MEMBER, COLLABORATOR]
+    #     deny: {}                            # same shape, opposite sense
+    #     max_field_bytes: 4096               # per string field, cut on a character boundary
+    #
+    # The two asymmetries are what make both usable, so they are worth stating:
+    #   * a path that does NOT resolve FAILS a `require` — you asked for a guarantee the
+    #     payload did not carry, so it is refused;
+    #   * a path that does NOT resolve PASSES a `deny` — absent is not the thing being refused.
+    # `deny` is evaluated first, so a payload that satisfies `require` and matches `deny` is
+    # refused as `deny`.
+    #
+    # A filtered event is STORED with status `filtered` and zero deliveries, and the producer is
+    # answered 200. A non-2xx would make a well-behaved producer retry harder over a decision
+    # that will be identical every time.
     parser: github          # understands issue/PR payloads; use `generic` for anything else
     verify:
       strategy: hmac_sha256
@@ -113,6 +165,17 @@ sources:
 # Sinks — where events go. A sink never knows which source sent it anything.
 # ---------------------------------------------------------------------------------------------
 sinks:
+  # `agent_readable: true` on any sink says its reader is a machine. Combined with an
+  # `untrusted` source it wraps the fields that source's parser marked attacker-authored:
+  #
+  #     <untrusted source="github" field="body">
+  #     ...content...
+  #     </untrusted>
+  #
+  # Defaults to false everywhere, which is what makes a v0.3.0 config render byte-identically.
+  # One cost to know before enabling it: a fenced field becomes a string, so under the `generic`
+  # parser — which marks the whole `payload` — `{{ payload.issue.title }}` renders empty. Use a
+  # named parser's context fields, which are fenced individually.
   - name: team-chat
     type: matrix
     url_env: MATRIX_HOMESERVER   # or: url: https://matrix.example.com

@@ -328,6 +328,101 @@ be looking.
 
 ---
 
+### Detection annotates; it is never a verification gate
+
+*Rejected: wiring the prompt-injection detector into the admit/refuse path.*
+
+This is the obvious implementation and it is wrong for a reason specific to this project. The
+premise here is that "verification was skipped" is not a reachable outcome, and that premise
+holds because HMAC has a **correct answer**: a signature either matches or it does not.
+
+A prompt-injection classifier does not have a correct answer. It has a confidence. Put one in
+the path that decides whether to accept a request and there are exactly two ways out, and both
+are the shape this project exists to remove:
+
+- **Refuse on a hit** and a false positive is a legitimate event dropped at the door, which
+  breaks the "never loses an event" claim that everything else here is built around.
+- **Admit on classifier error** and you have written `return True  # skip the check` with a
+  network call in front of it.
+
+So a verdict annotates or quarantines, and `on_error: drop` is not a value the config language
+can express — it is absent from the `Literal`, not present-and-warned-about. `on_detect: drop`
+does exist, because an operator may genuinely want it, and it is named a footgun in the README
+and in the config docstring.
+
+The corollary is the three-valued verdict. `Detector.score()` returns `None` for "could not
+evaluate", and that is surfaced as `verdict="unavailable"` rather than folded into `clean`. A
+detector that has been down for an hour must not report an hour of clean traffic.
+
+**Where it runs.** After the event is durable, before its deliveries are queued. The build plan
+asked for the background delivery path, and that would be better for latency — but
+`on_detect: quarantine` promises the withheld deliveries were *never enqueued*, and a verdict
+reached after the enqueue cannot keep that promise. Persist-then-decide still holds: the event
+is on disk before the detector runs, so a hanging backend delays a dispatch and never loses an
+event. The bundled heuristic backend is in-process regex and costs microseconds. An
+out-of-process backend would put real latency on the producer's connection, and that is a
+problem the build which adds one has to solve rather than inherit.
+
+### Fencing builds a context, not a Jinja `finalize` hook
+
+*Rejected: `finalize=`, and rejected again: an `Untrusted(str)` marker type.*
+
+Marking attacker-authored fields in rendered output has two obvious implementations. Both were
+checked against this codebase rather than reasoned about, and both fail:
+
+**`finalize` sees values, not names.** `template_context()` is a *flat* namespace: `source`,
+`event_type` and `delivery_id` sit alongside `summary`, `payload` and everything a parser merged
+in. A `finalize` hook receives each interpolated value with no idea which key it came from, so it
+would wrap `{{ source }}` — our own field, and the one an agent most needs to be able to trust —
+in the same fence as `{{ body }}`. A fence that wraps everything marks nothing.
+
+**A marker type does not survive the round trip.** `class Untrusted(str)` is destroyed twice
+over: `redaction._walk` calls `value.replace(...)`, which returns a plain `str`, and a replayed
+event is rebuilt from the `context_json` column, which is JSON and has no room for a Python
+subclass. The fences would be present on the ingest path and silently absent on the replay path —
+a defect invisible until the day someone replays an event, which is the day they least want a
+surprise.
+
+So the parser declares which context keys it filled from attacker-authored data, that list is
+persisted in its own column, and the fence is applied when the context is built. Three
+consequences worth stating:
+
+- the declaration survives storage, so replay fences exactly what the original delivery did;
+- the fence is applied per key, so structural fields stay outside it;
+- a fenced field becomes a string, so `{{ payload.x }}` renders empty on an `agent_readable`
+  sink. That cost is real, documented in the README, and the reason `agent_readable` is opt-in.
+
+**The engine chooses the fenced context, not the sink.** Fencing depends on the sink's
+`agent_readable` *and* the source's `trust`. `sinks/base.py` opens with the rule that no sink
+knows its source, and that rule is what keeps this a router rather than four glued-together
+listeners — so the decision belongs to the only component holding both facts. A sink still
+receives a plain dict and learns nothing about where the event came from.
+
+### The schema had no migration path, and said it did
+
+*Fixed in 0.4.0. Recorded because the failure mode is worth remembering.*
+
+`SqliteStore.connect()` ran `executescript(_SCHEMA)` — all `CREATE TABLE IF NOT EXISTS` — and
+then wrote `PRAGMA user_version` **without ever reading it**. On a fresh database that works. On
+an existing one, the `CREATE TABLE` is a no-op so a new column is never created, and the version
+is bumped anyway. The result is worse than a missing column: the database reports a schema
+version it does not have, so the *next* migrator trusts the number and skips the work.
+`store/base.py` documented `connect()` as applying migrations for three releases while nothing
+implemented it.
+
+Two rules came out of it, and both are enforced by test rather than by review:
+
+- **Decide by structure, not by the version field.** A `user_version` of 0 on a database that has
+  an `events` table is read as version 1, because a file written by the broken code can carry any
+  number at all.
+- **Do not write the version down twice.** `SCHEMA_VERSION` is `max(_MIGRATIONS)`, derived rather
+  than declared, so the constant and the migration table cannot drift — which is the same class
+  of defect the migrator was added to fix. `_SCHEMA` and `_MIGRATIONS` remain two descriptions of
+  one schema, so a test builds a database each way and compares them.
+
+A database whose version is *newer* than the running build raises rather than opening. A
+downgrade that writes is silent corruption.
+
 ## Exposure model
 
 **The container always binds `0.0.0.0:8080`, and that is not configurable.**
