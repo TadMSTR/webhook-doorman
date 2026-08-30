@@ -31,6 +31,9 @@ from __future__ import annotations
 import time
 from collections.abc import Iterable, Mapping
 
+from .filtering import FILTER_REASONS as _FILTER_REASONS
+from .sanitize import SANITIZE_CLASSES as _SANITIZE_CLASSES
+
 #: Every value `outcome` can take on `delivery_attempts_total`. Closed on purpose — see the
 #: cardinality note above.
 DELIVERY_OUTCOMES = ("delivered", "retry", "permanent", "exhausted")
@@ -40,6 +43,20 @@ DELIVERY_OUTCOMES = ("delivered", "retry", "permanent", "exhausted")
 #: has its own counter.
 REJECTION_REASONS = ("body_too_large", "source_disabled")
 
+#: Every value `reason` can take on `events_filtered_total`. Imported from `filtering` rather
+#: than restated, so the metric's label vocabulary and the gates that produce it cannot drift
+#: into disagreeing about what a reason is.
+FILTER_REASONS = _FILTER_REASONS
+
+#: Every value the `class` label can take on `content_sanitized_total`. Imported for the same
+#: reason as `FILTER_REASONS` above.
+SANITIZE_CLASSES = _SANITIZE_CLASSES
+
+#: Every value `verdict` can take on `detection_total`. `unavailable` is a first-class outcome
+#: and not an error state - see `detect` for why conflating it with `clean` is the failure this
+#: whole contract exists to make visible.
+DETECTION_VERDICTS = ("clean", "flagged", "unavailable")
+
 #: Fixed histogram buckets, in seconds, for delivery latency. Cumulative and ending at +Inf, per
 #: the exposition format. Chosen around what a chat webhook actually does: sub-100ms is healthy,
 #: the 1-5s range is where a struggling destination shows up, and past 10s the delivery timeout
@@ -48,6 +65,31 @@ LATENCY_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
 
 _HELP: Mapping[str, tuple[str, str]] = {
     "webhook_doorman_events_received_total": ("counter", "Events accepted and stored."),
+    "webhook_doorman_detection_total": (
+        "counter",
+        "Detector verdicts by source. Three outcomes, not two: 'unavailable' climbing while "
+        "'flagged' sits at zero is a detector that is down, which folding the two together "
+        "would report as 'everything is clean'.",
+    ),
+    "webhook_doorman_detection_latency_seconds": (
+        "histogram",
+        "Time spent scoring one event's untrusted text, by backend.",
+    ),
+    "webhook_doorman_events_quarantined_total": (
+        "counter",
+        "Events held instead of dispatched, by the highest-weighted rule that matched.",
+    ),
+    "webhook_doorman_held_events": ("gauge", "Events currently held in quarantine."),
+    "webhook_doorman_content_sanitized_total": (
+        "counter",
+        "Events whose content had a class of character removed before storage, by class. "
+        "Counted once per event per class, never per character.",
+    ),
+    "webhook_doorman_events_filtered_total": (
+        "counter",
+        "Events stored but not dispatched because the source's filter refused them, by which "
+        "gate refused it. Never the offending value — that is producer-controlled.",
+    ),
     "webhook_doorman_events_deduplicated_total": (
         "counter",
         "Events recognised as a repeat delivery and not re-dispatched.",
@@ -124,8 +166,10 @@ class Metrics:
     def __init__(self) -> None:
         self.process_start_time = time.time()
         self._counters: dict[str, dict[_Labels, float]] = {}
-        self._histograms: dict[_Labels, list[float]] = {}
-        self._histogram_sums: dict[_Labels, float] = {}
+        # Keyed by metric name first: there is more than one histogram family now, and a single
+        # flat map would have made two of them share buckets whenever their label sets matched.
+        self._histograms: dict[str, dict[_Labels, list[float]]] = {}
+        self._histogram_sums: dict[str, dict[_Labels, float]] = {}
 
     # -- recording ---------------------------------------------------------------------
 
@@ -141,9 +185,15 @@ class Metrics:
         the case you most want to see, and a histogram fed only by successes hides it — the
         p99 improves as the destination gets worse.
         """
+        self.observe("webhook_doorman_delivery_latency_seconds", seconds, **labels)
+
+    def observe(self, name: str, seconds: float, **labels: str) -> None:
+        """Record one observation into the named histogram family."""
         key = _key(labels)
-        counts = self._histograms.setdefault(key, [0.0] * (len(LATENCY_BUCKETS) + 1))
-        self._histogram_sums[key] = self._histogram_sums.get(key, 0.0) + seconds
+        family = self._histograms.setdefault(name, {})
+        sums = self._histogram_sums.setdefault(name, {})
+        counts = family.setdefault(key, [0.0] * (len(LATENCY_BUCKETS) + 1))
+        sums[key] = sums.get(key, 0.0) + seconds
         for index, bound in enumerate(LATENCY_BUCKETS):
             if seconds <= bound:
                 counts[index] += 1
@@ -151,7 +201,14 @@ class Metrics:
 
     # -- setup -------------------------------------------------------------------------
 
-    def initialise(self, *, sources: Mapping[str, str], sinks: Iterable[str]) -> None:
+    def initialise(
+        self,
+        *,
+        sources: Mapping[str, str],
+        sinks: Iterable[str],
+        untrusted_sources: Iterable[str] = (),
+        detector_enabled: bool = False,
+    ) -> None:
         """Create every config-derived series at zero.
 
         Without this a counter does not exist until the event it counts first happens, and
@@ -163,6 +220,11 @@ class Metrics:
         Args:
             sources: source name -> its verification strategy name.
             sinks: configured sink names.
+            untrusted_sources: sources whose `trust` is `untrusted`. Only these can ever
+                sanitise anything, so only these get the series - a permanent zero against a
+                `trusted` source would suggest a check is running there that is not.
+            detector_enabled: whether a detector backend is configured. The verdict series are
+                created only then, for the same reason.
         """
         for source, strategy in sources.items():
             self.increment("webhook_doorman_events_received_total", 0.0, source=source)
@@ -176,6 +238,23 @@ class Metrics:
             for reason in REJECTION_REASONS:
                 self.increment(
                     "webhook_doorman_requests_rejected_total", 0.0, source=source, reason=reason
+                )
+            for reason in FILTER_REASONS:
+                self.increment(
+                    "webhook_doorman_events_filtered_total", 0.0, source=source, reason=reason
+                )
+            if detector_enabled:
+                for verdict in DETECTION_VERDICTS:
+                    self.increment(
+                        "webhook_doorman_detection_total", 0.0, source=source, verdict=verdict
+                    )
+        for source in untrusted_sources:
+            for sanitize_class in SANITIZE_CLASSES:
+                self.increment(
+                    "webhook_doorman_content_sanitized_total",
+                    0.0,
+                    source=source,
+                    **{"class": sanitize_class},
                 )
         for sink in sinks:
             for outcome in DELIVERY_OUTCOMES:
@@ -204,7 +283,7 @@ class Metrics:
         lines: list[str] = []
         for name in sorted(self._counters):
             lines.extend(self._render_family(name, self._counters[name]))
-        lines.extend(self._render_histogram())
+        lines.extend(self._render_histograms())
         if stats is not None:
             lines.extend(_render_gauges(stats))
         lines.extend(_emit("webhook_doorman_build_info", {_key({"version": version}): 1.0}))
@@ -216,21 +295,24 @@ class Metrics:
     def _render_family(self, name: str, series: Mapping[_Labels, float]) -> list[str]:
         return _emit(name, series)
 
-    def _render_histogram(self) -> list[str]:
-        if not self._histograms:
-            return []
-        name = "webhook_doorman_delivery_latency_seconds"
-        lines = _header(name)
-        for key in sorted(self._histograms):
-            counts = self._histograms[key]
-            for index, bound in enumerate(LATENCY_BUCKETS):
-                labels = _render_labels((*key, ("le", _number(bound))))
-                lines.append(f"{name}_bucket{labels} {_number(counts[index])}")
-            lines.append(
-                f"{name}_bucket{_render_labels((*key, ('le', '+Inf')))} {_number(counts[-1])}"
-            )
-            lines.append(f"{name}_sum{_render_labels(key)} {self._histogram_sums[key]!r}")
-            lines.append(f"{name}_count{_render_labels(key)} {_number(counts[-1])}")
+    def _render_histograms(self) -> list[str]:
+        lines: list[str] = []
+        for name in sorted(self._histograms):
+            family = self._histograms[name]
+            if not family:
+                continue
+            lines.extend(_header(name))
+            sums = self._histogram_sums[name]
+            for key in sorted(family):
+                counts = family[key]
+                for index, bound in enumerate(LATENCY_BUCKETS):
+                    labels = _render_labels((*key, ("le", _number(bound))))
+                    lines.append(f"{name}_bucket{labels} {_number(counts[index])}")
+                lines.append(
+                    f"{name}_bucket{_render_labels((*key, ('le', '+Inf')))} {_number(counts[-1])}"
+                )
+                lines.append(f"{name}_sum{_render_labels(key)} {sums[key]!r}")
+                lines.append(f"{name}_count{_render_labels(key)} {_number(counts[-1])}")
         return lines
 
 
@@ -257,6 +339,11 @@ def _render_gauges(stats: Mapping[str, int]) -> list[str]:
     lines: list[str] = []
     lines.extend(_emit("webhook_doorman_events_stored", {(): float(stats.get("events", 0))}))
     lines.extend(_emit("webhook_doorman_dlq_size", {(): float(stats.get("dlq", 0))}))
+    # A gauge, not a `_total`: releasing an event takes it back down, and a counter that goes
+    # down reads to Prometheus as a reset. See the module docstring.
+    lines.extend(
+        _emit("webhook_doorman_held_events", {(): float(stats.get("events_quarantined", 0))})
+    )
 
     by_status = {
         _key({"status": name.removeprefix("deliveries_")}): float(value)

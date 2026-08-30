@@ -183,6 +183,59 @@ class DedupConfig(_Strict):
     enabled: bool = True
 
 
+class SourceFilter(_Strict):
+    """Which of a source's events are admissible, and how large their fields may be.
+
+    Empty by default, so a config that does not mention it behaves exactly as it did before this
+    model existed. Every field is an independent gate; see `filtering.evaluate` for the order
+    they are applied in and for the missing-path asymmetry between `require` and `deny`.
+
+    Attributes:
+        event_types: allowlist matched against the parser's `event_type`. `None` admits every
+            type. This is a *second*, independent gate from a parser's own idea of what is
+            actionable — `parse_github` already declines to act on anything but a newly opened
+            issue or PR, and merging the two would make one of them unstateable.
+        require: dotted payload path -> values, at least one of which must be present. A path
+            that does not resolve **fails** the requirement.
+        deny: dotted payload path -> values, none of which may be present. A path that does not
+            resolve **passes**.
+        max_field_bytes: byte cap per string field in the stored summary and parser context.
+    """
+
+    event_types: list[str] | None = None
+    require: dict[str, list[str]] = Field(default_factory=dict)
+    deny: dict[str, list[str]] = Field(default_factory=dict)
+    max_field_bytes: int | None = None
+
+    @field_validator("event_types")
+    @classmethod
+    def _no_empty_allowlist(cls, v: list[str] | None) -> list[str] | None:
+        if v is not None and not v:
+            raise ValueError(
+                "event_types is an empty list, which would admit nothing at all. Omit the key "
+                "(or set it to null) to admit every event type."
+            )
+        return v
+
+    @field_validator("require", "deny")
+    @classmethod
+    def _no_empty_value_lists(cls, v: dict[str, list[str]]) -> dict[str, list[str]]:
+        for path, values in v.items():
+            if not values:
+                raise ValueError(
+                    f"{path!r} maps to an empty list of values, which can never match. Remove "
+                    f"the entry, or name the values it should match."
+                )
+        return v
+
+    @field_validator("max_field_bytes")
+    @classmethod
+    def _positive(cls, v: int | None) -> int | None:
+        if v is not None and v <= 0:
+            raise ValueError("must be positive")
+        return v
+
+
 class SourceConfig(_Strict):
     name: str
     path: str
@@ -190,6 +243,18 @@ class SourceConfig(_Strict):
     sinks: list[str]
     parser: str = "generic"
     dedup: DedupConfig = Field(default_factory=DedupConfig)
+    filter: SourceFilter = Field(default_factory=SourceFilter)
+    trust: Literal["trusted", "untrusted"] = "untrusted"
+    """Whether this source's content is authored by someone you trust.
+
+    **Defaults to `untrusted`**, which is safe to default because it changes nothing on its own:
+    a source is only treated differently when a sink opts in with `agent_readable: true`. The
+    distinction it captures is the one a signature cannot: HMAC proves GitHub sent the request,
+    not that a stranger did not write the issue body inside it.
+
+    Set `trusted` for a source whose content originates with you - your own CI, your own
+    monitoring - and leave it alone for anything the public can write into.
+    """
     enabled: bool = True
 
     @field_validator("path")
@@ -252,6 +317,17 @@ class SourceConfig(_Strict):
 
 class _SinkBase(_Strict):
     name: str
+    agent_readable: bool = False
+    """This destination feeds an LLM rather than a person.
+
+    **Defaults to false**, which is what makes every v0.3.0 config render byte-identically:
+    fencing and its costs apply only where an operator has said the reader is a machine. Turning
+    it on wraps the fields an `untrusted` source's parser marked as attacker-authored - see
+    `fencing`, including what it costs a template that reaches into `payload`.
+
+    A person reading a chat room supplies this distinction themselves. An agent does not, and
+    nothing else in the rendered message tells it which words were written by a stranger.
+    """
 
     @field_validator("name")
     @classmethod
@@ -488,6 +564,33 @@ class MetricsConfig(_Strict):
     min_token_length: int = 32
 
 
+class DetectorConfig(_Strict):
+    """Prompt-injection detection: which backend, and what a hit is allowed to do.
+
+    Off by default (`backend: none`), which is what keeps an existing config unchanged.
+
+    **`on_error` has no `drop` member, and that is the point.** Discarding an event because the
+    *detector* failed is the fail-open/fail-lossy trade this project refuses: it makes a
+    dependency's outage into silent data loss, and it is the same shape as skipping verification
+    when a secret is missing. Pydantic rejects it at load with the ordinary Literal error, so
+    there is no path where an operator configures it and finds out later. `on_detect` does offer
+    `drop`, for an operator who has decided that is what they want - it is named a footgun in
+    the README and it is not the default.
+    """
+
+    backend: Literal["none", "heuristic"] = "none"
+    threshold: float = 0.8
+    on_detect: Literal["annotate", "quarantine", "drop"] = "annotate"
+    on_error: Literal["annotate", "quarantine"] = "annotate"
+
+    @field_validator("threshold")
+    @classmethod
+    def _within_range(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("must be between 0.0 and 1.0")
+        return v
+
+
 class Config(_Strict):
     sources: list[SourceConfig]
     sinks: list[SinkSpec]
@@ -496,6 +599,7 @@ class Config(_Strict):
     delivery: DeliveryConfig = Field(default_factory=DeliveryConfig)
     admin: AdminConfig = Field(default_factory=AdminConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    detector: DetectorConfig = Field(default_factory=DetectorConfig)
 
     @model_validator(mode="after")
     def _cross_check(self):

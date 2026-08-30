@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
-from ..models import Delivery, DlqEntry, InboundEvent, StoredEvent
+from ..models import Delivery, DlqEntry, EventStatus, HeldEntry, InboundEvent, StoredEvent
 
 
 @runtime_checkable
@@ -23,7 +23,19 @@ class Store(Protocol):
     """Durable storage for events, delivery attempts and the dead-letter queue."""
 
     async def connect(self) -> None:
-        """Open the store and apply any schema migrations. Idempotent."""
+        """Open the store and apply any schema migrations. Idempotent.
+
+        An implementation that versions its schema must **read** the stored version before
+        acting on it, and must decide by structure rather than by the version field alone. Until
+        v0.4.0 the SQLite implementation did neither: it wrote its version number
+        unconditionally, so an existing database reported a schema it had never been given. A
+        version field that can lie is worse than no version field, because the next migrator
+        trusts it and skips the work.
+
+        Raises:
+            StoreError: the stored schema is newer than this build understands. Opening it
+                anyway is a downgrade, and a downgrade that writes is silent corruption.
+        """
 
     async def close(self) -> None:
         """Release resources. Safe to call when never connected."""
@@ -90,6 +102,30 @@ class Store(Protocol):
         while an operator is paging, and under `OFFSET` every deletion behind the cursor shifts
         the window and silently skips a row. Skipping rows in the queue of things that failed is
         the one place that is least acceptable.
+        """
+        ...
+
+    async def record_detection(
+        self,
+        event_id: int,
+        *,
+        detection: dict | None,
+        status: EventStatus,
+        quarantined_at: datetime | None,
+    ) -> None:
+        """Record a detector verdict and the status it produced, in one write.
+
+        `detection` is `None` only when the detector could not evaluate the event — which is a
+        different fact from a score of zero and is stored as a different value.
+        """
+
+    async def release_event(self, event_id: int) -> None:
+        """Return a quarantined event to `received`. The caller queues the deliveries."""
+
+    async def list_held(self, *, limit: int, before_id: int | None = None) -> list[HeldEntry]:
+        """Quarantined events, newest first, for `GET /admin/held`.
+
+        Same keyset rule and same metadata-only rule as `list_dlq` — see `HeldEntry`.
         """
         ...
 

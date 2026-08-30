@@ -26,33 +26,43 @@ from pathlib import Path
 import aiosqlite
 import structlog
 
+from ..errors import StoreError
 from ..models import (
     Delivery,
     DeliveryStatus,
     DlqEntry,
     EventStatus,
+    HeldEntry,
     InboundEvent,
     StoredEvent,
 )
 
 log = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 1
-
+#: DDL for a **fresh** database, at the current schema version. It is not the migration path —
+#: `CREATE TABLE IF NOT EXISTS` is a no-op against an existing table, which is exactly the bug
+#: `_MIGRATIONS` exists to fix. Anything added here must also be added to `_MIGRATIONS`, and
+#: `test_fresh_and_migrated_schemas_match` compares the two rather than trusting review to.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    source        TEXT    NOT NULL,
-    delivery_id   TEXT    NOT NULL,
-    event_type    TEXT    NOT NULL DEFAULT '',
-    summary       TEXT    NOT NULL DEFAULT '',
-    received_at   TEXT    NOT NULL,
-    headers_json  TEXT    NOT NULL DEFAULT '{}',
-    body          BLOB    NOT NULL,
-    context_json  TEXT    NOT NULL DEFAULT '{}',
-    verified      INTEGER NOT NULL DEFAULT 1,
-    status        TEXT    NOT NULL DEFAULT 'received'
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    source                TEXT    NOT NULL,
+    delivery_id           TEXT    NOT NULL,
+    event_type            TEXT    NOT NULL DEFAULT '',
+    summary               TEXT    NOT NULL DEFAULT '',
+    received_at           TEXT    NOT NULL,
+    headers_json          TEXT    NOT NULL DEFAULT '{}',
+    body                  BLOB    NOT NULL,
+    context_json          TEXT    NOT NULL DEFAULT '{}',
+    verified              INTEGER NOT NULL DEFAULT 1,
+    status                TEXT    NOT NULL DEFAULT 'received',
+    untrusted_fields_json TEXT    NOT NULL DEFAULT '[]',
+    detection_json        TEXT,
+    quarantined_at        TEXT
 );
+
+-- `/admin/held` filters on status and pages on id descending.
+CREATE INDEX IF NOT EXISTS idx_events_status ON events (status, id);
 
 -- The dedup key. A producer retrying a delivery hits this and is answered 200, not 4xx.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedup ON events (source, delivery_id);
@@ -83,6 +93,35 @@ CREATE TABLE IF NOT EXISTS dlq (
 
 CREATE INDEX IF NOT EXISTS idx_dlq_exhausted ON dlq (exhausted_at);
 """
+
+
+#: Ordered DDL per target version, applied to a database that already exists. Version 1 is the
+#: baseline — the schema as v0.3.0 shipped it — so it has no entry; migrations start at 2.
+#:
+#: Every statement runs inside one transaction per target version, and `PRAGMA user_version` is
+#: written in that same transaction. SQLite journals the pragma with the DDL, so a crash
+#: mid-upgrade rolls both back together and the next start re-runs that step cleanly. Verified,
+#: not assumed: `test_version_and_ddl_roll_back_together`.
+_MIGRATIONS: dict[int, tuple[str, ...]] = {
+    2: (
+        # Which template-context fields this event's parser marked attacker-authored. Persisted
+        # rather than re-derived, because a replay rebuilds `StoredEvent` from the stored row
+        # and has no parser output to consult — an un-persisted marker would be lost on the
+        # replay path only, which is the failure mode that hides longest.
+        "ALTER TABLE events ADD COLUMN untrusted_fields_json TEXT NOT NULL DEFAULT '[]'",
+        # The detector's verdict, or NULL for "never evaluated". NULL and a zero score are
+        # different answers and are kept different here.
+        "ALTER TABLE events ADD COLUMN detection_json TEXT",
+        "ALTER TABLE events ADD COLUMN quarantined_at TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_events_status ON events (status, id)",
+    ),
+}
+
+#: Derived, never written down twice. `SCHEMA_VERSION` and the migration table are two rosters
+#: of one fact, and the failure mode of letting them drift is a version number that lies —
+#: which is the defect this whole mechanism was added to fix. Adding `_MIGRATIONS[3]` raises
+#: this automatically.
+SCHEMA_VERSION = max(_MIGRATIONS)
 
 
 def _iso(value: datetime) -> str:
@@ -121,9 +160,79 @@ class SqliteStore:
         await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.execute("PRAGMA busy_timeout=5000")
-        await self._db.executescript(_SCHEMA)
-        await self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-        log.info("store_ready", path=str(self.path), schema_version=SCHEMA_VERSION)
+
+        migrated_from = await self._apply_schema()
+        log.info(
+            "store_ready",
+            path=str(self.path),
+            schema_version=SCHEMA_VERSION,
+            # Present only when work was actually done, so its absence in a log line means "this
+            # database was already current" rather than "the migrator did not run".
+            **({"migrated_from": migrated_from} if migrated_from is not None else {}),
+        )
+
+    async def _apply_schema(self) -> int | None:
+        """Bring the open database up to `SCHEMA_VERSION`. Returns the version migrated from.
+
+        Returns `None` when nothing ran — a fresh database, or one already current.
+
+        **Version is decided by table presence first, `user_version` second.** Until v0.4.0 this
+        method wrote `user_version` unconditionally without ever reading it, so an existing
+        database was told it had a schema it had never been given: `CREATE TABLE IF NOT EXISTS`
+        is a no-op, no column was added, and the version was bumped anyway. Any database written
+        by that code reports a version it does not have, which is why a `user_version` of 0 on a
+        populated file is read as 1 rather than trusted.
+
+        Raises:
+            StoreError: the database is *newer* than this binary. That is a downgrade, and
+                writing v0.3.0 statements to a v0.5.0 file corrupts it quietly rather than
+                loudly. Refusing to open it is the only safe answer.
+        """
+        db = self.db
+        if not await self._table_exists("events"):
+            # Nothing to migrate: `_SCHEMA` is the current schema by definition.
+            await db.executescript(_SCHEMA)
+            await db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            return None
+
+        row = await self._fetchone("PRAGMA user_version")
+        current = int(row[0]) if row is not None else 0
+        if current == 0:
+            # A file predating `user_version`, or one whose pragma write was rolled back. It has
+            # the tables, so it is at least the baseline.
+            current = 1
+
+        if current > SCHEMA_VERSION:
+            raise StoreError(
+                f"{self.path} is at schema version {current}, but this build of "
+                f"webhook-doorman understands version {SCHEMA_VERSION}. This is a downgrade; "
+                f"writing to it would corrupt data written by the newer version. Restore the "
+                f"newer build, or restore the database from a backup taken before the upgrade."
+            )
+        if current == SCHEMA_VERSION:
+            return None
+
+        started_at = current
+        for target in sorted(version for version in _MIGRATIONS if version > current):
+            # One transaction per version, with the pragma inside it, so a crash between two
+            # migrations resumes at the boundary rather than half-applied.
+            await db.execute("BEGIN")
+            try:
+                for statement in _MIGRATIONS[target]:
+                    await db.execute(statement)
+                await db.execute(f"PRAGMA user_version={target}")
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
+            await db.execute("COMMIT")
+            log.info("schema_migrated", path=str(self.path), to_version=target)
+        return started_at
+
+    async def _table_exists(self, name: str) -> bool:
+        row = await self._fetchone(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        )
+        return row is not None
 
     async def close(self) -> None:
         if self._db is not None:
@@ -137,8 +246,8 @@ class SqliteStore:
             """
             INSERT OR IGNORE INTO events
                 (source, delivery_id, event_type, summary, received_at,
-                 headers_json, body, context_json, verified, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 headers_json, body, context_json, verified, status, untrusted_fields_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.source,
@@ -150,7 +259,11 @@ class SqliteStore:
                 event.body,
                 json.dumps(event.context, default=str),
                 int(event.verified),
-                EventStatus.RECEIVED.value,
+                # The event's own status, not a constant: an event refused by its source's
+                # filter is stored as `filtered`, and nothing settles it later because it has
+                # no deliveries to settle.
+                event.status.value,
+                json.dumps(event.untrusted_fields),
             ),
         )
         if cursor.rowcount:
@@ -325,7 +438,79 @@ class SqliteStore:
             verified=bool(row["verified"]),
             status=EventStatus(row["status"]),
             received_at=datetime.fromisoformat(row["received_at"]),
+            untrusted_fields=json.loads(row["untrusted_fields_json"] or "[]"),
         )
+
+    async def record_detection(
+        self,
+        event_id: int,
+        *,
+        detection: dict | None,
+        status: EventStatus,
+        quarantined_at: datetime | None,
+    ) -> None:
+        """Write one event's detector verdict and the status that followed from it.
+
+        One statement rather than three, so an event can never be found `quarantined` without
+        the verdict that put it there - which is the only thing `GET /admin/held` can show an
+        operator to justify the hold.
+        """
+        await self.db.execute(
+            """
+            UPDATE events
+               SET detection_json = ?, status = ?, quarantined_at = ?
+             WHERE id = ?
+            """,
+            (
+                json.dumps(detection) if detection is not None else None,
+                status.value,
+                _iso(quarantined_at) if quarantined_at is not None else None,
+                event_id,
+            ),
+        )
+
+    async def release_event(self, event_id: int) -> None:
+        """Take an event out of quarantine. The caller queues the deliveries."""
+        await self.db.execute(
+            "UPDATE events SET status = ?, quarantined_at = NULL WHERE id = ?",
+            (EventStatus.RECEIVED.value, event_id),
+        )
+
+    async def list_held(self, *, limit: int, before_id: int | None = None) -> list[HeldEntry]:
+        """Quarantined events, newest first, for `GET /admin/held`.
+
+        Keyset on `events.id` for the same reason `list_dlq` is: the retention sweep deletes
+        rows underneath a paging client, and `OFFSET` skips one row per deletion behind the
+        cursor. Skipping a row in the list of things being withheld is exactly as unacceptable
+        as skipping one in the list of things that failed.
+        """
+        sql = """
+            SELECT id, source, event_type, detection_json, quarantined_at
+              FROM events
+             WHERE status = ?
+        """
+        params: list[object] = [EventStatus.QUARANTINED.value]
+        if before_id is not None:
+            sql += " AND id < ?"
+            params.append(before_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+
+        cursor = await self.db.execute(sql, tuple(params))
+        entries: list[HeldEntry] = []
+        for row in await cursor.fetchall():
+            detection = json.loads(row["detection_json"]) if row["detection_json"] else {}
+            entries.append(
+                HeldEntry(
+                    event_id=int(row["id"]),
+                    source=row["source"],
+                    event_type=row["event_type"],
+                    score=detection.get("score"),
+                    rules=list(detection.get("rules") or []),
+                    quarantined_at=datetime.fromisoformat(row["quarantined_at"]),
+                )
+            )
+        return entries
 
     async def list_dlq(self, *, limit: int, before_id: int | None = None) -> list[DlqEntry]:
         # Keyset, not OFFSET: the retention sweep deletes DLQ rows underneath a paging client,
@@ -380,6 +565,15 @@ class SqliteStore:
         )
         for row in await cursor.fetchall():
             out[f"deliveries_{row['status']}"] = int(row["n"])
+
+        # Point-in-time, and read from the table rather than accumulated in the process, so a
+        # release takes it back down and a restart does not reset it to zero while rows are
+        # still held.
+        held = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM events WHERE status = ?",
+            (EventStatus.QUARANTINED.value,),
+        )
+        out["events_quarantined"] = int(held["n"]) if held else 0
         return out
 
     # -- maintenance -------------------------------------------------------------------

@@ -27,10 +27,13 @@ from fastapi.responses import JSONResponse
 
 from . import __version__, tracing
 from .config import Config, NoneVerify, load_config
+from .filtering import evaluate as evaluate_filter
+from .filtering import truncate
 from .metrics import METRICS
-from .models import DlqEntry, InboundEvent
+from .models import DlqEntry, EventStatus, HeldEntry, InboundEvent
 from .parsers import get_parser, parse
 from .redaction import redact_bytes, redact_headers, redact_json, redact_text
+from .sanitize import sanitize_structure
 from .secrets import Resolved, SourceState, resolve
 from .verification import verify
 
@@ -52,6 +55,9 @@ class EngineLike(Protocol):
     async def replay(self, event_id: int) -> dict[str, Any]: ...
     async def stats(self) -> dict[str, int]: ...
     async def list_dlq(self, *, limit: int, before_id: int | None = None) -> list[DlqEntry]: ...
+    async def list_held(self, *, limit: int, before_id: int | None = None) -> list[HeldEntry]: ...
+    async def release(self, event_id: int) -> dict[str, Any]: ...
+    def detector_health(self) -> dict[str, Any]: ...
     def check_admin_token(self, presented: str) -> bool: ...
 
 
@@ -209,20 +215,54 @@ def build_source_route(
             parsed = parse(parser_name, safe_body, headers)
             delivery_id = compute_delivery_id(state, headers, safe_body)
 
+            payload_json = _safe_json(safe_body)
+
+            # Sanitisation applies on `trust: untrusted` regardless of where the event is
+            # going, because the characters it removes are unwanted in a chat room and a log
+            # line too, not only in an agent's prompt. It runs *before* the byte cap so the cap
+            # is the last word on size, and before storage so a replay delivers what the
+            # original delivery did.
+            sanitized_classes: set[str] = set()
+            summary_text = redact_text(parsed.summary, secret_values)
+            context_value = redact_json(parsed.context, secret_values)
+            if source.trust == "untrusted":
+                summary_text = sanitize_structure(summary_text, sanitized_classes)
+                context_value = sanitize_structure(context_value, sanitized_classes)
+                for removed in sorted(sanitized_classes):
+                    log.info("content_sanitized", source=source.name, removed=removed)
+                    METRICS.increment(
+                        "webhook_doorman_content_sanitized_total",
+                        source=source.name,
+                        **{"class": removed},
+                    )
+
+            # Admission control, after parse and before ingest. A refusal here is not an error:
+            # the event is still stored, with no sinks queued, and the producer is answered 200
+            # exactly as it is for an event its parser found unactionable. Answering non-2xx
+            # would make a well-behaved producer retry harder — the storm the engine docstring
+            # warns about — over a decision that will be identical every time.
+            verdict = evaluate_filter(source.filter, parsed.event_type, payload_json)
+            cap = source.filter.max_field_bytes
+
             with structlog.contextvars.bound_contextvars(delivery_id=delivery_id):
                 event = InboundEvent(
                     source=source.name,
                     delivery_id=delivery_id,
                     event_type=parsed.event_type,
-                    summary=redact_text(parsed.summary, secret_values),
+                    summary=truncate(summary_text, cap),
                     headers=redact_headers(
                         headers, extra_headers=credential_headers, secret_values=secret_values
                     ),
                     body=safe_body,
-                    payload=_safe_json(safe_body),
-                    context=redact_json(parsed.context, secret_values),
-                    sinks=list(source.sinks) if parsed.actionable else [],
+                    payload=payload_json,
+                    context=truncate(context_value, cap),
+                    sinks=(list(source.sinks) if parsed.actionable and verdict.admitted else []),
                     verified=not isinstance(source.verify, NoneVerify),
+                    status=(EventStatus.FILTERED if not verdict.admitted else EventStatus.RECEIVED),
+                    filter_reason=verdict.reason,
+                    untrusted_fields=(
+                        list(parsed.untrusted_fields) if source.trust == "untrusted" else []
+                    ),
                 )
 
                 payload = await ingest(event)
@@ -316,6 +356,61 @@ def build_admin_router(engine: EngineLike) -> APIRouter:
             ],
         }
 
+    @router.get("/held")
+    async def list_held(
+        limit: int = DLQ_DEFAULT_LIMIT,
+        before_id: int | None = None,
+        authorization: str = Header(default=""),
+    ) -> dict[str, Any]:
+        """Events the detector is holding, newest first.
+
+        The response carries **failure metadata only** — see `HeldEntry`, and note the reason is
+        sharper here than for the DLQ: the content being withheld is content something flagged
+        as an injection attempt, so an endpoint that returned it would hand that text to whatever
+        reads the admin API. `rules` names what matched; the matched text is not carried.
+
+        Same cursor rule as `/admin/dlq`: keyset on the id, and a cursor only on a full page.
+        """
+        presented = authorization.removeprefix("Bearer ").strip()
+        if not engine.check_admin_token(presented):
+            log.warning("admin_auth_failed", path="/admin/held")
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        effective = max(1, min(limit, DLQ_MAX_LIMIT))
+        entries = await engine.list_held(limit=effective, before_id=before_id)
+        return {
+            "count": len(entries),
+            "limit": effective,
+            "next_before_id": entries[-1].event_id if len(entries) == effective else None,
+            "entries": [
+                {
+                    "event_id": e.event_id,
+                    "source": e.source,
+                    "event_type": e.event_type,
+                    "score": e.score,
+                    "rules": e.rules,
+                    "quarantined_at": e.quarantined_at.isoformat(),
+                }
+                for e in entries
+            ],
+        }
+
+    @router.post("/release/{event_id}")
+    async def release(event_id: int, authorization: str = Header(default="")) -> dict[str, Any]:
+        """Queue the deliveries a quarantine withheld.
+
+        Token first, like `replay` — an unauthenticated caller must not be able to use response
+        codes to probe which event ids are being held.
+        """
+        presented = authorization.removeprefix("Bearer ").strip()
+        if not engine.check_admin_token(presented):
+            log.warning("admin_auth_failed", path=f"/admin/release/{event_id}")
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        try:
+            return await engine.release(event_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="Event not found") from exc
+
     return router
 
 
@@ -366,6 +461,11 @@ def build_health_route(
             "unverified_sources": resolved.unverified_source_names(),
             "replay_enabled": resolved.admin_token() is not None,
         }
+        if engine is not None:
+            # Reported, and deliberately not part of the 503 verdict below. A router whose
+            # detector is down still routes; making an optional annotation able to flap the
+            # container's health status would turn it into a hard dependency.
+            body["detector"] = engine.detector_health()
 
         degraded: list[str] = []
         if not any(state.enabled for state in resolved.sources.values()):
@@ -542,6 +642,10 @@ def create_app(
     METRICS.initialise(
         sources={name: s.config.verify.strategy for name, s in resolved.sources.items()},
         sinks=resolved.sinks,
+        untrusted_sources=[
+            name for name, s in resolved.sources.items() if s.config.trust == "untrusted"
+        ],
+        detector_enabled=resolved.config.detector.backend != "none",
     )
 
     router = APIRouter()

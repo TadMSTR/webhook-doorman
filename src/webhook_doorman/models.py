@@ -17,6 +17,17 @@ class EventStatus(str, Enum):
     RECEIVED = "received"
     DISPATCHED = "dispatched"
     FAILED = "failed"
+    #: Admitted, verified and stored, but refused by the source's `filter` — no sinks were
+    #: queued. A terminal state: nothing settles it later, because there is nothing in flight.
+    FILTERED = "filtered"
+    #: Held by the detector under `on_detect: quarantine`. Stored, not dispatched, and
+    #: **releasable** — `POST /admin/release/{event_id}` queues the deliveries that were
+    #: withheld. This is the state `GET /admin/held` lists.
+    QUARANTINED = "quarantined"
+    #: Discarded by the detector under `on_detect: drop`. Stored with its verdict, never
+    #: dispatched, and deliberately *not* releasable — that is the whole difference from
+    #: `QUARANTINED`, and the reason the README names `drop` a footgun.
+    DROPPED = "dropped"
 
 
 class DeliveryStatus(str, Enum):
@@ -47,18 +58,30 @@ class InboundEvent:
     sinks: list[str] = field(default_factory=list)
     verified: bool = True
     received_at: datetime = field(default_factory=utcnow)
+    status: EventStatus = EventStatus.RECEIVED
+    untrusted_fields: list[str] = field(default_factory=list)
+    """Template-context keys this event's parser filled from attacker-authored data.
 
-    def template_context(self) -> dict[str, Any]:
-        """The namespace a sink template renders against."""
-        return {
-            "source": self.source,
-            "delivery_id": self.delivery_id,
-            "event_type": self.event_type,
-            "summary": self.summary,
-            "payload": self.payload,
-            "received_at": self.received_at.isoformat(),
-            **self.context,
-        }
+    Declared by the parser and persisted with the event, so a replay - which rebuilds the event
+    from the stored row and has no parser output to consult - fences exactly what the original
+    delivery did. See `fencing` for why this is a list of names rather than a marker type.
+    """
+    filter_reason: str | None = None
+    """Which gate in `SourceFilter` refused this event, when `status` is `FILTERED`.
+
+    One of `filtering.FILTER_REASONS`. Carried on the event rather than returned alongside it so
+    that the decision travels with the thing it was made about — the engine counts it after the
+    dedup check, where it means "events filtered" rather than "requests filtered".
+    """
+
+    def template_context(self, *, fence: bool = False) -> dict[str, Any]:
+        """The namespace a sink template renders against.
+
+        `event_id` is absent here and present on `StoredEvent`: an inbound event has not been
+        given an id yet. Delivery always renders a `StoredEvent`, so the key is available
+        wherever a template can actually reach it.
+        """
+        return _template_context(self, fence=fence)
 
 
 @dataclass
@@ -77,17 +100,37 @@ class StoredEvent:
     verified: bool
     status: EventStatus
     received_at: datetime
+    untrusted_fields: list[str] = field(default_factory=list)
 
-    def template_context(self) -> dict[str, Any]:
-        return {
-            "source": self.source,
-            "delivery_id": self.delivery_id,
-            "event_type": self.event_type,
-            "summary": self.summary,
-            "payload": self.payload,
-            "received_at": self.received_at.isoformat(),
-            **self.context,
-        }
+    def template_context(self, *, fence: bool = False) -> dict[str, Any]:
+        return _template_context(self, fence=fence, event_id=self.id)
+
+
+def _template_context(event, *, fence: bool, event_id: int | None = None) -> dict[str, Any]:
+    """The shared template namespace for both event shapes.
+
+    One function rather than two near-identical methods: the fencing rule has to be the same on
+    the ingest path and the replay path, and two copies of it is how they would come to differ.
+    """
+    context: dict[str, Any] = {
+        "source": event.source,
+        "delivery_id": event.delivery_id,
+        "event_type": event.event_type,
+        "summary": event.summary,
+        "payload": event.payload,
+        "received_at": event.received_at.isoformat(),
+        **event.context,
+    }
+    if event_id is not None:
+        # A stable idempotency key, so an agent acting on this message can dedup its own
+        # actions. It is the store's primary key, which is the only identifier here that is
+        # ours rather than the producer's.
+        context["event_id"] = event_id
+    if not fence or not event.untrusted_fields:
+        return context
+    from .fencing import fence_context
+
+    return fence_context(context, source=event.source, fields=event.untrusted_fields)
 
 
 @dataclass
@@ -103,6 +146,28 @@ class Delivery:
     response_code: int | None = None
     latency_ms: int | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class HeldEntry:
+    """One quarantined event, as `GET /admin/held` reports it.
+
+    **Failure metadata only - no payload, no rendered body, no field content.** The same rule as
+    `DlqEntry`, and here it matters more rather than less: the content being withheld is content
+    a detector flagged as an injection attempt, and a list endpoint that returned it would hand
+    that text to whatever reads the admin API. `rules` names what matched; the text that matched
+    is not carried anywhere.
+
+    `event_id` is both the identity and the pagination cursor here, unlike `DlqEntry` where they
+    are different numbers - quarantine is a property of an event, not of a delivery.
+    """
+
+    event_id: int
+    source: str
+    event_type: str
+    score: float | None
+    rules: list[str]
+    quarantined_at: datetime
 
 
 @dataclass(frozen=True)

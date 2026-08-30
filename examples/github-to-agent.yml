@@ -1,0 +1,88 @@
+# GitHub -> an LLM agent, with the content-safety layer switched on.
+#
+# The difference between this and `github-to-chat.yml` is the reader. A person in a chat room
+# supplies the "a stranger wrote this" distinction themselves; an agent does not, and nothing in
+# a rendered message tells it which words came from the payload unless you say so.
+#
+# Four things are doing work here, in descending order of how much risk they remove:
+#
+#   1. `filter.event_types`  - the agent never sees an event class you did not name.
+#   2. `filter.require`      - and never sees one authored by a drive-by account.
+#   3. `trust` + `agent_readable` - what is left arrives fenced and sanitized.
+#   4. `detector`            - and anything that still looks like an injection is held,
+#                              not delivered, and not silently dropped.
+#
+# The first two are deterministic and remove more real risk than the fourth. The detector is
+# defence in depth and is evadable; see SECURITY.md.
+
+server:
+  max_body_bytes: 1048576
+
+sources:
+  - name: github
+    path: /webhook/github
+    parser: github
+    # The default, stated explicitly because this file is about being explicit. A GitHub
+    # signature proves GitHub sent the request. It says nothing about who wrote the issue body
+    # inside it.
+    trust: untrusted
+    verify:
+      strategy: hmac_sha256
+      header: X-Hub-Signature-256
+      prefix: "sha256="
+      encoding: hex
+      secret_env: GITHUB_WEBHOOK_SECRET
+    dedup:
+      id_header: X-GitHub-Delivery
+    filter:
+      # A second, independent gate from the parser's own idea of what is actionable.
+      event_types: [issues.opened, pull_request.opened]
+      # A path that is absent FAILS this requirement. That is the point: a payload shape that
+      # does not carry `author_association` has not told you the author is trusted.
+      require:
+        issue.author_association: [OWNER, MEMBER, COLLABORATOR]
+      # A path that is absent PASSES a deny. Absent is not the thing being refused.
+      deny: {}
+      # Bytes, cut on a character boundary. Bounds what one issue body can put in front of the
+      # agent, and bounds the detector's input with it.
+      max_field_bytes: 4096
+    sinks: [agent-inbox]
+
+sinks:
+  - name: agent-inbox
+    type: http
+    url_env: AGENT_INBOX_URL
+    method: POST
+    content_type: application/json
+    # This is what turns fencing on. Without it the template below renders exactly as it did
+    # before v0.4.0.
+    agent_readable: true
+    # `event_id` is the store's primary key and is outside the fence, so the agent can dedup its
+    # own actions against it. `repo`, `number` and `url` are structural and also outside.
+    # `title` and `body` arrive wrapped in <untrusted source="github" field="...">.
+    template: |
+      {
+        "event_id": {{ event_id }},
+        "repo": "{{ repo }}",
+        "number": {{ number }},
+        "url": "{{ url }}",
+        "content": {{ body | tojson }}
+      }
+
+detector:
+  backend: heuristic
+  threshold: 0.8
+  # Hold it, do not deliver it, and do not throw it away. `GET /admin/held` lists what is held
+  # and `POST /admin/release/{event_id}` sends it on once you have looked.
+  #
+  # `annotate` is the default for a reason: the heuristic backend is noisy, and a security repo's
+  # issue tracker carries "ignore all previous instructions" as ordinary content. Start on
+  # `annotate`, watch `webhook_doorman_detection_total{verdict="flagged"}`, and move to
+  # `quarantine` once you know your own false-positive rate.
+  on_detect: quarantine
+  # There is no `drop` here, deliberately. Discarding an event because the *detector* failed is
+  # the one trade this project will not make, so the config language cannot express it.
+  on_error: annotate
+
+admin:
+  token_env: DOORMAN_ADMIN_TOKEN

@@ -78,6 +78,51 @@ vulnerability, not a feature request.
 6. A bundled sink escapes webhook content for the way its destination renders it. Verification
    proves a payload's *origin*, never that its *content* is safe — an issue title on a public
    repo is written by a stranger and is authentically signed by GitHub either way.
+7. Content that a source's parser declared attacker-authored cannot escape its `<untrusted>`
+   fence when the destination sink is `agent_readable`. This survives storage and replay.
+8. No endpoint returns withheld or dead-lettered *content*. `GET /admin/dlq` and
+   `GET /admin/held` return failure metadata only, and a detector reports the **names** of the
+   rules that matched, never the text that matched them.
+
+## The content-safety layer is defence in depth, and it is evadable
+
+Added in 0.4.0. Please read this before relying on any of it.
+
+**The prompt-injection detector is telemetry, not a boundary.** It is a small set of scored
+regular expressions. It will miss things a person would catch in a second, and it will flag
+legitimate content — a security repository's issue tracker carries "ignore all previous
+instructions" as ordinary text. That is why `annotate` is the default and why the README tells
+you to watch your own false-positive rate before enabling `quarantine`.
+
+This is not a limitation of *this* implementation. Machine-learned guards in this class are also
+evadable: arXiv 2510.01529 (June 2026) documents controlled-release bypasses against the
+reference open-source prompt-injection classifiers. A later release will add ML and LLM backends
+behind the same interface; **none of them will change this paragraph.** A detector score is a
+signal to investigate, not a control to depend on.
+
+What is *not* probabilistic, and what you should actually lean on:
+
+| Mechanism | Kind | Relies on |
+|---|---|---|
+| `filter.event_types` / `require` / `deny` | deterministic | your config, and the payload's structure |
+| Unicode sanitization | deterministic | a closed set of codepoints |
+| Fencing | deterministic | the parser's declaration of which fields are free text |
+| Detector score | **probabilistic** | pattern matching, and it is evadable |
+
+The first three remove more real risk than the fourth, and they do it the same way every time.
+Configure them first.
+
+**Fencing marks a boundary; it does not enforce one.** `<untrusted>` is a text delimiter, and the
+only thing between it and a forged boundary is that content cannot write the tag — opening or
+closing, with or without attributes, which are all removed case-insensitively and
+whitespace-tolerantly before wrapping. Whether the model on the
+other end *respects* the fence is a property of that model and its system prompt, not of this
+router. Treat fenced content as data in your agent's prompt, and do not give an agent
+irreversible capabilities on the strength of a fence alone.
+
+**A report that the fence can be escaped — that content reaches the far side outside the
+`<untrusted>` wrapper, or that a closing tag survives — is a vulnerability.** A report that the
+detector missed an injection is not; it is expected, and the design says so.
 
 ## Escaping in your own templates
 
