@@ -251,6 +251,72 @@ class TestMigrationFromV1:
             db.close()
 
 
+class TestMigratedFromIsReported:
+    """`store_ready` names the version it came from, and it must name a version that existed."""
+
+    @staticmethod
+    def _store_ready(monkeypatch) -> list[dict]:
+        import structlog
+
+        from webhook_doorman.store import sqlite as sqlite_module
+
+        entries: list[dict] = []
+
+        def capture(_logger, _name, event_dict):
+            entries.append(dict(event_dict))
+            raise structlog.DropEvent
+
+        saved = structlog.get_config()
+        structlog.configure(
+            processors=[capture],
+            wrapper_class=structlog.make_filtering_bound_logger(0),
+            logger_factory=structlog.PrintLoggerFactory(),
+            cache_logger_on_first_use=False,
+        )
+        # Rebound because `configure_logging` sets `cache_logger_on_first_use`: once any earlier
+        # test has logged through the module's lazy proxy, the proxy has permanently become the
+        # logger it was bound to, and reconfiguring alone would not reach it.
+        monkeypatch.setattr(
+            sqlite_module, "log", structlog.get_logger("webhook_doorman.store.sqlite")
+        )
+        return entries, saved
+
+    async def test_a_zero_versioned_database_reports_migrating_from_the_baseline(
+        self, tmp_path, monkeypatch
+    ):
+        """Not 0. A database written before this build can report a version it never had, and a
+        log line saying `migrated_from: 0` names a schema version that has never existed."""
+        import structlog
+
+        entries, saved = self._store_ready(monkeypatch)
+        try:
+            path = tmp_path / "unversioned.db"
+            build_v1_database(path, rows=1, user_version=0)
+            store = SqliteStore(path)
+            await store.connect()
+            await store.close()
+        finally:
+            structlog.configure(**saved)
+
+        ready = [e for e in entries if e.get("event") == "store_ready"]
+        assert ready and ready[0]["migrated_from"] == 1
+
+    async def test_a_fresh_database_reports_no_migration_at_all(self, tmp_path, monkeypatch):
+        """Absence of the key means "already current", not "the migrator did not run"."""
+        import structlog
+
+        entries, saved = self._store_ready(monkeypatch)
+        try:
+            store = SqliteStore(tmp_path / "fresh.db")
+            await store.connect()
+            await store.close()
+        finally:
+            structlog.configure(**saved)
+
+        ready = [e for e in entries if e.get("event") == "store_ready"]
+        assert ready and "migrated_from" not in ready[0]
+
+
 class TestNewerDatabaseIsRefused:
     async def test_refuses_to_open(self, tmp_path):
         path = tmp_path / "future.db"

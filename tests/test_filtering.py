@@ -114,6 +114,22 @@ class TestDeny:
         f = make_filter(deny={"issue.no_such_field": ["anything"]})
         assert evaluate(f, "issues.opened", PAYLOAD).admitted is True
 
+    def test_a_payload_failing_both_gates_is_reported_as_deny(self):
+        """The case that actually pins the evaluation order.
+
+        When only `deny` would reject, any order gives the same answer — so a test built that way
+        passes whichever gate runs first. This is the one that distinguishes them: `require`
+        fails *and* `deny` matches, so the reported reason says which gate was consulted first.
+        """
+        f = make_filter(
+            require={"issue.author_association": ["MEMBER"]},  # payload says OWNER: fails
+            deny={"repository.full_name": ["o/r"]},  # also matches
+        )
+        verdict = evaluate(f, "issues.opened", PAYLOAD)
+        assert verdict.admitted is False
+        assert verdict.reason == "deny"
+        assert verdict.detail == "repository.full_name"
+
     def test_deny_takes_precedence_over_require(self):
         """A payload satisfying `require` and matching `deny` is refused, and refused as deny."""
         f = make_filter(
