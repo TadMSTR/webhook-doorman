@@ -32,6 +32,7 @@ import time
 from collections.abc import Iterable, Mapping
 
 from .filtering import FILTER_REASONS as _FILTER_REASONS
+from .sanitize import SANITIZE_CLASSES as _SANITIZE_CLASSES
 
 #: Every value `outcome` can take on `delivery_attempts_total`. Closed on purpose — see the
 #: cardinality note above.
@@ -47,6 +48,10 @@ REJECTION_REASONS = ("body_too_large", "source_disabled")
 #: into disagreeing about what a reason is.
 FILTER_REASONS = _FILTER_REASONS
 
+#: Every value the `class` label can take on `content_sanitized_total`. Imported for the same
+#: reason as `FILTER_REASONS` above.
+SANITIZE_CLASSES = _SANITIZE_CLASSES
+
 #: Fixed histogram buckets, in seconds, for delivery latency. Cumulative and ending at +Inf, per
 #: the exposition format. Chosen around what a chat webhook actually does: sub-100ms is healthy,
 #: the 1-5s range is where a struggling destination shows up, and past 10s the delivery timeout
@@ -55,6 +60,11 @@ LATENCY_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
 
 _HELP: Mapping[str, tuple[str, str]] = {
     "webhook_doorman_events_received_total": ("counter", "Events accepted and stored."),
+    "webhook_doorman_content_sanitized_total": (
+        "counter",
+        "Events whose content had a class of character removed before storage, by class. "
+        "Counted once per event per class, never per character.",
+    ),
     "webhook_doorman_events_filtered_total": (
         "counter",
         "Events stored but not dispatched because the source's filter refused them, by which "
@@ -163,7 +173,13 @@ class Metrics:
 
     # -- setup -------------------------------------------------------------------------
 
-    def initialise(self, *, sources: Mapping[str, str], sinks: Iterable[str]) -> None:
+    def initialise(
+        self,
+        *,
+        sources: Mapping[str, str],
+        sinks: Iterable[str],
+        untrusted_sources: Iterable[str] = (),
+    ) -> None:
         """Create every config-derived series at zero.
 
         Without this a counter does not exist until the event it counts first happens, and
@@ -175,6 +191,9 @@ class Metrics:
         Args:
             sources: source name -> its verification strategy name.
             sinks: configured sink names.
+            untrusted_sources: sources whose `trust` is `untrusted`. Only these can ever
+                sanitise anything, so only these get the series - a permanent zero against a
+                `trusted` source would suggest a check is running there that is not.
         """
         for source, strategy in sources.items():
             self.increment("webhook_doorman_events_received_total", 0.0, source=source)
@@ -192,6 +211,14 @@ class Metrics:
             for reason in FILTER_REASONS:
                 self.increment(
                     "webhook_doorman_events_filtered_total", 0.0, source=source, reason=reason
+                )
+        for source in untrusted_sources:
+            for sanitize_class in SANITIZE_CLASSES:
+                self.increment(
+                    "webhook_doorman_content_sanitized_total",
+                    0.0,
+                    source=source,
+                    **{"class": sanitize_class},
                 )
         for sink in sinks:
             for outcome in DELIVERY_OUTCOMES:

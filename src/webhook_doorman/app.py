@@ -33,6 +33,7 @@ from .metrics import METRICS
 from .models import DlqEntry, EventStatus, InboundEvent
 from .parsers import get_parser, parse
 from .redaction import redact_bytes, redact_headers, redact_json, redact_text
+from .sanitize import sanitize_structure
 from .secrets import Resolved, SourceState, resolve
 from .verification import verify
 
@@ -213,6 +214,25 @@ def build_source_route(
 
             payload_json = _safe_json(safe_body)
 
+            # Sanitisation applies on `trust: untrusted` regardless of where the event is
+            # going, because the characters it removes are unwanted in a chat room and a log
+            # line too, not only in an agent's prompt. It runs *before* the byte cap so the cap
+            # is the last word on size, and before storage so a replay delivers what the
+            # original delivery did.
+            sanitized_classes: set[str] = set()
+            summary_text = redact_text(parsed.summary, secret_values)
+            context_value = redact_json(parsed.context, secret_values)
+            if source.trust == "untrusted":
+                summary_text = sanitize_structure(summary_text, sanitized_classes)
+                context_value = sanitize_structure(context_value, sanitized_classes)
+                for removed in sorted(sanitized_classes):
+                    log.info("content_sanitized", source=source.name, removed=removed)
+                    METRICS.increment(
+                        "webhook_doorman_content_sanitized_total",
+                        source=source.name,
+                        **{"class": removed},
+                    )
+
             # Admission control, after parse and before ingest. A refusal here is not an error:
             # the event is still stored, with no sinks queued, and the producer is answered 200
             # exactly as it is for an event its parser found unactionable. Answering non-2xx
@@ -226,17 +246,20 @@ def build_source_route(
                     source=source.name,
                     delivery_id=delivery_id,
                     event_type=parsed.event_type,
-                    summary=truncate(redact_text(parsed.summary, secret_values), cap),
+                    summary=truncate(summary_text, cap),
                     headers=redact_headers(
                         headers, extra_headers=credential_headers, secret_values=secret_values
                     ),
                     body=safe_body,
                     payload=payload_json,
-                    context=truncate(redact_json(parsed.context, secret_values), cap),
+                    context=truncate(context_value, cap),
                     sinks=(list(source.sinks) if parsed.actionable and verdict.admitted else []),
                     verified=not isinstance(source.verify, NoneVerify),
                     status=(EventStatus.FILTERED if not verdict.admitted else EventStatus.RECEIVED),
                     filter_reason=verdict.reason,
+                    untrusted_fields=(
+                        list(parsed.untrusted_fields) if source.trust == "untrusted" else []
+                    ),
                 )
 
                 payload = await ingest(event)
@@ -556,6 +579,9 @@ def create_app(
     METRICS.initialise(
         sources={name: s.config.verify.strategy for name, s in resolved.sources.items()},
         sinks=resolved.sinks,
+        untrusted_sources=[
+            name for name, s in resolved.sources.items() if s.config.trust == "untrusted"
+        ],
     )
 
     router = APIRouter()

@@ -131,6 +131,17 @@ class TestValueMatching:
         assert evaluate(make_filter(deny={"issue.draft": ["false"]}), "e", PAYLOAD).reason == "deny"
         assert evaluate(make_filter(deny={"issue.draft": ["False"]}), "e", PAYLOAD).admitted is True
 
+    def test_a_true_matches_its_json_spelling(self):
+        payload = {"pull_request": {"draft": True}}
+        f = make_filter(require={"pull_request.draft": ["true"]})
+        assert evaluate(f, "e", payload).admitted is True
+
+    def test_a_null_inside_a_list_matches_as_null(self):
+        """`dig` short-circuits a top-level null, so this is the only path that reaches it."""
+        payload = {"issue": {"assignees": [None]}}
+        f = make_filter(deny={"issue.assignees": ["null"]})
+        assert evaluate(f, "e", payload).reason == "deny"
+
     def test_a_number_matches_as_text(self):
         assert evaluate(make_filter(require={"issue.number": ["7"]}), "e", PAYLOAD).admitted is True
 

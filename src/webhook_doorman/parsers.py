@@ -35,12 +35,19 @@ class ParsedEvent:
             with 200 and dispatches to no sink. An unhandled event is not an error; answering it
             with a 4xx makes well-behaved producers retry harder.
         context: extra variables merged into the template namespace.
+        untrusted_fields: which of the names this parser fills - including `summary` - carry
+            content authored by whoever sent the payload rather than by the producer's own
+            structure. A parser is the only place that knows the difference: `repo` and `number`
+            are derived from the request's shape, while `title` and `body` are free text a
+            stranger typed. Named here, applied by `fencing`, and persisted with the event so a
+            replay fences what the original delivery fenced.
     """
 
     event_type: str
     summary: str
     actionable: bool = True
     context: dict[str, Any] = field(default_factory=dict)
+    untrusted_fields: list[str] = field(default_factory=list)
 
 
 Parser = Callable[[Any, Mapping[str, str]], ParsedEvent]
@@ -63,7 +70,14 @@ def parse_generic(payload: Any, headers: Mapping[str, str]) -> ParsedEvent:
             if isinstance(value, str) and value:
                 event_type = value
                 break
-    return ParsedEvent(event_type=event_type, summary=f"{event_type} event received")
+    # The whole payload, because a generic parser has no idea which parts of it are structural.
+    # `summary` is ours, but it is named anyway: it is built from `event_type`, which the payload
+    # supplied.
+    return ParsedEvent(
+        event_type=event_type,
+        summary=f"{event_type} event received",
+        untrusted_fields=["summary", "payload"],
+    )
 
 
 def parse_github(payload: Any, headers: Mapping[str, str]) -> ParsedEvent:
@@ -110,6 +124,10 @@ def parse_github(payload: Any, headers: Mapping[str, str]) -> ParsedEvent:
             "body": body,
             "kind": kind,
         },
+        # `repo`, `number`, `url` and `kind` are structurally derived and stay outside the
+        # fence. `author` is a login a stranger chose, `title` and `body` are what they wrote,
+        # and `summary` is built from `repo`, `number` and `title` - so it inherits `title`.
+        untrusted_fields=["summary", "title", "body", "author"],
     )
 
 
@@ -146,6 +164,7 @@ def parse_vikunja(payload: Any, headers: Mapping[str, str]) -> ParsedEvent:
         event_type=event_name,
         summary=summary,
         context={"title": title, "task_id": task_id, "done": bool(task.get("done"))},
+        untrusted_fields=["summary", "title"],
     )
 
 
@@ -192,6 +211,10 @@ def parse_grafana(payload: Any, headers: Mapping[str, str]) -> ParsedEvent:
             "firing_count": firing,
             "external_url": payload.get("externalURL") or "",
         },
+        # An alert title and message come from a rule an operator wrote, but the labels those
+        # rules interpolate routinely carry data from outside - a hostname, a user agent, a
+        # request path. `status` and the counts are ours.
+        untrusted_fields=["summary", "title", "message"],
     )
 
 

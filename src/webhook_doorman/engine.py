@@ -254,7 +254,9 @@ class Engine:
             return
 
         try:
-            outcome = await sink.deliver(event.template_context(), self._require_client())
+            outcome = await sink.deliver(
+                self._context_for(event, delivery.sink), self._require_client()
+            )
         except PermanentSinkError as exc:
             log.warning(
                 "delivery_permanent_failure",
@@ -291,6 +293,26 @@ class Engine:
                 sink=delivery.sink,
                 outcome="delivered",
             )
+
+    def _context_for(self, event: StoredEvent, sink_name: str) -> dict[str, Any]:
+        """The template namespace for one (event, sink) pair, fenced if this pair warrants it.
+
+        **The engine decides, not the sink.** `sinks/base.py` opens with the rule that no sink
+        knows its source, and it is the rule that keeps this a router rather than four glued
+        listeners. Fencing depends on the sink's `agent_readable` *and* the source's `trust`, so
+        the only component that can decide is the one holding both - this one. The sink still
+        receives a plain context dict and learns nothing about where the event came from.
+
+        Trust is read from the *current* config rather than from the stored event, so an
+        operator who reclassifies a source to `trusted` sees the change on the next delivery
+        instead of only on events ingested afterwards. A source that has since been deleted is
+        treated as untrusted, which is the safe direction.
+        """
+        sink_state = self.resolved.sinks.get(sink_name)
+        agent_readable = sink_state is not None and sink_state.config.agent_readable
+        source = self.config.source_by_name(event.source)
+        untrusted = source is None or source.trust == "untrusted"
+        return event.template_context(fence=agent_readable and untrusted)
 
     @staticmethod
     def _observe_latency(sink: str, latency_ms: int) -> None:

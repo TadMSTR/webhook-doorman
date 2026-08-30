@@ -245,8 +245,8 @@ class SqliteStore:
             """
             INSERT OR IGNORE INTO events
                 (source, delivery_id, event_type, summary, received_at,
-                 headers_json, body, context_json, verified, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 headers_json, body, context_json, verified, status, untrusted_fields_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.source,
@@ -262,6 +262,7 @@ class SqliteStore:
                 # filter is stored as `filtered`, and nothing settles it later because it has
                 # no deliveries to settle.
                 event.status.value,
+                json.dumps(event.untrusted_fields),
             ),
         )
         if cursor.rowcount:
@@ -436,6 +437,7 @@ class SqliteStore:
             verified=bool(row["verified"]),
             status=EventStatus(row["status"]),
             received_at=datetime.fromisoformat(row["received_at"]),
+            untrusted_fields=json.loads(row["untrusted_fields_json"] or "[]"),
         )
 
     async def list_dlq(self, *, limit: int, before_id: int | None = None) -> list[DlqEntry]:

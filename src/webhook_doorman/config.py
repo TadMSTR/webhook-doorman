@@ -244,6 +244,17 @@ class SourceConfig(_Strict):
     parser: str = "generic"
     dedup: DedupConfig = Field(default_factory=DedupConfig)
     filter: SourceFilter = Field(default_factory=SourceFilter)
+    trust: Literal["trusted", "untrusted"] = "untrusted"
+    """Whether this source's content is authored by someone you trust.
+
+    **Defaults to `untrusted`**, which is safe to default because it changes nothing on its own:
+    a source is only treated differently when a sink opts in with `agent_readable: true`. The
+    distinction it captures is the one a signature cannot: HMAC proves GitHub sent the request,
+    not that a stranger did not write the issue body inside it.
+
+    Set `trusted` for a source whose content originates with you - your own CI, your own
+    monitoring - and leave it alone for anything the public can write into.
+    """
     enabled: bool = True
 
     @field_validator("path")
@@ -306,6 +317,17 @@ class SourceConfig(_Strict):
 
 class _SinkBase(_Strict):
     name: str
+    agent_readable: bool = False
+    """This destination feeds an LLM rather than a person.
+
+    **Defaults to false**, which is what makes every v0.3.0 config render byte-identically:
+    fencing and its costs apply only where an operator has said the reader is a machine. Turning
+    it on wraps the fields an `untrusted` source's parser marked as attacker-authored - see
+    `fencing`, including what it costs a template that reaches into `payload`.
+
+    A person reading a chat room supplies this distinction themselves. An agent does not, and
+    nothing else in the rendered message tells it which words were written by a stranger.
+    """
 
     @field_validator("name")
     @classmethod
