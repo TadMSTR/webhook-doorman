@@ -392,6 +392,14 @@ consequences worth stating:
 - a fenced field becomes a string, so `{{ payload.x }}` renders empty on an `agent_readable`
   sink. That cost is real, documented in the README, and the reason `agent_readable` is opt-in.
 
+Tag forgery is removed in **both** directions before wrapping. A forged *close* is the escape and
+is obviously load-bearing. A forged *open* cannot escape — the real close is appended once, after
+all field content, so anything a forged open introduces stays inside the true span whatever
+`source` it claims — but it is stripped anyway, because the fence's entire job is to be an
+unambiguous statement about which words a stranger wrote, and a nested
+`<untrusted source="trusted-thing">` muddies exactly that. `detect.py`'s `fence_forgery` rule
+matches the same shape, so an attempt is still scored after it has been neutralised.
+
 **The engine chooses the fenced context, not the sink.** Fencing depends on the sink's
 `agent_readable` *and* the source's `trust`. `sinks/base.py` opens with the rule that no sink
 knows its source, and that rule is what keeps this a router rather than four glued-together

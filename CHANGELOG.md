@@ -56,7 +56,9 @@ upgrading**, as you would for any first-of-its-kind migration.
 - **Source `trust` and sink `agent_readable`.** Together they fence attacker-authored fields in
   rendered output as `<untrusted source="..." field="...">`. Structural fields — `source`,
   `event_type`, `delivery_id`, `event_id`, and parser-derived values like `repo` — stay outside
-  the fence. A forged closing tag is removed before wrapping.
+  the fence. Forged fence tags in content — opening or closing, with or without attributes — are
+  removed before wrapping, and `detect.py`'s `fence_forgery` rule scores the same shape so an
+  attempt is still recorded after it has been neutralised.
 - **`{{ event_id }}`** in the template context, as a stable idempotency key for a downstream
   agent.
 - **Unicode sanitization** on any `untrusted` source, regardless of destination: the tag block

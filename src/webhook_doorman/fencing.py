@@ -28,13 +28,21 @@ Both alternatives were checked against the code rather than assumed, and both ar
 Instead the parser declares which context keys it filled from attacker-authored data, that list
 is persisted alongside the event, and the fence is applied when the context is built.
 
-## The closing tag is the load-bearing part
+## The tag is the load-bearing part
 
 Content that can write `</untrusted>` can end the fence early and continue as trusted text, so
 any closing tag in the content is removed before wrapping. The match is deliberately looser than
 the tag this module emits - `</ untrusted >` and `</UNTRUSTED>` are removed too, because the
 reader being protected is a language model, not a strict parser, and it will treat those as a
 close.
+
+**Forged *opening* tags are removed as well.** They cannot produce an escape on their own: the
+real closing tag is appended once, after all field content, so anything a forged open introduces
+stays inside the true span whatever `source` attribute it claims. What they can do is unbalance
+the structure, and the fence's whole job is to be an unambiguous signal about which words came
+from a stranger - a nested `<untrusted source="trusted-thing">` muddies exactly the thing the
+delimiter exists to say. Stripping them costs nothing: tag syntax bearing this module's own
+delimiter name has no legitimate meaning inside a webhook payload.
 """
 
 from __future__ import annotations
@@ -45,9 +53,14 @@ from typing import Any
 
 from .sanitize import sanitize
 
-#: Matches any plausible spelling of the closing tag. Case-insensitive and whitespace-tolerant
-#: because the consumer is an LLM: a fence that only stops an exact-match forgery is not one.
-_CLOSING_TAG = re.compile(r"</\s*untrusted\s*>", re.IGNORECASE)
+#: Matches any plausible spelling of the fence tag - opening or closing, with or without
+#: attributes. Case-insensitive and whitespace-tolerant because the consumer is an LLM: a fence
+#: that only stops an exact-match forgery is not one.
+#:
+#: The lookahead is what keeps this from over-reaching. `untrusted` must be followed by
+#: whitespace or `>`, so a payload containing `<untrusted-data>` is left alone while
+#: `<untrusted source="...">` is not.
+_FENCE_TAG = re.compile(r"</?\s*untrusted(?=[\s>])[^>]*>", re.IGNORECASE)
 
 
 def _attribute(value: str) -> str:
@@ -63,7 +76,7 @@ def fence_text(content: str, *, source: str, field: str) -> str:
     the log and another to the model reading the message.
     """
     cleaned, _ = sanitize(content)
-    cleaned = _CLOSING_TAG.sub("", cleaned)
+    cleaned = _FENCE_TAG.sub("", cleaned)
     return (
         f"<untrusted source={_attribute(source)} field={_attribute(field)}>\n"
         f"{cleaned}\n"

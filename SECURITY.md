@@ -113,8 +113,9 @@ The first three remove more real risk than the fourth, and they do it the same w
 Configure them first.
 
 **Fencing marks a boundary; it does not enforce one.** `<untrusted>` is a text delimiter, and the
-only thing between it and a forged boundary is that content cannot write a closing tag — which is
-removed, case-insensitively and whitespace-tolerantly, before wrapping. Whether the model on the
+only thing between it and a forged boundary is that content cannot write the tag — opening or
+closing, with or without attributes, which are all removed case-insensitively and
+whitespace-tolerantly before wrapping. Whether the model on the
 other end *respects* the fence is a property of that model and its system prompt, not of this
 router. Treat fenced content as data in your agent's prompt, and do not give an agent
 irreversible capabilities on the strength of a fence alone.
