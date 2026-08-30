@@ -183,6 +183,59 @@ class DedupConfig(_Strict):
     enabled: bool = True
 
 
+class SourceFilter(_Strict):
+    """Which of a source's events are admissible, and how large their fields may be.
+
+    Empty by default, so a config that does not mention it behaves exactly as it did before this
+    model existed. Every field is an independent gate; see `filtering.evaluate` for the order
+    they are applied in and for the missing-path asymmetry between `require` and `deny`.
+
+    Attributes:
+        event_types: allowlist matched against the parser's `event_type`. `None` admits every
+            type. This is a *second*, independent gate from a parser's own idea of what is
+            actionable — `parse_github` already declines to act on anything but a newly opened
+            issue or PR, and merging the two would make one of them unstateable.
+        require: dotted payload path -> values, at least one of which must be present. A path
+            that does not resolve **fails** the requirement.
+        deny: dotted payload path -> values, none of which may be present. A path that does not
+            resolve **passes**.
+        max_field_bytes: byte cap per string field in the stored summary and parser context.
+    """
+
+    event_types: list[str] | None = None
+    require: dict[str, list[str]] = Field(default_factory=dict)
+    deny: dict[str, list[str]] = Field(default_factory=dict)
+    max_field_bytes: int | None = None
+
+    @field_validator("event_types")
+    @classmethod
+    def _no_empty_allowlist(cls, v: list[str] | None) -> list[str] | None:
+        if v is not None and not v:
+            raise ValueError(
+                "event_types is an empty list, which would admit nothing at all. Omit the key "
+                "(or set it to null) to admit every event type."
+            )
+        return v
+
+    @field_validator("require", "deny")
+    @classmethod
+    def _no_empty_value_lists(cls, v: dict[str, list[str]]) -> dict[str, list[str]]:
+        for path, values in v.items():
+            if not values:
+                raise ValueError(
+                    f"{path!r} maps to an empty list of values, which can never match. Remove "
+                    f"the entry, or name the values it should match."
+                )
+        return v
+
+    @field_validator("max_field_bytes")
+    @classmethod
+    def _positive(cls, v: int | None) -> int | None:
+        if v is not None and v <= 0:
+            raise ValueError("must be positive")
+        return v
+
+
 class SourceConfig(_Strict):
     name: str
     path: str
@@ -190,6 +243,7 @@ class SourceConfig(_Strict):
     sinks: list[str]
     parser: str = "generic"
     dedup: DedupConfig = Field(default_factory=DedupConfig)
+    filter: SourceFilter = Field(default_factory=SourceFilter)
     enabled: bool = True
 
     @field_validator("path")

@@ -35,7 +35,7 @@ from . import tracing
 from .config import Config
 from .errors import PermanentSinkError, SinkError
 from .metrics import METRICS
-from .models import Delivery, DlqEntry, InboundEvent, StoredEvent, utcnow
+from .models import Delivery, DlqEntry, EventStatus, InboundEvent, StoredEvent, utcnow
 from .redaction import redact_text
 from .secrets import Resolved
 from .sinks import Sink, build_sink
@@ -143,6 +143,28 @@ class Engine:
         # `events_received_total` mean "events that had somewhere to go", which is a different
         # question and already answerable from `delivery_attempts_total`.
         METRICS.increment("webhook_doorman_events_received_total", source=event.source)
+
+        # Counted after the dedup check, like `events_received_total` above, so it means
+        # "events filtered" rather than "requests filtered" — a producer retrying a delivery
+        # we already refused must not inflate the number.
+        if event.status is EventStatus.FILTERED:
+            log.info(
+                "event_filtered",
+                source=event.source,
+                event_type=event.event_type,
+                event_id=event_id,
+                reason=event.filter_reason,
+            )
+            METRICS.increment(
+                "webhook_doorman_events_filtered_total",
+                source=event.source,
+                reason=event.filter_reason or "unknown",
+            )
+            return {
+                "status": "filtered",
+                "event_id": event_id,
+                "reason": event.filter_reason,
+            }
 
         if not event.sinks:
             log.info("event_stored_no_sinks", source=event.source, event_type=event.event_type)

@@ -258,7 +258,10 @@ class SqliteStore:
                 event.body,
                 json.dumps(event.context, default=str),
                 int(event.verified),
-                EventStatus.RECEIVED.value,
+                # The event's own status, not a constant: an event refused by its source's
+                # filter is stored as `filtered`, and nothing settles it later because it has
+                # no deliveries to settle.
+                event.status.value,
             ),
         )
         if cursor.rowcount:

@@ -17,6 +17,9 @@ class EventStatus(str, Enum):
     RECEIVED = "received"
     DISPATCHED = "dispatched"
     FAILED = "failed"
+    #: Admitted, verified and stored, but refused by the source's `filter` — no sinks were
+    #: queued. A terminal state: nothing settles it later, because there is nothing in flight.
+    FILTERED = "filtered"
 
 
 class DeliveryStatus(str, Enum):
@@ -47,6 +50,14 @@ class InboundEvent:
     sinks: list[str] = field(default_factory=list)
     verified: bool = True
     received_at: datetime = field(default_factory=utcnow)
+    status: EventStatus = EventStatus.RECEIVED
+    filter_reason: str | None = None
+    """Which gate in `SourceFilter` refused this event, when `status` is `FILTERED`.
+
+    One of `filtering.FILTER_REASONS`. Carried on the event rather than returned alongside it so
+    that the decision travels with the thing it was made about — the engine counts it after the
+    dedup check, where it means "events filtered" rather than "requests filtered".
+    """
 
     def template_context(self) -> dict[str, Any]:
         """The namespace a sink template renders against."""

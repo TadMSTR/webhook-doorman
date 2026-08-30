@@ -27,8 +27,10 @@ from fastapi.responses import JSONResponse
 
 from . import __version__, tracing
 from .config import Config, NoneVerify, load_config
+from .filtering import evaluate as evaluate_filter
+from .filtering import truncate
 from .metrics import METRICS
-from .models import DlqEntry, InboundEvent
+from .models import DlqEntry, EventStatus, InboundEvent
 from .parsers import get_parser, parse
 from .redaction import redact_bytes, redact_headers, redact_json, redact_text
 from .secrets import Resolved, SourceState, resolve
@@ -209,20 +211,32 @@ def build_source_route(
             parsed = parse(parser_name, safe_body, headers)
             delivery_id = compute_delivery_id(state, headers, safe_body)
 
+            payload_json = _safe_json(safe_body)
+
+            # Admission control, after parse and before ingest. A refusal here is not an error:
+            # the event is still stored, with no sinks queued, and the producer is answered 200
+            # exactly as it is for an event its parser found unactionable. Answering non-2xx
+            # would make a well-behaved producer retry harder — the storm the engine docstring
+            # warns about — over a decision that will be identical every time.
+            verdict = evaluate_filter(source.filter, parsed.event_type, payload_json)
+            cap = source.filter.max_field_bytes
+
             with structlog.contextvars.bound_contextvars(delivery_id=delivery_id):
                 event = InboundEvent(
                     source=source.name,
                     delivery_id=delivery_id,
                     event_type=parsed.event_type,
-                    summary=redact_text(parsed.summary, secret_values),
+                    summary=truncate(redact_text(parsed.summary, secret_values), cap),
                     headers=redact_headers(
                         headers, extra_headers=credential_headers, secret_values=secret_values
                     ),
                     body=safe_body,
-                    payload=_safe_json(safe_body),
-                    context=redact_json(parsed.context, secret_values),
-                    sinks=list(source.sinks) if parsed.actionable else [],
+                    payload=payload_json,
+                    context=truncate(redact_json(parsed.context, secret_values), cap),
+                    sinks=(list(source.sinks) if parsed.actionable and verdict.admitted else []),
                     verified=not isinstance(source.verify, NoneVerify),
+                    status=(EventStatus.FILTERED if not verdict.admitted else EventStatus.RECEIVED),
+                    filter_reason=verdict.reason,
                 )
 
                 payload = await ingest(event)

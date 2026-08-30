@@ -31,6 +31,8 @@ from __future__ import annotations
 import time
 from collections.abc import Iterable, Mapping
 
+from .filtering import FILTER_REASONS as _FILTER_REASONS
+
 #: Every value `outcome` can take on `delivery_attempts_total`. Closed on purpose — see the
 #: cardinality note above.
 DELIVERY_OUTCOMES = ("delivered", "retry", "permanent", "exhausted")
@@ -40,6 +42,11 @@ DELIVERY_OUTCOMES = ("delivered", "retry", "permanent", "exhausted")
 #: has its own counter.
 REJECTION_REASONS = ("body_too_large", "source_disabled")
 
+#: Every value `reason` can take on `events_filtered_total`. Imported from `filtering` rather
+#: than restated, so the metric's label vocabulary and the gates that produce it cannot drift
+#: into disagreeing about what a reason is.
+FILTER_REASONS = _FILTER_REASONS
+
 #: Fixed histogram buckets, in seconds, for delivery latency. Cumulative and ending at +Inf, per
 #: the exposition format. Chosen around what a chat webhook actually does: sub-100ms is healthy,
 #: the 1-5s range is where a struggling destination shows up, and past 10s the delivery timeout
@@ -48,6 +55,11 @@ LATENCY_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
 
 _HELP: Mapping[str, tuple[str, str]] = {
     "webhook_doorman_events_received_total": ("counter", "Events accepted and stored."),
+    "webhook_doorman_events_filtered_total": (
+        "counter",
+        "Events stored but not dispatched because the source's filter refused them, by which "
+        "gate refused it. Never the offending value — that is producer-controlled.",
+    ),
     "webhook_doorman_events_deduplicated_total": (
         "counter",
         "Events recognised as a repeat delivery and not re-dispatched.",
@@ -176,6 +188,10 @@ class Metrics:
             for reason in REJECTION_REASONS:
                 self.increment(
                     "webhook_doorman_requests_rejected_total", 0.0, source=source, reason=reason
+                )
+            for reason in FILTER_REASONS:
+                self.increment(
+                    "webhook_doorman_events_filtered_total", 0.0, source=source, reason=reason
                 )
         for sink in sinks:
             for outcome in DELIVERY_OUTCOMES:
