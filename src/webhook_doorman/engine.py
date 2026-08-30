@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import hmac
 import random
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -33,9 +34,19 @@ import structlog
 
 from . import tracing
 from .config import Config
+from .detect import Detector, build_detector
 from .errors import PermanentSinkError, SinkError
+from .logging import log_throttled
 from .metrics import METRICS
-from .models import Delivery, DlqEntry, EventStatus, InboundEvent, StoredEvent, utcnow
+from .models import (
+    Delivery,
+    DlqEntry,
+    EventStatus,
+    HeldEntry,
+    InboundEvent,
+    StoredEvent,
+    utcnow,
+)
 from .redaction import redact_text
 from .secrets import Resolved
 from .sinks import Sink, build_sink
@@ -57,6 +68,11 @@ class Engine:
         self._client: httpx.AsyncClient | None = None
         self._tasks: list[asyncio.Task] = []
         self._stopping = asyncio.Event()
+        # Built at construction rather than at first use: an unknown backend name is a startup
+        # failure, and a content check the operator believes is running and which is not is
+        # worse than one they know is off.
+        self._detector: Detector | None = build_detector(self.config.detector.backend)
+        self._detector_last_error: str | None = None
 
     # -- lifecycle ---------------------------------------------------------------------
 
@@ -170,6 +186,10 @@ class Engine:
             log.info("event_stored_no_sinks", source=event.source, event_type=event.event_type)
             return {"status": "ignored", "event_id": event_id}
 
+        withheld = await self._screen(event, event_id)
+        if withheld is not None:
+            return withheld
+
         await self.store.enqueue_deliveries(event_id, event.sinks)
         log.info(
             "event_accepted",
@@ -179,6 +199,166 @@ class Engine:
             sinks=event.sinks,
         )
         return {"status": "accepted", "event_id": event_id}
+
+    async def _screen(self, event: InboundEvent, event_id: int) -> dict[str, Any] | None:
+        """Score an event's untrusted text and act on the verdict.
+
+        Returns a response body when the event was withheld, and `None` when it should be
+        dispatched normally.
+
+        **Placement.** This runs after the event is durable and before its deliveries are
+        queued. The plan asked for the background delivery path, but `on_detect: quarantine`
+        promises the withheld deliveries were never enqueued, and a verdict reached after the
+        enqueue cannot keep that promise. Persist-then-decide still holds — the event is on
+        disk before anything here runs, so a detector that hangs delays a dispatch and never
+        loses an event. The heuristic backend is in-process regex and costs microseconds; an
+        out-of-process backend would put real latency on the request, and that is the trade a
+        later build has to solve rather than inherit. Recorded in ARCHITECTURE.md.
+        """
+        detector = self._detector
+        if detector is None:
+            return None
+
+        text = self._untrusted_text(event)
+        if not text:
+            # A trusted source, or a parser that declared nothing. There is no attacker-authored
+            # text to score, so nothing is scored and nothing is counted — a detection series
+            # that ticked up here would be measuring events the detector never looked at.
+            return None
+
+        started = time.monotonic()
+        try:
+            result = await detector.score(text)
+        except Exception as exc:  # A backend's failure is this engine's problem, not the event's.
+            result = None
+            self._detector_last_error = repr(exc)
+        elapsed = time.monotonic() - started
+        METRICS.observe("webhook_doorman_detection_latency_seconds", elapsed, backend=detector.name)
+
+        cfg = self.config.detector
+        if result is None:
+            verdict, action = "unavailable", cfg.on_error
+            log_throttled(
+                log,
+                f"degrade:detector:{detector.name}",
+                "detector_unavailable",
+                backend=detector.name,
+                error=self._detector_last_error,
+                action=action,
+            )
+        elif result.score >= cfg.threshold:
+            verdict, action = "flagged", cfg.on_detect
+            self._detector_last_error = None
+        else:
+            verdict, action = "clean", "annotate"
+            self._detector_last_error = None
+
+        METRICS.increment("webhook_doorman_detection_total", source=event.source, verdict=verdict)
+
+        status = {
+            "annotate": EventStatus.RECEIVED,
+            "quarantine": EventStatus.QUARANTINED,
+            "drop": EventStatus.DROPPED,
+        }[action]
+        await self.store.record_detection(
+            event_id,
+            detection=result.as_dict() if result is not None else None,
+            status=status,
+            quarantined_at=utcnow() if status is EventStatus.QUARANTINED else None,
+        )
+
+        if status is EventStatus.RECEIVED:
+            return None
+
+        rules = result.rules if result is not None else []
+        log.warning(
+            "event_withheld",
+            source=event.source,
+            event_type=event.event_type,
+            event_id=event_id,
+            action=action,
+            verdict=verdict,
+            score=result.score if result is not None else None,
+            # Rule names only. The text that matched is the attacker's words, and copying it
+            # here moves the injection from the event log into the log an operator reads.
+            rules=rules,
+        )
+        if status is EventStatus.QUARANTINED:
+            METRICS.increment(
+                "webhook_doorman_events_quarantined_total",
+                source=event.source,
+                rule=rules[0] if rules else "unavailable",
+            )
+        return {"status": status.value, "event_id": event_id}
+
+    @staticmethod
+    def _untrusted_text(event: InboundEvent) -> str:
+        """The attacker-authored text a detector should look at, and nothing else.
+
+        Only the fields the parser marked untrusted, already sanitised by the ingest path. The
+        fence wrapper itself is excluded: it is our text, and scoring it would make the
+        `fence_forgery` rule match on every fenced field.
+        """
+        context = event.template_context()
+        parts = [
+            str(context[name])
+            for name in event.untrusted_fields
+            if name in context and context[name] is not None
+        ]
+        return "\n".join(parts).strip()
+
+    def detector_health(self) -> dict[str, Any]:
+        """The `detector` block of `/health`.
+
+        Reports 200 even when unavailable — a router whose detector is down still routes, and
+        the documented 503 conditions are unchanged. A detector that could flap the container's
+        health status would make an optional annotation into a hard dependency.
+        """
+        cfg = self.config.detector
+        return {
+            "configured": cfg.backend != "none",
+            "backend": cfg.backend,
+            "available": self._detector is not None and self._detector_last_error is None,
+            "last_error": self._detector_last_error,
+        }
+
+    async def list_held(self, *, limit: int, before_id: int | None = None) -> list[HeldEntry]:
+        """Quarantined events, newest first. The clamp on `limit` belongs to the caller."""
+        return await self.store.list_held(limit=limit, before_id=before_id)
+
+    async def release(self, event_id: int) -> dict[str, Any]:
+        """Queue the deliveries a quarantine withheld.
+
+        Raises:
+            LookupError: no such event.
+        """
+        event = await self.store.get_event(event_id)
+        if event is None:
+            raise LookupError(f"event {event_id} not found")
+        if event.status is not EventStatus.QUARANTINED:
+            # Not an error, and deliberately not a re-enqueue: releasing an already-released
+            # event twice would double every delivery, which is the one thing a manual
+            # intervention on a held event must not do.
+            return {"status": "not_quarantined", "event_id": event_id, "state": event.status.value}
+
+        sinks = self._sinks_for(event.source)
+        await self.store.release_event(event_id)
+        if not sinks:
+            return {"status": "no_sinks", "event_id": event_id}
+
+        await self.store.enqueue_deliveries(event_id, sinks)
+        log.warning("event_released", event_id=event_id, source=event.source, sinks=sinks)
+        return {"status": "released", "event_id": event_id, "sinks": sinks}
+
+    def _sinks_for(self, source_name: str) -> list[str]:
+        """The sinks a source routes to, resolved from the current config.
+
+        Shared by `replay` and `release` rather than written twice: both answer "where would
+        this event have gone", and two copies is how they come to disagree after a config
+        change.
+        """
+        source = self.config.source_by_name(source_name)
+        return list(source.sinks) if source else []
 
     async def replay(self, event_id: int) -> dict[str, Any]:
         """Re-queue every delivery for a stored event.
@@ -190,8 +370,7 @@ class Engine:
         if event is None:
             raise LookupError(f"event {event_id} not found")
 
-        source = self.config.source_by_name(event.source)
-        sinks = list(source.sinks) if source else []
+        sinks = self._sinks_for(event.source)
         if not sinks:
             return {"status": "no_sinks", "event_id": event_id}
 

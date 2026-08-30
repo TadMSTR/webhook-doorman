@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 import structlog
 
@@ -46,3 +47,37 @@ def configure_logging(level: str | None = None, log_format: str | None = None) -
         logger_factory=structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,
     )
+
+
+#: Seconds between repeats of the same throttled key. One minute: long enough that an hour of
+#: a down dependency is ~60 lines rather than one per event, short enough that the line is still
+#: present in whatever window an operator is looking at.
+THROTTLE_INTERVAL_SECONDS = 60.0
+
+_last_emitted: dict[str, float] = {}
+
+
+def log_throttled(logger, key: str, event: str, /, **fields) -> bool:
+    """Emit `event` at warning level at most once per `key` per interval.
+
+    A degraded dependency produces one log line per *event* if you let it, and at webhook volume
+    that buries the rest of the log in a repetition of one fact. Ported in spirit from
+    `searxng-mcp`'s `logThrottled`, including the shape of the key: `degrade:<what>`, so the
+    thing being suppressed is greppable and so two different degradations never share a budget.
+
+    Returns:
+        True if the line was emitted, False if it was suppressed. Returned so a caller can count
+        suppressions without the throttle having to know what a metric is.
+    """
+    now = time.monotonic()
+    previous = _last_emitted.get(key)
+    if previous is not None and (now - previous) < THROTTLE_INTERVAL_SECONDS:
+        return False
+    _last_emitted[key] = now
+    logger.warning(event, throttle_key=key, **fields)
+    return True
+
+
+def reset_throttle() -> None:
+    """Forget every throttle key. For tests — a live router has no reason to call this."""
+    _last_emitted.clear()

@@ -390,6 +390,10 @@ class StubEngine:
     def check_admin_token(self, presented: str) -> bool:  # pragma: no cover - not exercised
         return False
 
+    def detector_health(self) -> dict:
+        """`/health` reports the detector from v0.4.0 on. No backend configured here."""
+        return {"configured": False, "backend": "none", "available": False, "last_error": None}
+
 
 def build_with_engine(config_data: dict, env: dict, engine) -> TestClient:
     app = create_app(config=Config.model_validate(config_data), env=env, engine=engine)

@@ -20,6 +20,14 @@ class EventStatus(str, Enum):
     #: Admitted, verified and stored, but refused by the source's `filter` — no sinks were
     #: queued. A terminal state: nothing settles it later, because there is nothing in flight.
     FILTERED = "filtered"
+    #: Held by the detector under `on_detect: quarantine`. Stored, not dispatched, and
+    #: **releasable** — `POST /admin/release/{event_id}` queues the deliveries that were
+    #: withheld. This is the state `GET /admin/held` lists.
+    QUARANTINED = "quarantined"
+    #: Discarded by the detector under `on_detect: drop`. Stored with its verdict, never
+    #: dispatched, and deliberately *not* releasable — that is the whole difference from
+    #: `QUARANTINED`, and the reason the README names `drop` a footgun.
+    DROPPED = "dropped"
 
 
 class DeliveryStatus(str, Enum):
@@ -138,6 +146,28 @@ class Delivery:
     response_code: int | None = None
     latency_ms: int | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class HeldEntry:
+    """One quarantined event, as `GET /admin/held` reports it.
+
+    **Failure metadata only - no payload, no rendered body, no field content.** The same rule as
+    `DlqEntry`, and here it matters more rather than less: the content being withheld is content
+    a detector flagged as an injection attempt, and a list endpoint that returned it would hand
+    that text to whatever reads the admin API. `rules` names what matched; the text that matched
+    is not carried anywhere.
+
+    `event_id` is both the identity and the pagination cursor here, unlike `DlqEntry` where they
+    are different numbers - quarantine is a property of an event, not of a delivery.
+    """
+
+    event_id: int
+    source: str
+    event_type: str
+    score: float | None
+    rules: list[str]
+    quarantined_at: datetime
 
 
 @dataclass(frozen=True)

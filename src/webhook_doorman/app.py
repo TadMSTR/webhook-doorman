@@ -30,7 +30,7 @@ from .config import Config, NoneVerify, load_config
 from .filtering import evaluate as evaluate_filter
 from .filtering import truncate
 from .metrics import METRICS
-from .models import DlqEntry, EventStatus, InboundEvent
+from .models import DlqEntry, EventStatus, HeldEntry, InboundEvent
 from .parsers import get_parser, parse
 from .redaction import redact_bytes, redact_headers, redact_json, redact_text
 from .sanitize import sanitize_structure
@@ -55,6 +55,9 @@ class EngineLike(Protocol):
     async def replay(self, event_id: int) -> dict[str, Any]: ...
     async def stats(self) -> dict[str, int]: ...
     async def list_dlq(self, *, limit: int, before_id: int | None = None) -> list[DlqEntry]: ...
+    async def list_held(self, *, limit: int, before_id: int | None = None) -> list[HeldEntry]: ...
+    async def release(self, event_id: int) -> dict[str, Any]: ...
+    def detector_health(self) -> dict[str, Any]: ...
     def check_admin_token(self, presented: str) -> bool: ...
 
 
@@ -353,6 +356,61 @@ def build_admin_router(engine: EngineLike) -> APIRouter:
             ],
         }
 
+    @router.get("/held")
+    async def list_held(
+        limit: int = DLQ_DEFAULT_LIMIT,
+        before_id: int | None = None,
+        authorization: str = Header(default=""),
+    ) -> dict[str, Any]:
+        """Events the detector is holding, newest first.
+
+        The response carries **failure metadata only** — see `HeldEntry`, and note the reason is
+        sharper here than for the DLQ: the content being withheld is content something flagged
+        as an injection attempt, so an endpoint that returned it would hand that text to whatever
+        reads the admin API. `rules` names what matched; the matched text is not carried.
+
+        Same cursor rule as `/admin/dlq`: keyset on the id, and a cursor only on a full page.
+        """
+        presented = authorization.removeprefix("Bearer ").strip()
+        if not engine.check_admin_token(presented):
+            log.warning("admin_auth_failed", path="/admin/held")
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        effective = max(1, min(limit, DLQ_MAX_LIMIT))
+        entries = await engine.list_held(limit=effective, before_id=before_id)
+        return {
+            "count": len(entries),
+            "limit": effective,
+            "next_before_id": entries[-1].event_id if len(entries) == effective else None,
+            "entries": [
+                {
+                    "event_id": e.event_id,
+                    "source": e.source,
+                    "event_type": e.event_type,
+                    "score": e.score,
+                    "rules": e.rules,
+                    "quarantined_at": e.quarantined_at.isoformat(),
+                }
+                for e in entries
+            ],
+        }
+
+    @router.post("/release/{event_id}")
+    async def release(event_id: int, authorization: str = Header(default="")) -> dict[str, Any]:
+        """Queue the deliveries a quarantine withheld.
+
+        Token first, like `replay` — an unauthenticated caller must not be able to use response
+        codes to probe which event ids are being held.
+        """
+        presented = authorization.removeprefix("Bearer ").strip()
+        if not engine.check_admin_token(presented):
+            log.warning("admin_auth_failed", path=f"/admin/release/{event_id}")
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        try:
+            return await engine.release(event_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="Event not found") from exc
+
     return router
 
 
@@ -403,6 +461,11 @@ def build_health_route(
             "unverified_sources": resolved.unverified_source_names(),
             "replay_enabled": resolved.admin_token() is not None,
         }
+        if engine is not None:
+            # Reported, and deliberately not part of the 503 verdict below. A router whose
+            # detector is down still routes; making an optional annotation able to flap the
+            # container's health status would turn it into a hard dependency.
+            body["detector"] = engine.detector_health()
 
         degraded: list[str] = []
         if not any(state.enabled for state in resolved.sources.values()):
@@ -582,6 +645,7 @@ def create_app(
         untrusted_sources=[
             name for name, s in resolved.sources.items() if s.config.trust == "untrusted"
         ],
+        detector_enabled=resolved.config.detector.backend != "none",
     )
 
     router = APIRouter()

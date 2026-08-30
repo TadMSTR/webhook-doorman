@@ -32,6 +32,7 @@ from ..models import (
     DeliveryStatus,
     DlqEntry,
     EventStatus,
+    HeldEntry,
     InboundEvent,
     StoredEvent,
 )
@@ -440,6 +441,77 @@ class SqliteStore:
             untrusted_fields=json.loads(row["untrusted_fields_json"] or "[]"),
         )
 
+    async def record_detection(
+        self,
+        event_id: int,
+        *,
+        detection: dict | None,
+        status: EventStatus,
+        quarantined_at: datetime | None,
+    ) -> None:
+        """Write one event's detector verdict and the status that followed from it.
+
+        One statement rather than three, so an event can never be found `quarantined` without
+        the verdict that put it there - which is the only thing `GET /admin/held` can show an
+        operator to justify the hold.
+        """
+        await self.db.execute(
+            """
+            UPDATE events
+               SET detection_json = ?, status = ?, quarantined_at = ?
+             WHERE id = ?
+            """,
+            (
+                json.dumps(detection) if detection is not None else None,
+                status.value,
+                _iso(quarantined_at) if quarantined_at is not None else None,
+                event_id,
+            ),
+        )
+
+    async def release_event(self, event_id: int) -> None:
+        """Take an event out of quarantine. The caller queues the deliveries."""
+        await self.db.execute(
+            "UPDATE events SET status = ?, quarantined_at = NULL WHERE id = ?",
+            (EventStatus.RECEIVED.value, event_id),
+        )
+
+    async def list_held(self, *, limit: int, before_id: int | None = None) -> list[HeldEntry]:
+        """Quarantined events, newest first, for `GET /admin/held`.
+
+        Keyset on `events.id` for the same reason `list_dlq` is: the retention sweep deletes
+        rows underneath a paging client, and `OFFSET` skips one row per deletion behind the
+        cursor. Skipping a row in the list of things being withheld is exactly as unacceptable
+        as skipping one in the list of things that failed.
+        """
+        sql = """
+            SELECT id, source, event_type, detection_json, quarantined_at
+              FROM events
+             WHERE status = ?
+        """
+        params: list[object] = [EventStatus.QUARANTINED.value]
+        if before_id is not None:
+            sql += " AND id < ?"
+            params.append(before_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+
+        cursor = await self.db.execute(sql, tuple(params))
+        entries: list[HeldEntry] = []
+        for row in await cursor.fetchall():
+            detection = json.loads(row["detection_json"]) if row["detection_json"] else {}
+            entries.append(
+                HeldEntry(
+                    event_id=int(row["id"]),
+                    source=row["source"],
+                    event_type=row["event_type"],
+                    score=detection.get("score"),
+                    rules=list(detection.get("rules") or []),
+                    quarantined_at=datetime.fromisoformat(row["quarantined_at"]),
+                )
+            )
+        return entries
+
     async def list_dlq(self, *, limit: int, before_id: int | None = None) -> list[DlqEntry]:
         # Keyset, not OFFSET: the retention sweep deletes DLQ rows underneath a paging client,
         # and OFFSET would skip a row for every deletion behind the cursor. `id` is an
@@ -493,6 +565,15 @@ class SqliteStore:
         )
         for row in await cursor.fetchall():
             out[f"deliveries_{row['status']}"] = int(row["n"])
+
+        # Point-in-time, and read from the table rather than accumulated in the process, so a
+        # release takes it back down and a restart does not reset it to zero while rows are
+        # still held.
+        held = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM events WHERE status = ?",
+            (EventStatus.QUARANTINED.value,),
+        )
+        out["events_quarantined"] = int(held["n"]) if held else 0
         return out
 
     # -- maintenance -------------------------------------------------------------------

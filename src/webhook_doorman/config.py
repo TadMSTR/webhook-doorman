@@ -564,6 +564,33 @@ class MetricsConfig(_Strict):
     min_token_length: int = 32
 
 
+class DetectorConfig(_Strict):
+    """Prompt-injection detection: which backend, and what a hit is allowed to do.
+
+    Off by default (`backend: none`), which is what keeps an existing config unchanged.
+
+    **`on_error` has no `drop` member, and that is the point.** Discarding an event because the
+    *detector* failed is the fail-open/fail-lossy trade this project refuses: it makes a
+    dependency's outage into silent data loss, and it is the same shape as skipping verification
+    when a secret is missing. Pydantic rejects it at load with the ordinary Literal error, so
+    there is no path where an operator configures it and finds out later. `on_detect` does offer
+    `drop`, for an operator who has decided that is what they want - it is named a footgun in
+    the README and it is not the default.
+    """
+
+    backend: Literal["none", "heuristic"] = "none"
+    threshold: float = 0.8
+    on_detect: Literal["annotate", "quarantine", "drop"] = "annotate"
+    on_error: Literal["annotate", "quarantine"] = "annotate"
+
+    @field_validator("threshold")
+    @classmethod
+    def _within_range(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("must be between 0.0 and 1.0")
+        return v
+
+
 class Config(_Strict):
     sources: list[SourceConfig]
     sinks: list[SinkSpec]
@@ -572,6 +599,7 @@ class Config(_Strict):
     delivery: DeliveryConfig = Field(default_factory=DeliveryConfig)
     admin: AdminConfig = Field(default_factory=AdminConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    detector: DetectorConfig = Field(default_factory=DetectorConfig)
 
     @model_validator(mode="after")
     def _cross_check(self):

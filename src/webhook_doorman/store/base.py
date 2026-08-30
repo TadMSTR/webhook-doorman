@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
-from ..models import Delivery, DlqEntry, InboundEvent, StoredEvent
+from ..models import Delivery, DlqEntry, EventStatus, HeldEntry, InboundEvent, StoredEvent
 
 
 @runtime_checkable
@@ -102,6 +102,30 @@ class Store(Protocol):
         while an operator is paging, and under `OFFSET` every deletion behind the cursor shifts
         the window and silently skips a row. Skipping rows in the queue of things that failed is
         the one place that is least acceptable.
+        """
+        ...
+
+    async def record_detection(
+        self,
+        event_id: int,
+        *,
+        detection: dict | None,
+        status: EventStatus,
+        quarantined_at: datetime | None,
+    ) -> None:
+        """Record a detector verdict and the status it produced, in one write.
+
+        `detection` is `None` only when the detector could not evaluate the event — which is a
+        different fact from a score of zero and is stored as a different value.
+        """
+
+    async def release_event(self, event_id: int) -> None:
+        """Return a quarantined event to `received`. The caller queues the deliveries."""
+
+    async def list_held(self, *, limit: int, before_id: int | None = None) -> list[HeldEntry]:
+        """Quarantined events, newest first, for `GET /admin/held`.
+
+        Same keyset rule and same metadata-only rule as `list_dlq` — see `HeldEntry`.
         """
         ...
 
