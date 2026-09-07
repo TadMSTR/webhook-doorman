@@ -5,6 +5,66 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-09-07
+
+Supply-chain release. **No behavioural change to the service** — an existing 0.4.0 config runs
+identically. What changed is what the project can prove about the image it publishes.
+
+### The dependency tree that ships is now pinned and audited
+
+`Dockerfile` ran `pip install '.[otel]'`: a fresh resolve at image-build time. The CI audit job
+separately extracted the declared version *ranges* and ran `pip-audit -r` on them, which
+re-resolves again. Those were two different resolutions at two different moments, and neither
+was the tree in the published image — so the multi-arch image on GHCR had a dependency set that
+nothing had audited.
+
+- `uv.lock` is committed and is the source of truth. The image installs from it with
+  `--require-hashes --no-deps`, so the build resolves nothing.
+- The audit reads the lock through an exported PEP 751 `pylock.toml` with `pip-audit --locked`,
+  which also resolves nothing. `-r` is not an alternative: it runs a pip dry-run resolution even
+  with `--no-deps`.
+- Split into **runtime** and **dev** gates. Dev dependencies were previously unaudited entirely.
+- Declared ranges are bounded (`>=x,<next-major`) rather than bare floors.
+- Dependabot maintains the lock, on the `uv` ecosystem — `pip` would update `pyproject.toml`
+  and leave `uv.lock` frozen.
+
+No vulnerabilities were found in the 0.4.0 image while making this change; the gap was that
+nothing was looking.
+
+### The published image is verified before it is pushed
+
+`publish.yml` built and pushed in a single step, so nothing tested the artefact until after it
+was public. It now builds amd64, verifies it, then pushes multi-arch. The arm64 leg is built
+from the same Dockerfile and lock but is not itself smoke-tested — noted in the workflow rather
+than left to assumption.
+
+CI and the publish path now run the *same* script, `.github/ci/verify-image.sh`, so a gate
+cannot apply to one path and silently not the other.
+
+### CI asserts the service contract, not liveness
+
+The image job checked contents, runtime uid and `--version`. It never asserted what the service
+does. It now asserts, against the running container: an unsigned request is refused, a wrongly
+signed request is refused, and **a correctly signed request is accepted**. The accept case is
+the load-bearing one — without it a build whose verification rejected everything would pass
+identically to one that works.
+
+### Also
+
+- Build provenance attestation on the published image.
+- Both `python:3.13-slim` base stages pinned by digest as well as tag, matching the uv build
+  stage. A floating tag can be repointed at new content with nothing in git recording it, and
+  Dependabot's tag-only tracking does not see that. The rebuilt image is byte-identical, so
+  the pin records what was already being pulled rather than changing it.
+- CodeQL (`python` and `actions`), OSSF Scorecard, `CODEOWNERS`, `dependabot.yml`.
+- `packages: write` moved from workflow level to the single job that pushes.
+- Coverage floor 80 → 95, with the measured figure (96.95%, 669 tests) and date recorded beside
+  it; the flat 80 permitted a silent seventeen-point regression.
+- `webhook-doorman --check` runs over every shipped example in CI, through the installed wheel.
+- `docs/` is now a navigable set with an `index.md`; the configuration reference and the
+  security model moved out of a 451-line README into `docs/configuration.md` and
+  `docs/security.md`.
+
 ## [0.4.0] — 2026-08-30
 
 A content-safety layer for destinations that feed an LLM agent, and the schema migration path
@@ -379,6 +439,7 @@ First release. Security-audited before tagging: one Medium finding, resolved bel
   redacted before storage, collapsing every event onto one dedup id and silently discarding all
   but the first.
 
+[0.5.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.5.0
 [0.4.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.4.0
 [0.3.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.3.0
 [0.2.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.2.0

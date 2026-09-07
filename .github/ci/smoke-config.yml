@@ -1,0 +1,28 @@
+# Fixture for the CI image smoke test. Not an example and not a template — `examples/` is the
+# documented set and is exercised separately by `--check`. This file exists so the smoke test
+# can assert the *service contract* (does verification actually accept and reject?) against a
+# source whose secret the test knows.
+#
+# The sink is deliberately an unroutable address. A correctly-signed request must still answer
+# 200: acceptance is decided by verification, and delivery happens after the response. Pointing
+# it at something reachable would make the test depend on a network path it is not testing.
+sources:
+  - name: smoke
+    path: /webhook/smoke
+    parser: generic
+    verify:
+      strategy: hmac_sha256
+      header: X-Smoke-Signature
+      encoding: hex
+      prefix: "sha256="
+      secret_env: SMOKE_SECRET
+    sinks: [blackhole]
+
+sinks:
+  - name: blackhole
+    type: http
+    url_env: SMOKE_SINK_URL
+    method: POST
+    content_type: application/json
+    template: |
+      {"source": "{{ source }}", "summary": "{{ summary }}"}
