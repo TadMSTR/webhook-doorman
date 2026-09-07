@@ -75,10 +75,16 @@ jobs:
           webhook-doorman --version
           webhook-doorman --config config.example.yml --check
 
-      # Every shipped example is parsed, on every PR. This repo is the reason the Flagship
-      # standard carries this requirement: a config router whose own published examples do not
-      # load is the worst failure it has available. searxng-mcp's compose examples rotted
-      # exactly this way — syntactically present, functionally wrong, because nothing ran them.
+      # Every shipped example, through the INSTALLED wheel's CLI, on every PR.
+      #
+      # tests/test_examples.py already loads each example via load_config(), so this is not the
+      # first thing to read them. It is a different claim: that `webhook-doorman --check` — the
+      # command an adopter actually runs before a deploy — works against the built artefact.
+      # A packaging fault that breaks the entry point is invisible to a library-level test.
+      #
+      # A config router whose own published examples do not load is the worst failure available
+      # to it. searxng-mcp's compose examples rotted exactly that way — syntactically present,
+      # functionally wrong, because nothing exercised them on a PR.
       #
       # The count assertion is not decoration. `for f in examples/*.yml` over an empty or
       # renamed directory iterates zero times and exits 0, so without a floor this step would
