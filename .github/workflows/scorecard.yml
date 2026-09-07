@@ -2,10 +2,13 @@
 #
 # TREAT THE SCORE AS A MEASUREMENT, NOT A TARGET. Several checks assess things this repository
 # deliberately does not do (signed releases, branch protection on a single-maintainer project),
-# and chasing the number would mean adopting process for the sake of a metric. The first result
-# is recorded verbatim in the PR that added this workflow, as a baseline — the same discipline
-# the coverage floor in pyproject.toml is under (vikunja#680): record what was measured, with a
-# date, so a later reader can tell a deliberate value from a stale one.
+# and chasing the number would mean adopting process for the sake of a metric.
+#
+# The first result is recorded as a baseline in CHANGELOG.md once it exists — the same
+# discipline the coverage floor in pyproject.toml is under (vikunja#680): record what was
+# measured, with a date, so a later reader can tell a deliberate value from a stale one. Note
+# that this workflow has no `pull_request` trigger, so the baseline cannot come from the PR
+# that adds it; the first run is the first push to main afterwards.
 #
 # What it is genuinely good at is catching regressions in things this repo does care about: an
 # unpinned action appearing in a workflow, a dependency update path going stale, a token
