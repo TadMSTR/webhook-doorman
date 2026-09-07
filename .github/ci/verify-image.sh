@@ -15,10 +15,14 @@ set -euo pipefail
 
 IMAGE="${1:?usage: verify-image.sh <image-tag>}"
 WORK="$(mktemp -d)"
-CONTAINER=""
 
+# Every scratch container this script creates is named with the PID suffix, and all three are
+# removed unconditionally on exit. Naming matters: a bare name like "probe" is host-global in
+# Docker, so a collision would target something that is not ours. Removing them in the trap
+# rather than only inline matters too — `set -e` aborts on the first failing gate, and an
+# inline-only `docker rm` leaks a container on exactly the runs that failed.
 cleanup() {
-  [ -n "$CONTAINER" ] && docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  docker rm -f "wd-contents-$$" "wd-audit-$$" "wd-smoke-$$" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
