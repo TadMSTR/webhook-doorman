@@ -52,6 +52,10 @@ identically to one that works.
 ### Also
 
 - Build provenance attestation on the published image.
+- Both `python:3.13-slim` base stages pinned by digest as well as tag, matching the uv build
+  stage. A floating tag can be repointed at new content with nothing in git recording it, and
+  Dependabot's tag-only tracking does not see that. The rebuilt image is byte-identical, so
+  the pin records what was already being pulled rather than changing it.
 - CodeQL (`python` and `actions`), OSSF Scorecard, `CODEOWNERS`, `dependabot.yml`.
 - `packages: write` moved from workflow level to the single job that pushes.
 - Coverage floor 80 → 95, with the measured figure (96.95%, 669 tests) and date recorded beside

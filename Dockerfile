@@ -4,7 +4,21 @@
 # The builder produces a self-contained virtualenv. Nothing from this stage reaches the final
 # image except /opt/venv, so build tooling, the source tree and pip's cache stay out of the
 # published layers.
-FROM python:3.13-slim AS builder
+#
+# Pinned by tag AND digest, for the same reason the uv stage below is: a mutable tag is an
+# unpinned dependency wearing a version number. Docker Hub can repoint `3.13-slim` at new
+# content at any time, so without the digest two builds of an unchanged Dockerfile can pull
+# different base layers with nothing in git recording it — which would undercut the
+# reproducibility the lockfile and the audit gates are there to provide.
+#
+# Dependabot's `docker` ecosystem does NOT close this on its own while tag-pinned: it opens a
+# PR when the version tag moves (3.13 -> 3.14), not when content changes behind an unchanged
+# tag. Once digest-pinned it tracks digest bumps, so this costs no unmanaged maintenance.
+#
+# This digest is an OCI image index covering linux/amd64 and linux/arm64 (verified), so the
+# multi-arch publish still resolves per-platform. Do not replace it with a single-platform
+# digest — that would break the arm64 leg.
+FROM python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285 AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
@@ -39,7 +53,8 @@ RUN uv export --frozen --no-dev --extra otel --no-emit-project \
  && /opt/venv/bin/pip install --no-deps .
 
 # --- runtime ----------------------------------------------------------------------------------
-FROM python:3.13-slim AS runtime
+# Same digest as the builder stage above, and it must stay that way — see the reasoning there.
+FROM python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285 AS runtime
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
