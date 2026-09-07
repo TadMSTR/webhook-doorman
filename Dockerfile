@@ -11,14 +11,32 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 
 WORKDIR /src
 
+# uv is here only to turn uv.lock into a hash-pinned requirements file. Pinned by digest as
+# well as tag, because a mutable tag in a build stage is an unpinned dependency wearing a
+# version number.
+COPY --from=ghcr.io/astral-sh/uv:0.12.10@sha256:2bb3ebca0a796a155094a27773d290c4b074572e6107f171d88d086682fd2500 /uv /usr/local/bin/uv
+
 # README and LICENSE are referenced by pyproject metadata; the build fails without them.
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
 
+# This install resolves NOTHING. It previously ran `pip install '.[otel]'`, which re-resolved
+# every dependency at build time — so the published image's tree was decided by whatever PyPI
+# served that minute, and matched no audited set anywhere. That is vikunja#670: the CI audit and
+# the image build were two separate resolves, and only the image shipped.
+#
+# `uv export` reads the committed lock and emits exact versions with hashes; `--require-hashes`
+# makes pip refuse anything whose artefact does not match. `--no-deps` on both installs stops
+# pip re-deriving a dependency graph the lock already fixed.
+#
 # `[otel]` is included in the image so enabling tracing is one environment variable rather than
 # a derived image. An adopter who never sets OTEL_EXPORTER_OTLP_ENDPOINT pays image size and
 # nothing else — tracing.py imports none of it unless that variable is set.
-RUN python -m venv /opt/venv && /opt/venv/bin/pip install '.[otel]'
+RUN uv export --frozen --no-dev --extra otel --no-emit-project \
+        --format requirements.txt -o /tmp/requirements.txt \
+ && python -m venv /opt/venv \
+ && /opt/venv/bin/pip install --require-hashes --no-deps -r /tmp/requirements.txt \
+ && /opt/venv/bin/pip install --no-deps .
 
 # --- runtime ----------------------------------------------------------------------------------
 FROM python:3.13-slim AS runtime

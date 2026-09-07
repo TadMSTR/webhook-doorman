@@ -1,0 +1,52 @@
+# Dependabot configuration.
+#
+# This file is not optional scaffolding here. A committed lockfile without something maintaining
+# it is a *freeze*, not an improvement — pinned-and-forgotten is a different failure, not the
+# absence of one. vikunja#670 says so explicitly, and uv.lock landed in the same change as this
+# file for that reason.
+#
+# The ecosystem is `uv`, NOT `pip`. They are separate ecosystems in Dependabot, and the
+# distinction is load-bearing: `pip` would update pyproject.toml and leave uv.lock untouched,
+# which is precisely the frozen-lock failure above, wearing the appearance of coverage.
+#
+# Majors are ignored for every dependency. A semver-major bump is a reading task, not a merge
+# task, and the bounded ranges in pyproject.toml already stop one arriving silently — that is
+# what vikunja#627 was: `fastmcp>=2.0` resolving to 4.0.1, two majors past anything tested,
+# unobserved for ten days. To take a major, do it by hand and read the upstream changelog.
+version: 2
+
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    # Dev dependencies batch into one PR. They update often and none of them ship in the image,
+    # so one PR per bump would drown the runtime updates that actually need reading.
+    groups:
+      dev-dependencies:
+        dependency-type: "development"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Actions are SHA-pinned with a trailing version comment (see .github/workflows/*.yml).
+    # Dependabot understands SHA pins and bumps the SHA while updating that comment, so pinning
+    # costs no update coverage.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # The base image and the uv build stage are dependencies of the published artefact just as
+  # much as anything in the lock, and nothing else in this repo watches them.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]

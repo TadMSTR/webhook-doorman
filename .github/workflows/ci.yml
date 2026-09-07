@@ -30,6 +30,12 @@ jobs:
       # `[otel]` too, so the tracing happy path is actually exercised rather than skipped. The
       # degraded path — endpoint set, extra absent — does not depend on this: it forces the
       # ImportError deterministically, so it runs identically with or without the extra.
+      #
+      # Deliberately installs from the declared ranges, NOT from uv.lock, and that asymmetry is
+      # the point: this job answers "do the versions we permit still work", while the image
+      # gates answer "is the version set we actually ship sound". Pinning this to the lock too
+      # would leave nothing watching the ceilings in pyproject.toml, and a range that has
+      # silently stopped working is how vikunja#627 went unnoticed for ten days.
       - name: Install
         run: pip install -e ".[dev,otel]"
 
@@ -68,6 +74,25 @@ jobs:
           python -c "import webhook_doorman; print(webhook_doorman.__version__)"
           webhook-doorman --version
           webhook-doorman --config config.example.yml --check
+
+      # Every shipped example is parsed, on every PR. This repo is the reason the Flagship
+      # standard carries this requirement: a config router whose own published examples do not
+      # load is the worst failure it has available. searxng-mcp's compose examples rotted
+      # exactly this way — syntactically present, functionally wrong, because nothing ran them.
+      #
+      # The count assertion is not decoration. `for f in examples/*.yml` over an empty or
+      # renamed directory iterates zero times and exits 0, so without a floor this step would
+      # report success precisely when it had stopped checking anything.
+      - name: Check every shipped example parses
+        run: |
+          shopt -s nullglob
+          files=(examples/*.yml)
+          echo "found ${#files[@]} example(s)"
+          [ "${#files[@]}" -ge 5 ] || { echo "::error::expected at least 5 examples, found ${#files[@]} — this gate is not checking what it claims"; exit 1; }
+          for f in "${files[@]}"; do
+            echo "--- $f"
+            webhook-doorman --config "$f" --check
+          done
 
   image:
     name: Image build and verification
@@ -120,24 +145,46 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
       - name: Install pip-audit
         run: pip install pip-audit
 
-      # pip-audit scans the *environment* by default, which has two failure modes here: a job
-      # that installs only pip-audit ends up auditing pip-audit's own dependency tree and passes
-      # while this project's dependencies go unchecked, and installing this project makes
-      # --strict fail on webhook-doorman itself, which is not published to PyPI.
-      #
-      # Auditing an explicit requirements file avoids both. The list is generated from
-      # pyproject.toml rather than duplicated, so a dependency added there cannot be missed here.
-      - name: Extract declared dependencies
-        run: |
-          python - <<'PY' > requirements-audit.txt
-          import pathlib, tomllib
-          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
-          print("\n".join(data["project"]["dependencies"]))
-          PY
-          cat requirements-audit.txt
+      # A lockfile that has drifted from pyproject.toml describes a tree nobody installs, which
+      # is the same defect this job was rebuilt to remove, relocated one file over. `--check`
+      # fails on drift instead of silently re-resolving to paper over it.
+      - name: Assert the lockfile matches pyproject.toml
+        run: uv lock --check
 
-      - name: Audit dependencies
-        run: pip-audit --strict -r requirements-audit.txt
+      # Two gates, not one widened gate. Merging them makes "something we ship is vulnerable"
+      # indistinguishable from "something we build with is vulnerable", and those warrant
+      # different urgency and different responses.
+      #
+      # There is deliberately no third gate for container sub-projects — the Flagship standard
+      # asks for one where they exist and this repo has none. The image is built from this same
+      # workspace and this same lock, and is audited from its own installed tree in the `image`
+      # job above. Stated rather than left as an apparent omission.
+      #
+      # `--locked` against an exported PEP 751 pylock reads the pinned versions and resolves
+      # nothing. This job previously extracted `project.dependencies` — range specs — into a
+      # requirements file and ran `pip-audit -r` on it, which re-resolves and therefore reported
+      # on whatever a fresh install would get that minute. `-r` is not a fix for this even with
+      # exact pins: it runs a pip dry-run resolution regardless of --no-deps. That is
+      # vikunja#670, and vikunja#633 is the case where the same shape read a dependency green
+      # while the deployed container ran a version with four HIGH advisories.
+      - name: Audit runtime dependencies
+        run: |
+          mkdir -p audit-runtime
+          uv export --frozen --no-dev --extra otel --no-emit-project \
+            --format pylock.toml -o audit-runtime/pylock.toml
+          pip-audit --strict --locked audit-runtime
+
+      # Dev dependencies were not audited at all before this. They are not shipped, but they run
+      # in CI with a checkout and a token.
+      - name: Audit dev dependencies
+        run: |
+          mkdir -p audit-dev
+          uv export --frozen --extra dev --extra otel --no-emit-project \
+            --format pylock.toml -o audit-dev/pylock.toml
+          pip-audit --strict --locked audit-dev
