@@ -213,6 +213,7 @@ Full index: **[docs/index.md](docs/index.md)**.
 | [docs/configuration.md](docs/configuration.md) | Sources, sinks, verification strategies, guard rails on unverified sources |
 | [docs/deployment.md](docs/deployment.md) | Exposure, file-permission traps, reverse proxy, migrating from an existing receiver |
 | [docs/security.md](docs/security.md) | Exposure model, verification guarantees, the content-safety layer |
+| [docs/security-audit.md](docs/security-audit.md) | Audit history, findings and remediation across five reviews |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Design decisions, extension points, what is protected and what is not |
 | [SECURITY.md](SECURITY.md) | Reporting a vulnerability, threat model boundaries |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Adding a source, sink or strategy; code style; tests |

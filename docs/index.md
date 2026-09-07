@@ -13,6 +13,7 @@ the map of everything below it.
 | [configuration.md](configuration.md) | Writing or changing a `config.yml` — sources, sinks, verification strategies |
 | [deployment.md](deployment.md) | Running it: exposure, file permissions, reverse proxy, migrating from an existing receiver |
 | [security.md](security.md) | Deciding what to point at it, or what it protects you from |
+| [security-audit.md](security-audit.md) | What independent review has found, and what was done about it |
 
 ## Reference
 
