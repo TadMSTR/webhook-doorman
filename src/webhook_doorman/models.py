@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
@@ -13,7 +13,7 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-class EventStatus(str, Enum):
+class EventStatus(StrEnum):
     RECEIVED = "received"
     DISPATCHED = "dispatched"
     FAILED = "failed"
@@ -30,7 +30,7 @@ class EventStatus(str, Enum):
     DROPPED = "dropped"
 
 
-class DeliveryStatus(str, Enum):
+class DeliveryStatus(StrEnum):
     PENDING = "pending"
     IN_FLIGHT = "in_flight"
     DELIVERED = "delivered"
