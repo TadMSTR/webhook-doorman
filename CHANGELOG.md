@@ -5,6 +5,19 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+## [Unreleased]
+
+### Changed
+- **Dependabot `github-actions`: explicit `open-pull-requests-limit: 13` and a narrow
+  `github/codeql-action*` group on both update channels.** The ecosystem sat at the default
+  cap of 5, where Dependabot stops raising further bumps without saying so. codeql-action's
+  `init` / `analyze` / `upload-sarif` were being bumped as separate PRs, splitting a set that
+  must move together (CodeQL aborts `neutral`, not `failure`). The group is repeated with
+  `applies-to: security-updates` because a group without `applies-to` covers version updates
+  only. Supersedes Dependabot PRs #19, #21 and #22.
+- **codeql-action v4.37.9 → v4.38.2**, all three subpaths on one SHA in one commit.
+
 ## [0.5.0] — 2026-09-07
 
 Supply-chain release. **No behavioural change to the service** — an existing 0.4.0 config runs
