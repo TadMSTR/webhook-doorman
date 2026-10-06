@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Dependabot `uv`: `opentelemetry` and `dev-tools` groups.** Every per-package OTel PR
+  already moved the whole family in `uv.lock`, so they were one change filed several times.
+  `dev-dependencies` never caught the tools because `dev` is an optional-dependencies extra,
+  not a `[dependency-groups]` table, so ruff arrived on its own. Both groups sit above
+  `dev-dependencies`, since a dependency joins the first group it matches (vikunja#1031).
 - **Dependabot `github-actions`: explicit `open-pull-requests-limit: 13` and a narrow
   `github/codeql-action*` group on both update channels.** The ecosystem sat at the default
   cap of 5, where Dependabot stops raising further bumps without saying so. codeql-action's
@@ -17,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `applies-to: security-updates` because a group without `applies-to` covers version updates
   only. Supersedes Dependabot PRs #19, #21 and #22.
 - **codeql-action v4.37.9 → v4.38.2**, all three subpaths on one SHA in one commit.
+
+### Security
+- **urllib3 2.7.0 → 2.8.0 in `uv.lock`** (PYSEC-2026-4175/4176/4177). Transitive, so no
+  Dependabot PR touched it. It failed both `Dependency audit` and `Image build and
+  verification`, which audits the built image's site-packages (vikunja#1031).
 
 ## [0.5.0] — 2026-09-07
 
