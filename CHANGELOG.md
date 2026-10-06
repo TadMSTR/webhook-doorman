@@ -8,7 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-10-06
+
+Dependency release. No application code changed.
+
 ### Changed
+- **OpenTelemetry 1.44.0 → 1.45.0** (instrumentation 0.65b0 → 0.66b0), the whole family in
+  one group PR (#34). Two new transitive packages arrive with it:
+  `opentelemetry-exporter-otlp-common` and `opentelemetry-exporter-http-transport` 0.66b0.
+- **CI actions:** docker/build-push-action 7.3.0 → 7.4.0, docker/setup-buildx-action
+  4.3.0 → 4.4.1, docker/setup-qemu-action 4.3.0 → 4.4.0, astral-sh/setup-uv 10.0.1 → 10.2.0.
+  ruff 0.16.6 → 0.16.10 (dev only).
 - **Dependabot `uv`: `opentelemetry` and `dev-tools` groups.** Every per-package OTel PR
   already moved the whole family in `uv.lock`, so they were one change filed several times.
   `dev-dependencies` never caught the tools because `dev` is an optional-dependencies extra,
@@ -462,6 +472,7 @@ First release. Security-audited before tagging: one Medium finding, resolved bel
   redacted before storage, collapsing every event onto one dedup id and silently discarding all
   but the first.
 
+[0.5.1]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.5.1
 [0.5.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.5.0
 [0.4.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.4.0
 [0.3.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.3.0
