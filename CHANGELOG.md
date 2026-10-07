@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **FastAPI 0.142 no longer gets to export telemetry on its own.** 0.142 added native
+  OpenTelemetry. On lifespan startup it reads `OTEL_EXPORTER_OTLP_ENDPOINT`, which is the variable
+  this router already uses as its tracing switch, and attaches its own OTLP exporter to the
+  installed TracerProvider without deduplicating. With tracing on, that doubled every exported
+  span (span processors 1 → 2). It also installed SDK meter and logger providers and started a
+  metrics stream to the collector that nothing here configured. `create_app` now passes
+  `telemetry={"auto_configure": False}`. Before 0.142 that keyword lands in `app.extra` and is
+  inert, so the declared range is unchanged. A regression test asserts the provider still has
+  exactly one processor after lifespan startup, and that no SDK meter or logger provider appears.
+  Without the fix, the test fails on that assertion.
+
+### Added
+- **CI: `Image Python is in the test matrix`.** Fails when any `FROM python:X.Y` in the
+  Dockerfile has no matching matrix entry, so a base-image bump cannot land without a test leg
+  for it (vikunja#729). Both lists have a non-empty floor, so an unparsed file fails instead of
+  agreeing vacuously.
+
 ### Changed
 - **Image base: `python:3.13-slim` → `python:3.14-slim`**, digest-pinned to today's multi-arch
   index (`sha256:f85c5697…`) in both stages. Supersedes Dependabot #7, whose digest dated from
@@ -16,12 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   openssl/libssl3t64, libsqlite3-0, gzip, libpcre2-8-0) and none on the new base.
 - **CI matrix gains 3.14**, so the interpreter the image ships is one the suite runs on.
   669 tests pass on 3.14.8.
-
-### Added
-- **CI: `Image Python is in the test matrix`.** Fails when any `FROM python:X.Y` in the
-  Dockerfile has no matching matrix entry, so a base-image bump cannot land without a test leg
-  for it (vikunja#729). Both lists have a non-empty floor, so an unparsed file fails instead of
-  agreeing vacuously.
+- **fastapi 0.141.1 → 0.142.2** in `uv.lock`, which supersedes Dependabot #31. It brings
+  `opentelemetry-api` in as a base dependency of fastapi. That's the API only, with no SDK or
+  exporter. 0.142.1 and 0.142.2 are bug fixes (router endpoint wrapping, and startup when
+  auto-configuration fails).
 
 ### Known
 - pip's vendored bundle still carries msgpack 1.1.2, setuptools 70.3.0 and urllib3 2.7.0

@@ -629,6 +629,14 @@ def create_app(
         version=__version__,
         description="A fail-closed inbound webhook router.",
         lifespan=lifespan,
+        # tracing.py owns OpenTelemetry export, and it is the only thing that may. FastAPI
+        # 0.142 added native telemetry that, on lifespan startup, reads the same
+        # OTEL_EXPORTER_OTLP_ENDPOINT and attaches its OWN exporter to whatever TracerProvider
+        # is already installed. It does not deduplicate. Measured: with tracing on, span
+        # processors went from 1 to 2 (every span exported twice), and an SDK MeterProvider +
+        # LoggerProvider appeared and began exporting metrics nobody configured. Before 0.142
+        # this keyword lands in `app.extra` and does nothing, so it is safe across the range.
+        telemetry={"auto_configure": False},
     )
     app.state.resolved = resolved
     app.state.engine = engine
