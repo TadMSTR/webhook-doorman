@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-07
+
+Python 3.14 image, and a fix for FastAPI 0.142 exporting telemetry on its own. Minor rather
+than patch because the image's interpreter changes (3.13 → 3.14). **Redeploying clears the
+8 fixable OS HIGH/CRITICAL findings in the 0.5.1 image** (vikunja#1033), including a CRITICAL
+in perl-base.
+
 ### Fixed
 - **FastAPI 0.142 no longer gets to export telemetry on its own.** 0.142 added native
   OpenTelemetry. On lifespan startup it reads `OTEL_EXPORTER_OTLP_ENDPOINT`, which is the variable
@@ -509,6 +516,7 @@ First release. Security-audited before tagging: one Medium finding, resolved bel
   redacted before storage, collapsing every event onto one dedup id and silently discarding all
   but the first.
 
+[0.6.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.6.0
 [0.5.1]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.5.1
 [0.5.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.5.0
 [0.4.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.4.0
