@@ -17,7 +17,7 @@ pytest
 ruff check . && ruff format --check .
 ```
 
-Python 3.11 is the floor. CI runs 3.11, 3.12 and 3.13.
+Python 3.11 is the floor. CI runs 3.11, 3.12, 3.13 and 3.14.
 
 ## The bar
 
@@ -112,7 +112,7 @@ blanket exemption for `tests/` would hide exactly the mistake it exists to catch
 
 ## Pull requests
 
-- Branch from `main`. CI must be green: lint, format, the 3.11/3.12/3.13 matrix, the wheel build,
+- Branch from `main`. CI must be green: lint, format, the 3.11/3.12/3.13/3.14 matrix, the wheel build,
   `pip-audit --strict`, and the image-contents check.
 - Explain **why**, not just what. The diff shows what changed.
 - Update `CHANGELOG.md` under `## [Unreleased]`.

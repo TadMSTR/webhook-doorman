@@ -6,7 +6,7 @@
 # published layers.
 #
 # Pinned by tag AND digest, for the same reason the uv stage below is: a mutable tag is an
-# unpinned dependency wearing a version number. Docker Hub can repoint `3.13-slim` at new
+# unpinned dependency wearing a version number. Docker Hub can repoint `3.14-slim` at new
 # content at any time, so without the digest two builds of an unchanged Dockerfile can pull
 # different base layers with nothing in git recording it — which would undercut the
 # reproducibility the lockfile and the audit gates are there to provide.
@@ -18,7 +18,7 @@
 # This digest is an OCI image index covering linux/amd64 and linux/arm64 (verified), so the
 # multi-arch publish still resolves per-platform. Do not replace it with a single-platform
 # digest — that would break the arm64 leg.
-FROM python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285 AS builder
+FROM python:3.14-slim@sha256:f85c5697265c178cc6887276c55fe16cf3d14ca35c3df6a5eab3b360534a55d2 AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
@@ -54,7 +54,7 @@ RUN uv export --frozen --no-dev --extra otel --no-emit-project \
 
 # --- runtime ----------------------------------------------------------------------------------
 # Same digest as the builder stage above, and it must stay that way — see the reasoning there.
-FROM python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285 AS runtime
+FROM python:3.14-slim@sha256:f85c5697265c178cc6887276c55fe16cf3d14ca35c3df6a5eab3b360534a55d2 AS runtime
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \

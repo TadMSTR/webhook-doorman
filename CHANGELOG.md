@@ -20,11 +20,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly one processor after lifespan startup, and that no SDK meter or logger provider appears.
   Without the fix, the test fails on that assertion.
 
+### Added
+- **CI: `Image Python is in the test matrix`.** Fails when any `FROM python:X.Y` in the
+  Dockerfile has no matching matrix entry, so a base-image bump cannot land without a test leg
+  for it (vikunja#729). Both lists have a non-empty floor, so an unparsed file fails instead of
+  agreeing vacuously.
+
 ### Changed
+- **Image base: `python:3.13-slim` → `python:3.14-slim`**, digest-pinned to today's multi-arch
+  index (`sha256:f85c5697…`) in both stages. Supersedes Dependabot #7, whose digest dated from
+  2026-09-07. The move also clears every OS-level finding in the published 0.5.1 image: Trivy
+  (`HIGH,CRITICAL --ignore-unfixed`) reports 8 fixable OS packages there (perl-base CRITICAL,
+  openssl/libssl3t64, libsqlite3-0, gzip, libpcre2-8-0) and none on the new base.
+- **CI matrix gains 3.14**, so the interpreter the image ships is one the suite runs on.
+  669 tests pass on 3.14.8.
 - **fastapi 0.141.1 → 0.142.2** in `uv.lock`, which supersedes Dependabot #31. It brings
   `opentelemetry-api` in as a base dependency of fastapi. That's the API only, with no SDK or
   exporter. 0.142.1 and 0.142.2 are bug fixes (router endpoint wrapping, and startup when
   auto-configuration fails).
+
+### Known
+- pip's vendored bundle still carries msgpack 1.1.2, setuptools 70.3.0 and urllib3 2.7.0
+  (pip 26.2.1, the current release), in both the base image's pip and the venv's. They are
+  identical on 3.13 and 3.14, so this change neither adds nor removes them. The image's own
+  urllib3 is 2.8.0. This repo has no Trivy gate, which is why the OS findings above shipped.
 
 ## [0.5.1] — 2026-10-06
 
