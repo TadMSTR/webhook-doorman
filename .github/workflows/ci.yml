@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -47,6 +47,32 @@ jobs:
 
       - name: Tests
         run: pytest
+
+  # The image's Python and the test matrix are two declarations of one fact, and nothing kept
+  # them aligned: a base-image bump (Dependabot #7, 3.13 -> 3.14) was green and would have
+  # shipped an interpreter the suite never ran on (vikunja#729). This turns the coincidence
+  # into a checked property. A base-image bump now fails here until the matrix gains the
+  # same version, so the two have to land in one PR.
+  python-parity:
+    name: Image Python is in the test matrix
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Each assertion has a floor. A grep that matches nothing yields an empty list, and an
+      # empty list "agrees" with anything, so an unparsed file must fail rather than pass.
+      - name: Assert every FROM python:X.Y is a matrix entry
+        run: |
+          set -euo pipefail
+          images=$(grep -oE '^FROM python:[0-9]+\.[0-9]+' Dockerfile | sed 's/^FROM python://' | sort -u)
+          matrix=$(grep -E '^\s+python-version: \[' .github/workflows/ci.yml | grep -oE '"[0-9]+\.[0-9]+"' | tr -d '"')
+          [ -n "$images" ] || { echo "::error::no 'FROM python:X.Y' line found in Dockerfile"; exit 1; }
+          [ -n "$matrix" ] || { echo "::error::no python-version matrix found in ci.yml"; exit 1; }
+          echo "image Python: $images"; echo "matrix: $(echo $matrix)"
+          for v in $images; do
+            echo "$matrix" | grep -qx "$v" || { echo "::error file=Dockerfile::image ships Python $v, which the test matrix does not run"; exit 1; }
+          done
 
   build:
     name: Build and install the artifact
