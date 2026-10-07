@@ -298,3 +298,73 @@ class TestExtraPresent:
             )
             is True
         )
+
+
+def _fastapi_has_native_telemetry() -> bool:
+    try:
+        return importlib.util.find_spec("fastapi.telemetry") is not None
+    except ModuleNotFoundError:
+        return False
+
+
+@pytest.mark.skipif(not OTEL_INSTALLED, reason="the [otel] extra is not installed")
+@pytest.mark.skipif(
+    not _fastapi_has_native_telemetry(), reason="FastAPI < 0.142 has no native telemetry"
+)
+class TestFastAPIDoesNotExportOnItsOwn:
+    """tracing.py is the only exporter. FastAPI >= 0.142 must not add a second one.
+
+    FastAPI 0.142's lifespan reads `OTEL_EXPORTER_OTLP_ENDPOINT` — the variable this router
+    already uses as its tracing switch — and attaches its own OTLP exporter to the installed
+    TracerProvider, plus SDK meter and logger providers that export too. Unguarded, that
+    doubled every span and started a metrics stream to the collector (measured: 1 -> 2 span
+    processors, `/v1/metrics` POSTs appearing).
+
+    The ENDPOINT is set in the real process environment, because that is what both
+    `create_app` and FastAPI read; passing `env=` to `tracing.configure` would leave FastAPI
+    nothing to react to, and this test would pass on the bug.
+    """
+
+    @staticmethod
+    def _reset_global_providers():
+        # Each OTel global is one-shot per process; see `trace_one_request` above. FastAPI's own
+        # registry of providers it has configured is reset too, or a provider from an earlier
+        # test would be skipped as "already configured" and the assertion would pass vacuously.
+        import fastapi.telemetry._runtime as fastapi_runtime
+        from opentelemetry import trace as otel_trace
+        from opentelemetry._logs import _internal as otel_logs
+        from opentelemetry.metrics import _internal as otel_metrics
+
+        otel_trace._TRACER_PROVIDER = None
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = False
+        otel_metrics._METER_PROVIDER = None
+        otel_metrics._METER_PROVIDER_SET_ONCE._done = False
+        otel_logs._LOGGER_PROVIDER = None
+        otel_logs._LOGGER_PROVIDER_SET_ONCE._done = False
+        fastapi_runtime._configured.clear()
+        fastapi_runtime._owned.clear()
+
+    def test_lifespan_adds_no_exporter_and_no_providers(self, monkeypatch):
+        from opentelemetry import _logs, metrics, trace
+        from opentelemetry.sdk._logs import LoggerProvider
+        from opentelemetry.sdk.metrics import MeterProvider
+
+        self._reset_global_providers()
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", ENDPOINT)
+        try:
+            app = build()
+            assert tracing.enabled() is True, "precondition: create_app turned tracing on"
+            provider = trace.get_tracer_provider()
+            assert len(provider._active_span_processor._span_processors) == 1
+
+            with TestClient(app) as client:  # runs lifespan startup, where FastAPI configures
+                assert post(client).status_code == 200
+
+            assert trace.get_tracer_provider() is provider
+            assert len(provider._active_span_processor._span_processors) == 1, (
+                "FastAPI attached a second span exporter: every span would be exported twice"
+            )
+            assert not isinstance(metrics.get_meter_provider(), MeterProvider)
+            assert not isinstance(_logs.get_logger_provider(), LoggerProvider)
+        finally:
+            self._reset_global_providers()
