@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **FastAPI 0.142 no longer gets to export telemetry on its own.** 0.142 added native
+  OpenTelemetry. On lifespan startup it reads `OTEL_EXPORTER_OTLP_ENDPOINT`, which is the variable
+  this router already uses as its tracing switch, and attaches its own OTLP exporter to the
+  installed TracerProvider without deduplicating. With tracing on, that doubled every exported
+  span (span processors 1 → 2). It also installed SDK meter and logger providers and started a
+  metrics stream to the collector that nothing here configured. `create_app` now passes
+  `telemetry={"auto_configure": False}`. Before 0.142 that keyword lands in `app.extra` and is
+  inert, so the declared range is unchanged. A regression test asserts the provider still has
+  exactly one processor after lifespan startup, and that no SDK meter or logger provider appears.
+  Without the fix, the test fails on that assertion.
+
+### Changed
+- **fastapi 0.141.1 → 0.142.2** in `uv.lock`, which supersedes Dependabot #31. It brings
+  `opentelemetry-api` in as a base dependency of fastapi. That's the API only, with no SDK or
+  exporter. 0.142.1 and 0.142.2 are bug fixes (router endpoint wrapping, and startup when
+  auto-configuration fails).
+
 ## [0.5.1] — 2026-10-06
 
 Dependency release. No application code changed.
