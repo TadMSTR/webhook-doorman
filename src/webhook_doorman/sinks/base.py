@@ -157,8 +157,11 @@ class HttpSinkBase:
                 f"{self.name}: HTTP {code}: {detail}",
                 retry_after=parse_retry_after(response.headers.get("retry-after")),
                 latency_ms=latency,
+                response_code=code,
             )
-        raise PermanentSinkError(f"{self.name}: HTTP {code}: {detail}", latency_ms=latency)
+        raise PermanentSinkError(
+            f"{self.name}: HTTP {code}: {detail}", latency_ms=latency, response_code=code
+        )
 
     def _classify(self, response: httpx.Response) -> Verdict:
         """What this response means. Override to correct a destination that disagrees with HTTP.

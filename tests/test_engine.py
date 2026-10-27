@@ -6,15 +6,24 @@ sleep produces a suite that is slow when it passes and confusing when it fails.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 
 import httpx
 import pytest
 
 from webhook_doorman.config import Config
+from webhook_doorman.detect import DetectionResult
 from webhook_doorman.engine import Engine
 from webhook_doorman.errors import PermanentSinkError, SinkError
-from webhook_doorman.models import InboundEvent, utcnow
+from webhook_doorman.models import (
+    Delivery,
+    DeliveryStatus,
+    EventStatus,
+    InboundEvent,
+    StoredEvent,
+    utcnow,
+)
 from webhook_doorman.secrets import resolve
 from webhook_doorman.store import SqliteStore
 
@@ -352,3 +361,245 @@ class TestErrorTaxonomy:
         """The engine catches PermanentSinkError first; if the hierarchy inverted, a permanent
         failure would silently become a retry."""
         assert issubclass(PermanentSinkError, SinkError)
+
+
+async def _rows(engine: Engine, sql: str, params: tuple = ()) -> list:
+    cursor = await engine.store.db.execute(sql, params)
+    return list(await cursor.fetchall())
+
+
+def _fail_first_enqueue(engine: Engine, monkeypatch) -> None:
+    """Make the ingest path's first enqueue raise, as a crash between the two writes would.
+
+    Patches whichever method ingest uses, so the test fails on behaviour, not on a missing name,
+    against code that predates `enqueue_first_deliveries`.
+    """
+    name = (
+        "enqueue_first_deliveries"
+        if hasattr(engine.store, "enqueue_first_deliveries")
+        else "enqueue_deliveries"
+    )
+    real = getattr(engine.store, name)
+    calls = {"n": 0}
+
+    async def flaky(event_id, sinks):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("disk I/O error")
+        return await real(event_id, sinks)
+
+    monkeypatch.setattr(engine.store, name, flaky)
+
+
+class TestIngestResumesAnInterruptedDispatch:
+    """A failure between storing an event and queueing it must not lose it (d5a1b8ae).
+
+    The event row commits before its deliveries are queued. If the second write fails (a
+    restart, an I/O error), the producer sees a 5xx and redelivers with the same delivery id.
+    That retry used to be answered `deduplicated` and the event never went anywhere.
+    """
+
+    async def test_the_redelivery_queues_what_the_first_attempt_did_not(self, engine, monkeypatch):
+        _fail_first_enqueue(engine, monkeypatch)
+        with pytest.raises(RuntimeError):
+            await engine.ingest(event("resume-1"))
+
+        retry = await engine.ingest(event("resume-1"))
+        assert retry["status"] == "accepted"
+        assert retry.get("resumed") is True
+        assert (await engine.stats())["deliveries_pending"] == 1
+
+    async def test_a_redelivery_of_a_queued_event_is_still_a_duplicate(self, engine):
+        first = await engine.ingest(event("resume-2"))
+        second = await engine.ingest(event("resume-2"))
+        assert second == {"status": "ok", "deduplicated": True, "event_id": first["event_id"]}
+        assert (await engine.stats())["deliveries_pending"] == 1
+
+    async def test_concurrent_redeliveries_queue_once(self, engine, monkeypatch):
+        _fail_first_enqueue(engine, monkeypatch)
+        with pytest.raises(RuntimeError):
+            await engine.ingest(event("resume-3"))
+        results = await asyncio.gather(*(engine.ingest(event("resume-3")) for _ in range(4)))
+        assert sum(1 for r in results if r.get("resumed")) == 1
+        assert (await engine.stats())["deliveries_pending"] == 1
+
+    async def test_an_event_stored_with_no_sinks_is_not_resumed(self, engine):
+        await engine.ingest(event("resume-4", sinks=[]))
+        again = await engine.ingest(event("resume-4", sinks=[]))
+        assert again["deduplicated"] is True
+        assert (await engine.stats()).get("deliveries_pending", 0) == 0
+
+
+class TestRunOnceSurfacesWorkerFailures:
+    """A delivery whose bookkeeping fails must not be stranded in_flight (82a62f8b).
+
+    `run_once` gathered with `return_exceptions=True` and discarded the result. A store error
+    after the sink answered 200 left the delivery `in_flight`, unclaimable and unlogged, until
+    the process restarted.
+    """
+
+    async def test_a_failed_mark_delivered_is_logged_and_requeued(
+        self, engine, httpx_mock, monkeypatch, capsys
+    ):
+        httpx_mock.add_response(url=SINK_URL, status_code=200, is_reusable=True)
+        real = engine.store.mark_delivered
+        calls = {"n": 0}
+
+        async def flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("database is locked")
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(engine.store, "mark_delivered", flaky)
+        await engine.ingest(event("worker-1"))
+        assert await engine.run_once() == 1
+
+        out = capsys.readouterr().out
+        assert "delivery_worker_error" in out
+        assert "database is locked" in out
+        rows = await _rows(engine, "SELECT status FROM deliveries")
+        assert [r["status"] for r in rows] == ["pending"]
+
+        await engine.store.requeue_incomplete()  # collapse the backoff
+        assert await engine.run_once() == 1
+        assert (await engine.stats())["deliveries_delivered"] == 1
+
+
+class TestFailedAttemptsKeepTheirMetadata:
+    """A failed attempt records the code and latency the sink reported (0fa230b9).
+
+    Both failure paths passed `None, 0`, so every DLQ entry had `response_code: null` and every
+    failed attempt a latency of 0, though the exception carried both.
+    """
+
+    async def test_a_permanent_failure_records_code_and_latency(self, engine, monkeypatch):
+        async def fail(context, client):
+            raise PermanentSinkError("notes: HTTP 400: bad", latency_ms=1234, response_code=400)
+
+        monkeypatch.setattr(engine._sinks["notes"], "deliver", fail)
+        await engine.ingest(event("meta-1"))
+        await engine.run_once()
+
+        rows = await _rows(engine, "SELECT response_code, latency_ms, status FROM deliveries")
+        assert [(r["response_code"], r["latency_ms"], r["status"]) for r in rows] == [
+            (400, 1234, "exhausted")
+        ]
+        dlq = await engine.list_dlq(limit=10)
+        assert dlq[0].response_code == 400
+
+    async def test_a_retryable_failure_records_code_and_latency(self, engine, monkeypatch):
+        async def fail(context, client):
+            raise SinkError("notes: HTTP 503", latency_ms=77, response_code=503)
+
+        monkeypatch.setattr(engine._sinks["notes"], "deliver", fail)
+        await engine.ingest(event("meta-2"))
+        await engine.run_once()
+
+        rows = await _rows(engine, "SELECT response_code, latency_ms, status FROM deliveries")
+        assert [(r["response_code"], r["latency_ms"], r["status"]) for r in rows] == [
+            (503, 77, "pending")
+        ]
+
+    async def test_the_http_sink_reports_the_status_it_got(self, engine, httpx_mock):
+        httpx_mock.add_response(url=SINK_URL, status_code=400, text="bad")
+        await engine.ingest(event("meta-3"))
+        await engine.run_once()
+        assert (await engine.list_dlq(limit=10))[0].response_code == 400
+
+
+class TestEngineInternalsArePinned:
+    """Branches the pilot showed no test could tell apart from their removal.
+
+    5af07394: a source deleted from config is untrusted (fenced). 3454d8af: a clean verdict
+    clears a detector's last error. 9144b107: a delivery whose event is gone is terminal at once.
+    """
+
+    async def test_an_event_from_a_removed_source_is_fenced(self, tmp_path):
+        config = Config.model_validate(
+            {
+                **CONFIG,
+                "sinks": [{**CONFIG["sinks"][0], "agent_readable": True}],
+            }
+        )
+        eng = Engine(resolve(config, ENV))
+        stored = StoredEvent(
+            id=1,
+            source="deleted-source",
+            delivery_id="x",
+            event_type="ping",
+            summary="hi",
+            headers={},
+            body=b"{}",
+            payload={},
+            context={},
+            verified=True,
+            status=EventStatus.RECEIVED,
+            received_at=utcnow(),
+            untrusted_fields=["summary"],
+        )
+        fenced = eng._context_for(stored, "notes")
+        plain = stored.template_context(fence=False)
+        assert fenced != plain, "an event from an unknown source reached an agent unfenced"
+        assert fenced == stored.template_context(fence=True)
+
+    async def test_a_clean_verdict_clears_the_last_detector_error(self, engine):
+        class Flaky:
+            name = "flaky"
+
+            def __init__(self):
+                self.fail = True
+
+            async def score(self, text):
+                if self.fail:
+                    self.fail = False
+                    raise RuntimeError("backend down")
+                return DetectionResult(score=0.0, backend="flaky")
+
+        engine._detector = Flaky()
+        untrusted = {"untrusted_fields": ["summary"]}
+        await engine.ingest(InboundEvent(**{**_event_kwargs("det-1"), **untrusted}))
+        assert engine.detector_health()["available"] is False
+        await engine.ingest(InboundEvent(**{**_event_kwargs("det-2"), **untrusted}))
+        assert engine.detector_health() == {
+            "configured": False,
+            "backend": "none",
+            "available": True,
+            "last_error": None,
+        }
+
+    async def test_a_delivery_whose_event_is_gone_is_exhausted_not_retried(
+        self, engine, monkeypatch
+    ):
+        calls: list[tuple[str, str]] = []
+
+        async def exhausted(delivery_id, *, error, **kw):
+            calls.append(("exhausted", error))
+
+        async def retry(delivery_id, *, error, **kw):
+            calls.append(("retry", error))
+
+        async def gone(event_id):
+            return None
+
+        monkeypatch.setattr(engine.store, "mark_exhausted", exhausted)
+        monkeypatch.setattr(engine.store, "mark_retry", retry)
+        monkeypatch.setattr(engine.store, "get_event", gone)
+        delivery = Delivery(
+            id=1, event_id=99, sink="notes", attempt=0, status=DeliveryStatus.IN_FLIGHT
+        )
+        await engine._deliver_once(delivery)
+        assert calls == [("exhausted", "event no longer exists")]
+
+
+def _event_kwargs(delivery_id: str) -> dict:
+    return {
+        "source": "internal",
+        "delivery_id": delivery_id,
+        "event_type": "ping",
+        "summary": "a summary",
+        "headers": {},
+        "body": b'{"ok": true}',
+        "payload": {"ok": True},
+        "sinks": ["notes"],
+    }

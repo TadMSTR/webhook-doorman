@@ -54,6 +54,20 @@ class Store(Protocol):
         """Create one pending delivery per sink. Returns the new delivery ids."""
         ...
 
+    async def enqueue_first_deliveries(self, event_id: int, sinks: list[str]) -> list[int]:
+        """Queue an event's first deliveries, atomically and at most once.
+
+        Queues nothing, and returns `[]`, unless the event has no deliveries yet AND is still
+        `received`. Both conditions are checked in the same statement as the insert. That is the
+        guarantee the ingest path relies on: a redelivery resuming an interrupted dispatch cannot
+        double the deliveries, and cannot queue an event the detector has just withheld.
+        """
+        ...
+
+    async def has_deliveries(self, event_id: int) -> bool:
+        """Whether any delivery row exists for the event."""
+        ...
+
     async def claim_due_deliveries(self, now: datetime, limit: int) -> list[Delivery]:
         """Atomically move due pending deliveries to `in_flight` and return them."""
         ...
@@ -119,8 +133,21 @@ class Store(Protocol):
         different fact from a score of zero and is stored as a different value.
         """
 
-    async def release_event(self, event_id: int) -> None:
-        """Return a quarantined event to `received`. The caller queues the deliveries."""
+    async def release_event(self, event_id: int) -> bool:
+        """Return a quarantined event to `received`. The caller queues the deliveries.
+
+        Returns whether THIS call did it. The status test and the write are one statement, so of
+        two concurrent releases exactly one gets `True`, and only that one may enqueue.
+        """
+        ...
+
+    async def release_claim(self, delivery_id: int, next_attempt_at: datetime) -> bool:
+        """Hand an `in_flight` delivery back to `pending`, due at `next_attempt_at`.
+
+        For a delivery whose attempt raised in the engine rather than the sink, so it is not left
+        claimed until the next restart. Not an attempt: the counter does not move.
+        """
+        ...
 
     async def list_held(self, *, limit: int, before_id: int | None = None) -> list[HeldEntry]:
         """Quarantined events, newest first, for `GET /admin/held`.

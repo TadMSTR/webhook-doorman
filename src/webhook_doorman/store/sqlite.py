@@ -292,7 +292,63 @@ class SqliteStore:
             ids.append(int(cursor.lastrowid))
         return ids
 
+    async def enqueue_first_deliveries(self, event_id: int, sinks: list[str]) -> list[int]:
+        """One statement, so SQLite's write lock makes it all-or-nothing. See `Store`.
+
+        Per-sink inserts would not do: after the first row lands, a second caller's `NOT EXISTS`
+        is already false for the remaining sinks, and one interleaving queues half the set.
+        `json_each` turns the sink list into rows inside the same statement instead.
+        """
+        if not sinks:
+            return []
+        now = _iso(_utcnow())
+        cursor = await self.db.execute(
+            """
+            INSERT INTO deliveries (event_id, sink, attempt, status, next_attempt_at, updated_at)
+            SELECT ?, sinks.value, 0, ?, ?, ?
+              FROM json_each(?) AS sinks
+             WHERE NOT EXISTS (SELECT 1 FROM deliveries WHERE event_id = ?)
+               AND EXISTS (SELECT 1 FROM events WHERE id = ? AND status = ?)
+             ORDER BY sinks.key
+            RETURNING id
+            """,
+            (
+                event_id,
+                DeliveryStatus.PENDING.value,
+                now,
+                now,
+                json.dumps(sinks),
+                event_id,
+                event_id,
+                EventStatus.RECEIVED.value,
+            ),
+        )
+        return [int(row[0]) for row in await cursor.fetchall()]
+
+    async def has_deliveries(self, event_id: int) -> bool:
+        row = await self._fetchone(
+            "SELECT EXISTS (SELECT 1 FROM deliveries WHERE event_id = ?) AS n", (event_id,)
+        )
+        return bool(row and row["n"])
+
     # -- delivery ----------------------------------------------------------------------
+
+    async def release_claim(self, delivery_id: int, next_attempt_at: datetime) -> bool:
+        cursor = await self.db.execute(
+            """
+            UPDATE deliveries
+               SET status = ?, next_attempt_at = ?, updated_at = ?
+             WHERE id = ? AND status = ?
+            """,
+            (
+                DeliveryStatus.PENDING.value,
+                _iso(next_attempt_at),
+                _iso(_utcnow()),
+                delivery_id,
+                DeliveryStatus.IN_FLIGHT.value,
+            ),
+        )
+        return cursor.rowcount == 1
 
     async def claim_due_deliveries(self, now: datetime, limit: int) -> list[Delivery]:
         cursor = await self.db.execute(
@@ -469,12 +525,17 @@ class SqliteStore:
             ),
         )
 
-    async def release_event(self, event_id: int) -> None:
-        """Take an event out of quarantine. The caller queues the deliveries."""
-        await self.db.execute(
-            "UPDATE events SET status = ?, quarantined_at = NULL WHERE id = ?",
-            (EventStatus.RECEIVED.value, event_id),
+    async def release_event(self, event_id: int) -> bool:
+        """Take an event out of quarantine. The caller queues the deliveries.
+
+        Conditional on the status in the same statement, so a second, concurrent release
+        changes nothing and is told so. See `Store.release_event`.
+        """
+        cursor = await self.db.execute(
+            "UPDATE events SET status = ?, quarantined_at = NULL WHERE id = ? AND status = ?",
+            (EventStatus.RECEIVED.value, event_id, EventStatus.QUARANTINED.value),
         )
+        return cursor.rowcount == 1
 
     async def list_held(self, *, limit: int, before_id: int | None = None) -> list[HeldEntry]:
         """Quarantined events, newest first, for `GET /admin/held`.

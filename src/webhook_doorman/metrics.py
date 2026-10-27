@@ -35,8 +35,9 @@ from .filtering import FILTER_REASONS as _FILTER_REASONS
 from .sanitize import SANITIZE_CLASSES as _SANITIZE_CLASSES
 
 #: Every value `outcome` can take on `delivery_attempts_total`. Closed on purpose — see the
-#: cardinality note above.
-DELIVERY_OUTCOMES = ("delivered", "retry", "permanent", "exhausted")
+#: cardinality note above. `error` is the engine failing around an attempt (a store write that
+#: raised), not the sink failing; the delivery is handed back to `pending` when that happens.
+DELIVERY_OUTCOMES = ("delivered", "retry", "permanent", "exhausted", "error")
 
 #: Every value `reason` can take on `requests_rejected_total`. These are the rejections that
 #: happen *before* verification; a signature that does not match is a verification failure and

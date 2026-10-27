@@ -56,6 +56,10 @@ log = structlog.get_logger(__name__)
 
 CLAIM_BATCH = 32
 
+#: Statuses `replay` refuses. Each is a decision made about the event, and replay re-sends to
+#: the source's sinks without asking the detector or the filter again.
+_NOT_REPLAYABLE = frozenset({EventStatus.DROPPED, EventStatus.QUARANTINED, EventStatus.FILTERED})
+
 
 class Engine:
     """Owns the store, the sinks, and the background loops."""
@@ -145,6 +149,9 @@ class Engine:
         event_id, duplicate = await self.store.record_event(event)
 
         if duplicate:
+            resumed = await self._resume(event, event_id)
+            if resumed is not None:
+                return resumed
             log.info(
                 "event_deduplicated",
                 source=event.source,
@@ -190,7 +197,9 @@ class Engine:
         if withheld is not None:
             return withheld
 
-        await self.store.enqueue_deliveries(event_id, event.sinks)
+        # The at-most-once variant, so a redelivery resuming this same event concurrently (see
+        # `_resume`) cannot queue a second set.
+        await self.store.enqueue_first_deliveries(event_id, event.sinks)
         log.info(
             "event_accepted",
             source=event.source,
@@ -200,7 +209,48 @@ class Engine:
         )
         return {"status": "accepted", "event_id": event_id}
 
-    async def _screen(self, event: InboundEvent, event_id: int) -> dict[str, Any] | None:
+    async def _resume(self, event: InboundEvent, event_id: int) -> dict[str, Any] | None:
+        """Finish a dispatch the first delivery of this event did not.
+
+        The event row commits before its deliveries are queued, with the detector between the
+        two. A failure in that gap (a restart, an I/O error) answers the producer 5xx, and the
+        producer redelivers with the same id. Treating that redelivery as an ordinary duplicate
+        would lose the event: stored, `received`, and queued to nothing, for good.
+
+        So a duplicate whose original is still `received` and has no deliveries, and which has
+        somewhere to go, is resumed: screened and queued now. The stored event is screened, not
+        the redelivered one, so what is checked is what will be sent. Returns `None` for an
+        ordinary duplicate.
+        """
+        if not event.sinks or event.status is not EventStatus.RECEIVED:
+            return None
+        stored = await self.store.get_event(event_id)
+        if stored is None or stored.status is not EventStatus.RECEIVED:
+            return None
+        # Checked before screening, so a redelivery of an event whose deliveries are merely
+        # still pending is not scored and counted a second time.
+        if await self.store.has_deliveries(event_id):
+            return None
+
+        withheld = await self._screen(stored, event_id)
+        if withheld is not None:
+            return withheld
+        queued = await self.store.enqueue_first_deliveries(event_id, event.sinks)
+        if not queued:
+            return None  # a concurrent redelivery got there first
+        log.warning(
+            "event_dispatch_resumed",
+            source=event.source,
+            event_type=event.event_type,
+            event_id=event_id,
+            delivery_id=event.delivery_id,
+            sinks=event.sinks,
+        )
+        return {"status": "accepted", "event_id": event_id, "resumed": True}
+
+    async def _screen(
+        self, event: InboundEvent | StoredEvent, event_id: int
+    ) -> dict[str, Any] | None:
         """Score an event's untrusted text and act on the verdict.
 
         Returns a response body when the event was withheld, and `None` when it should be
@@ -302,7 +352,7 @@ class Engine:
         return {"status": status.value, "event_id": event_id}
 
     @staticmethod
-    def _untrusted_text(event: InboundEvent) -> str:
+    def _untrusted_text(event: InboundEvent | StoredEvent) -> str:
         """The attacker-authored text a detector should look at, and nothing else.
 
         Only the fields the parser marked untrusted, already sanitised by the ingest path. The
@@ -352,8 +402,14 @@ class Engine:
             # intervention on a held event must not do.
             return {"status": "not_quarantined", "event_id": event_id, "state": event.status.value}
 
+        # The check above shapes the answer; this decides it. Two releases can both pass the
+        # check, and only the one whose conditional write lands may enqueue.
+        if not await self.store.release_event(event_id):
+            current = await self.store.get_event(event_id)
+            state = current.status.value if current is not None else "missing"
+            return {"status": "not_quarantined", "event_id": event_id, "state": state}
+
         sinks = self._sinks_for(event.source)
-        await self.store.release_event(event_id)
         if not sinks:
             return {"status": "no_sinks", "event_id": event_id}
 
@@ -380,6 +436,12 @@ class Engine:
         event = await self.store.get_event(event_id)
         if event is None:
             raise LookupError(f"event {event_id} not found")
+        if event.status in _NOT_REPLAYABLE:
+            # Replay is not a way round a verdict. `dropped` promises the content never reaches a
+            # sink, `quarantined` leaves only through `release` (once), and `filtered` was
+            # refused by the source's own filter. Answered like `release`'s refusal: not an
+            # error, and nothing queued.
+            return {"status": "not_replayable", "event_id": event_id, "state": event.status.value}
 
         sinks = self._sinks_for(event.source)
         if not sinks:
@@ -419,8 +481,39 @@ class Engine:
         due = await self.store.claim_due_deliveries(utcnow(), CLAIM_BATCH)
         if not due:
             return 0
-        await asyncio.gather(*(self._deliver(d) for d in due), return_exceptions=True)
+        results = await asyncio.gather(*(self._deliver(d) for d in due), return_exceptions=True)
+        # `_deliver_once` turns every sink failure into a retry or a DLQ row, so what arrives here
+        # is the engine failing around an attempt: a store write that raised. Discarding it left
+        # the delivery `in_flight`, which nothing claims again until a restart, with no log line.
+        for delivery, result in zip(due, results, strict=True):
+            if isinstance(result, Exception):
+                await self._recover(delivery, result)
+            elif isinstance(result, BaseException):
+                raise result
         return len(due)
+
+    async def _recover(self, delivery: Delivery, exc: Exception) -> None:
+        """Log a failed attempt's engine error and hand the delivery back to `pending`.
+
+        At-least-once: if the sink had already answered 200 and the failure was recording that,
+        the delivery is sent again. That is what a restart did anyway, a restart later.
+        """
+        log.error(
+            "delivery_worker_error",
+            delivery=delivery.id,
+            sink=delivery.sink,
+            error=self._redact_error(repr(exc)),
+        )
+        METRICS.increment(
+            "webhook_doorman_delivery_attempts_total", sink=delivery.sink, outcome="error"
+        )
+        retry_at = utcnow() + timedelta(seconds=self.retry_delay_seconds(delivery.attempt + 1))
+        try:
+            await self.store.release_claim(delivery.id, retry_at)
+        except Exception:
+            # The store is what failed, so this may fail too. `requeue_incomplete` at the next
+            # start is the backstop; the log line above is what makes the gap visible.
+            log.exception("delivery_release_claim_failed", delivery=delivery.id)
 
     async def _deliver(self, delivery: Delivery) -> None:
         # A root span, not a child of the ingest span. A retry runs in the background worker
@@ -460,10 +553,16 @@ class Engine:
                 sink=delivery.sink,
                 outcome="permanent",
             )
-            await self._exhaust(delivery, str(exc), None, 0)
+            await self._exhaust(delivery, str(exc), exc.response_code, exc.latency_ms)
         except SinkError as exc:
             self._observe_latency(delivery.sink, exc.latency_ms)
-            await self._schedule_retry(delivery, str(exc), None, 0, retry_after=exc.retry_after)
+            await self._schedule_retry(
+                delivery,
+                str(exc),
+                exc.response_code,
+                exc.latency_ms,
+                retry_after=exc.retry_after,
+            )
         except Exception as exc:  # pragma: no cover - defensive; a sink bug is not a lost event
             log.exception("delivery_unexpected_error", delivery=delivery.id, sink=delivery.sink)
             await self._schedule_retry(delivery, repr(exc), None, 0)
