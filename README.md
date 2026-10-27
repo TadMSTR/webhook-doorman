@@ -79,7 +79,7 @@ cp config.example.yml config.yml && $EDITOR config.yml   # declare your sources 
 echo 'GITHUB_WEBHOOK_SECRET=...' > .env                  # secrets live here, never in YAML
 docker run --rm -p 127.0.0.1:8080:8080 \
   -v "$PWD/config.yml:/config/config.yml:ro" -v doorman-data:/data \
-  --env-file .env ghcr.io/tadmstr/webhook-doorman:0.1.1
+  --env-file .env ghcr.io/tadmstr/webhook-doorman:0.7.0
 ```
 
 `docker compose up -d` with the bundled `docker-compose.yml` does the same with hardened
