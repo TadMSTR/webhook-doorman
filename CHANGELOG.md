@@ -14,7 +14,9 @@ Per-sink filters, a full review of the codebase, and an image with no pip. **Upg
 recommended**: this release fixes security issues in the verification, admin, replay and
 content-safety paths (below). Every existing config loads unchanged. Three behaviours do change
 and are worth checking before you deploy: a source listing the same sink twice, or with a
-`{`/`}` in its `path`, is now a startup error; and `/docs` and `/openapi.json` are gone.
+`{`/`}` in its `path`, is now a startup error; and `/docs` and `/openapi.json` are gone. The
+database migrates to schema v3 on first start (one column and one small table, in a
+transaction); back up `/data` first if you want a way back to 0.6.0.
 
 ### Added
 - **Per-sink filters.** A source's `sinks:` entry may be `{name, filter}` as well as a name. The
@@ -39,10 +41,13 @@ and are worth checking before you deploy: a source listing the same sink twice, 
 - `POST /admin/replay` refuses events the detector dropped or quarantined, or the source filter
   refused (`not_replayable`). Quarantined events leave through `/admin/release` only.
 - `/admin/release` is atomic: concurrent releases of one event queue one set of deliveries.
-- Fence-tag stripping repeats until nothing changes, and covers the self-closing form.
-- On an agent-readable sink, `payload` is fenced for every parser, not only `generic`.
+- Fence-tag stripping catches every spelling of the tag, including ones that form when another
+  is removed, and stays linear on adversarial input.
+- On an agent-readable sink, `summary` and `payload` are always fenced, whatever the parser
+  declared or the source's trust was when the event was stored.
 - The detector reads structured fields as their text, sanitised, rather than their Python repr.
-- Secrets are redacted in their JSON-escaped spellings too, and in the decoded `payload`.
+- Secrets are redacted in their JSON-escaped spellings, and again in the decoded `payload` at
+  delivery.
 - A blank admin or metrics token never enables anything, whatever `min_token_length` says.
 - Matrix messages carry an empty `m.mentions`, so event text cannot ping a room.
 - No `/docs`, `/redoc` or `/openapi.json`. They listed every ingest path, unauthenticated.
@@ -50,13 +55,17 @@ and are worth checking before you deploy: a source listing the same sink twice, 
 - Locked dependencies refreshed past two published advisories: certifi 2026.7.22 → 2026.10.23
   (PYSEC-2026-4320) and the OpenTelemetry family 1.45.0 → 1.45.1 / 0.66b0 → 0.66b1
   (CVE-2026-114603). Dev-only: filelock 3.32.5 → 4.2.4 (CVE-2026-112907, CVE-2026-112913,
-  CVE-2026-112940).
+  CVE-2026-112940) and msgpack 1.2.2 → 1.2.4 (CVE-2026-114613).
 
 ### Fixed
 - An event whose deliveries were not queued (a failure between storing it and queueing them) is
   resumed when the producer redelivers it, instead of being answered as a duplicate and lost.
-- A delivery is never left `in_flight` with no log line after a store error; `run_once` logs it,
-  counts it and returns it to `pending`.
+  Only events that were meant to reach sinks are resumed, to the sinks recorded when they were
+  stored.
+- A delivery is never left `in_flight` with no log line after a store error. The error is
+  logged, counted, and counts as an attempt, so a failure that repeats reaches the DLQ.
+- A detector verdict never downgrades a withheld event.
+- Matrix transaction ids include a per-database id, so a re-created database cannot reuse one.
 - DLQ entries and failed attempts record the destination's status code and latency, not null
   and 0.
 - ntfy titles are folded onto one line, and a request httpx refuses to send is dead-lettered at
