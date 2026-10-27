@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
+import dataclasses
 import random
 import time
 from datetime import timedelta
@@ -36,6 +36,7 @@ from . import tracing
 from .config import Config
 from .detect import Detector, build_detector
 from .errors import PermanentSinkError, SinkError
+from .filtering import route as route_sinks
 from .logging import log_throttled
 from .metrics import METRICS
 from .models import (
@@ -47,14 +48,21 @@ from .models import (
     StoredEvent,
     utcnow,
 )
-from .redaction import redact_text
+from .redaction import redact_json, redact_text
+from .sanitize import sanitize
 from .secrets import Resolved
 from .sinks import Sink, build_sink
+from .sinks.base import DELIVERY_KEY
 from .store import SqliteStore, Store
+from .verification import secure_compare
 
 log = structlog.get_logger(__name__)
 
 CLAIM_BATCH = 32
+
+#: Statuses `replay` refuses. Each is a decision made about the event, and replay re-sends to
+#: the source's sinks without asking the detector or the filter again.
+_NOT_REPLAYABLE = frozenset({EventStatus.DROPPED, EventStatus.QUARANTINED, EventStatus.FILTERED})
 
 
 class Engine:
@@ -145,6 +153,9 @@ class Engine:
         event_id, duplicate = await self.store.record_event(event)
 
         if duplicate:
+            resumed = await self._resume(event, event_id)
+            if resumed is not None:
+                return resumed
             log.info(
                 "event_deduplicated",
                 source=event.source,
@@ -160,6 +171,25 @@ class Engine:
         # question and already answerable from `delivery_attempts_total`.
         METRICS.increment("webhook_doorman_events_received_total", source=event.source)
 
+        # Per-sink refusals, after the dedup check for the same reason as the event-level count
+        # below. Logged one line per sink: which route refused, and which gate in it.
+        for sink, refusal in event.filtered_sinks.items():
+            log.info(
+                "delivery_filtered",
+                source=event.source,
+                sink=sink,
+                event_type=event.event_type,
+                event_id=event_id,
+                reason=refusal.reason,
+                path=refusal.detail if refusal.reason != "event_type" else None,
+            )
+            METRICS.increment(
+                "webhook_doorman_deliveries_filtered_total",
+                source=event.source,
+                sink=sink,
+                reason=refusal.reason or "unknown",
+            )
+
         # Counted after the dedup check, like `events_received_total` above, so it means
         # "events filtered" rather than "requests filtered" — a producer retrying a delivery
         # we already refused must not inflate the number.
@@ -170,17 +200,23 @@ class Engine:
                 event_type=event.event_type,
                 event_id=event_id,
                 reason=event.filter_reason,
+                sinks=sorted(event.filtered_sinks) or None,
             )
             METRICS.increment(
                 "webhook_doorman_events_filtered_total",
                 source=event.source,
                 reason=event.filter_reason or "unknown",
             )
-            return {
+            body: dict[str, Any] = {
                 "status": "filtered",
                 "event_id": event_id,
                 "reason": event.filter_reason,
             }
+            if event.filtered_sinks:
+                # Names of sinks from this producer's own config, not anything it sent. The
+                # producer already knows its endpoint; the path and gate stay in the log.
+                body["sinks"] = sorted(event.filtered_sinks)
+            return body
 
         if not event.sinks:
             log.info("event_stored_no_sinks", source=event.source, event_type=event.event_type)
@@ -190,7 +226,9 @@ class Engine:
         if withheld is not None:
             return withheld
 
-        await self.store.enqueue_deliveries(event_id, event.sinks)
+        # The at-most-once variant, so a redelivery resuming this same event concurrently (see
+        # `_resume`) cannot queue a second set.
+        await self.store.enqueue_first_deliveries(event_id, event.sinks)
         log.info(
             "event_accepted",
             source=event.source,
@@ -200,7 +238,61 @@ class Engine:
         )
         return {"status": "accepted", "event_id": event_id}
 
-    async def _screen(self, event: InboundEvent, event_id: int) -> dict[str, Any] | None:
+    async def _resume(self, event: InboundEvent, event_id: int) -> dict[str, Any] | None:
+        """Finish a dispatch the first delivery of this event did not.
+
+        The event row commits before its deliveries are queued, with the detector between the
+        two. A failure in that gap (a restart, an I/O error) answers the producer 5xx, and the
+        producer redelivers with the same id. Treating that redelivery as an ordinary duplicate
+        would lose the event: stored, `received`, and queued to nothing, for good.
+
+        So a duplicate whose original is still `received` and has no deliveries, and which has
+        somewhere to go, is resumed: screened and queued now. The stored event is screened, not
+        the redelivered one, so what is checked is what will be sent. Returns `None` for an
+        ordinary duplicate.
+        """
+        stored = await self.store.get_event(event_id)
+        if stored is None or stored.status is not EventStatus.RECEIVED:
+            return None
+        # Only an event that was MEANT to go somewhere. "received with no deliveries" is also
+        # the permanent state of every non-actionable or unparseable event, and resuming one of
+        # those would send a stored body to sinks chosen by a different request. `None` is a
+        # row written before the sink list was stored: unknown, so never resumed.
+        if not stored.sinks:
+            return None
+        # Checked before screening, so a redelivery of an event whose deliveries are merely
+        # still pending is not scored and counted a second time.
+        if await self.store.has_deliveries(event_id):
+            return None
+        # The stored decision, not this request's: the content and the routing must come from
+        # the same event. Narrowed by the current routes, as `release` and `replay` are, so a
+        # route filter tightened since the event was stored is honoured here too. Also before
+        # screening: an event no current route accepts would otherwise be scored again on every
+        # redelivery, and answered as a duplicate each time.
+        current = set(self._sinks_for(stored))
+        sinks = [sink for sink in stored.sinks if sink in current]
+        if not sinks:
+            return None
+
+        withheld = await self._screen(stored, event_id)
+        if withheld is not None:
+            return withheld
+        queued = await self.store.enqueue_first_deliveries(event_id, sinks)
+        if not queued:
+            return None  # a concurrent redelivery got there first
+        log.warning(
+            "event_dispatch_resumed",
+            source=event.source,
+            event_type=event.event_type,
+            event_id=event_id,
+            delivery_id=event.delivery_id,
+            sinks=sinks,
+        )
+        return {"status": "accepted", "event_id": event_id, "resumed": True}
+
+    async def _screen(
+        self, event: InboundEvent | StoredEvent, event_id: int
+    ) -> dict[str, Any] | None:
         """Score an event's untrusted text and act on the verdict.
 
         Returns a response body when the event was withheld, and `None` when it should be
@@ -302,7 +394,7 @@ class Engine:
         return {"status": status.value, "event_id": event_id}
 
     @staticmethod
-    def _untrusted_text(event: InboundEvent) -> str:
+    def _untrusted_text(event: InboundEvent | StoredEvent) -> str:
         """The attacker-authored text a detector should look at, and nothing else.
 
         Only the fields the parser marked untrusted, already sanitised by the ingest path. The
@@ -310,12 +402,14 @@ class Engine:
         `fence_forgery` rule match on every fenced field.
         """
         context = event.template_context()
-        parts = [
-            str(context[name])
-            for name in event.untrusted_fields
-            if name in context and context[name] is not None
-        ]
-        return "\n".join(parts).strip()
+        parts: list[str] = []
+        for name in event.untrusted_fields:
+            if name in context and context[name] is not None:
+                parts.extend(_text_leaves(context[name]))
+        # Sanitised the way a fence sanitises, so the detector reads what an agent would. Text
+        # from `payload` is not sanitised at ingest, and invisible characters inside a phrase
+        # would otherwise keep a rule from matching it.
+        return sanitize("\n".join(parts))[0].strip()
 
     def detector_health(self) -> dict[str, Any]:
         """The `detector` block of `/health`.
@@ -352,24 +446,37 @@ class Engine:
             # intervention on a held event must not do.
             return {"status": "not_quarantined", "event_id": event_id, "state": event.status.value}
 
-        sinks = self._sinks_for(event.source)
-        await self.store.release_event(event_id)
+        # The check above shapes the answer; this decides it. Two releases can both pass the
+        # check, and only the one whose conditional write lands may enqueue.
+        if not await self.store.release_event(event_id):
+            current = await self.store.get_event(event_id)
+            state = current.status.value if current is not None else "missing"
+            return {"status": "not_quarantined", "event_id": event_id, "state": state}
+
+        sinks = self._sinks_for(event)
         if not sinks:
             return {"status": "no_sinks", "event_id": event_id}
 
-        await self.store.enqueue_deliveries(event_id, sinks)
+        # At most once: the event is `received` with no deliveries at this point, which is
+        # exactly the state `enqueue_first_deliveries` requires.
+        await self.store.enqueue_first_deliveries(event_id, sinks)
         log.warning("event_released", event_id=event_id, source=event.source, sinks=sinks)
         return {"status": "released", "event_id": event_id, "sinks": sinks}
 
-    def _sinks_for(self, source_name: str) -> list[str]:
-        """The sinks a source routes to, resolved from the current config.
+    def _sinks_for(self, event: StoredEvent) -> list[str]:
+        """The sinks this event routes to under the current config, route filters applied.
 
         Shared by `replay` and `release` rather than written twice: both answer "where would
         this event have gone", and two copies is how they come to disagree after a config
-        change.
+        change. The route filters run against the stored payload, so a replay does not send a
+        sink the events its filter refuses. The source filter is not re-run: an event it refused
+        is `filtered`, and `replay` refuses those.
         """
-        source = self.config.source_by_name(source_name)
-        return list(source.sinks) if source else []
+        source = self.config.source_by_name(event.source)
+        if source is None:
+            return []
+        sinks, _ = route_sinks(source.sinks, event.event_type, event.payload)
+        return sinks
 
     async def replay(self, event_id: int) -> dict[str, Any]:
         """Re-queue every delivery for a stored event.
@@ -380,8 +487,14 @@ class Engine:
         event = await self.store.get_event(event_id)
         if event is None:
             raise LookupError(f"event {event_id} not found")
+        if event.status in _NOT_REPLAYABLE:
+            # Replay is not a way round a verdict. `dropped` promises the content never reaches a
+            # sink, `quarantined` leaves only through `release` (once), and `filtered` was
+            # refused by the source's own filter. Answered like `release`'s refusal: not an
+            # error, and nothing queued.
+            return {"status": "not_replayable", "event_id": event_id, "state": event.status.value}
 
-        sinks = self._sinks_for(event.source)
+        sinks = self._sinks_for(event)
         if not sinks:
             return {"status": "no_sinks", "event_id": event_id}
 
@@ -419,8 +532,45 @@ class Engine:
         due = await self.store.claim_due_deliveries(utcnow(), CLAIM_BATCH)
         if not due:
             return 0
-        await asyncio.gather(*(self._deliver(d) for d in due), return_exceptions=True)
+        results = await asyncio.gather(*(self._deliver(d) for d in due), return_exceptions=True)
+        # `_deliver_once` turns every sink failure into a retry or a DLQ row, so what arrives here
+        # is the engine failing around an attempt: a store write that raised. Discarding it left
+        # the delivery `in_flight`, which nothing claims again until a restart, with no log line.
+        for delivery, result in zip(due, results, strict=True):
+            if isinstance(result, Exception):
+                await self._recover(delivery, result)
+            elif isinstance(result, BaseException):
+                raise result
         return len(due)
+
+    async def _recover(self, delivery: Delivery, exc: Exception) -> None:
+        """Log a failed attempt's engine error, count it, and retry or dead-letter it.
+
+        It is an attempt like any other, so it counts towards `max_attempts`. A failure that
+        repeats on every pass (a stored event that cannot be read back, a full disk) used to
+        hand the delivery back unchanged and loop every poll for ever, never reaching the DLQ.
+
+        At-least-once: if the sink had already answered 200 and the failure was recording that,
+        the delivery is sent again. That is what a restart did anyway, a restart later.
+        """
+        error = self._redact_error(repr(exc))
+        log.error("delivery_worker_error", delivery=delivery.id, sink=delivery.sink, error=error)
+        attempts_made = delivery.attempt + 1
+        try:
+            if attempts_made >= self.config.delivery.max_attempts:
+                # Counted once, as `exhausted`, like a sink failure's last attempt: the outcomes
+                # of `delivery_attempts_total` sum to the number of attempts.
+                await self._dead_letter(delivery, f"engine error: {error}", None, 0, attempts_made)
+                return
+            METRICS.increment(
+                "webhook_doorman_delivery_attempts_total", sink=delivery.sink, outcome="error"
+            )
+            retry_at = utcnow() + timedelta(seconds=self.retry_delay_seconds(attempts_made))
+            await self.store.release_claim(delivery.id, retry_at)
+        except Exception:
+            # The store is what failed, so this may fail too. `requeue_incomplete` at the next
+            # start is the backstop; the log line above is what makes the gap visible.
+            log.exception("delivery_release_claim_failed", delivery=delivery.id)
 
     async def _deliver(self, delivery: Delivery) -> None:
         # A root span, not a child of the ingest span. A retry runs in the background worker
@@ -443,10 +593,10 @@ class Engine:
             await self._exhaust(delivery, f"sink {delivery.sink!r} is not available", None, 0)
             return
 
+        context = self._context_for(event, delivery.sink)
+        context[DELIVERY_KEY] = f"{self.store.install_id}-{delivery.id}"
         try:
-            outcome = await sink.deliver(
-                self._context_for(event, delivery.sink), self._require_client()
-            )
+            outcome = await sink.deliver(context, self._require_client())
         except PermanentSinkError as exc:
             log.warning(
                 "delivery_permanent_failure",
@@ -460,10 +610,16 @@ class Engine:
                 sink=delivery.sink,
                 outcome="permanent",
             )
-            await self._exhaust(delivery, str(exc), None, 0)
+            await self._exhaust(delivery, str(exc), exc.response_code, exc.latency_ms)
         except SinkError as exc:
             self._observe_latency(delivery.sink, exc.latency_ms)
-            await self._schedule_retry(delivery, str(exc), None, 0, retry_after=exc.retry_after)
+            await self._schedule_retry(
+                delivery,
+                str(exc),
+                exc.response_code,
+                exc.latency_ms,
+                retry_after=exc.retry_after,
+            )
         except Exception as exc:  # pragma: no cover - defensive; a sink bug is not a lost event
             log.exception("delivery_unexpected_error", delivery=delivery.id, sink=delivery.sink)
             await self._schedule_retry(delivery, repr(exc), None, 0)
@@ -502,6 +658,13 @@ class Engine:
         agent_readable = sink_state is not None and sink_state.config.agent_readable
         source = self.config.source_by_name(event.source)
         untrusted = source is None or source.trust == "untrusted"
+        # `payload` is decoded from the stored body on every read, so the ingest-time pass over
+        # the decoded payload (`app.py`) never reaches what is delivered. A secret the byte pass
+        # did not recognise (an escape spelling it does not know) would decode back into the
+        # clear here. Redact the decoded form again, at the point of use.
+        event = dataclasses.replace(
+            event, payload=redact_json(event.payload, self.resolved.secret_values)
+        )
         return event.template_context(fence=agent_readable and untrusted)
 
     @staticmethod
@@ -527,19 +690,7 @@ class Engine:
         error = self._redact_error(error)
         attempts_made = delivery.attempt + 1
         if attempts_made >= self.config.delivery.max_attempts:
-            log.warning(
-                "delivery_exhausted",
-                delivery=delivery.id,
-                sink=delivery.sink,
-                attempts=attempts_made,
-                error=error,
-            )
-            METRICS.increment(
-                "webhook_doorman_delivery_attempts_total",
-                sink=delivery.sink,
-                outcome="exhausted",
-            )
-            await self._exhaust(delivery, error, code, latency_ms)
+            await self._dead_letter(delivery, error, code, latency_ms, attempts_made)
             return
 
         METRICS.increment(
@@ -562,6 +713,27 @@ class Engine:
             honoured_retry_after=retry_after is not None,
             error=error,
         )
+
+    async def _dead_letter(
+        self, delivery: Delivery, error: str, code: int | None, latency_ms: int, attempts: int
+    ) -> None:
+        """Exhaust a delivery that ran out of attempts, with the log line and the metric.
+
+        One helper for both ways a delivery runs out: sink failures (`_schedule_retry`) and
+        engine errors (`_recover`). An alert keyed on `delivery_exhausted` or on
+        `outcome="exhausted"` has to see both, and it used to miss the second.
+        """
+        log.warning(
+            "delivery_exhausted",
+            delivery=delivery.id,
+            sink=delivery.sink,
+            attempts=attempts,
+            error=error,
+        )
+        METRICS.increment(
+            "webhook_doorman_delivery_attempts_total", sink=delivery.sink, outcome="exhausted"
+        )
+        await self._exhaust(delivery, error, code, latency_ms)
 
     def _redact_error(self, error: str) -> str:
         """Strip resolved secrets from a delivery error before it is persisted or logged.
@@ -659,7 +831,24 @@ class Engine:
         expected = self.resolved.admin_token()
         if not expected or not presented:
             return False
-        return hmac.compare_digest(expected, presented)
+        return secure_compare(expected, presented)
+
+
+def _text_leaves(value: Any) -> list[str]:
+    """Every string in a decoded structure, in order, as the text it is.
+
+    `str()` of a dict is Python's repr: newlines become a literal backslash-n, which removes the
+    word boundary and the line start that the detector's rules anchor on. So a generic source's
+    `payload` scored 0.0 where the same text scored 1.0. Scalars that are not strings are kept as
+    text too, because a number is still something an agent reads.
+    """
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [leaf for item in value.values() for leaf in _text_leaves(item)]
+    if isinstance(value, list | tuple):
+        return [leaf for item in value for leaf in _text_leaves(item)]
+    return [] if value is None else [str(value)]
 
 
 def _jittered(seconds: float, jitter: float) -> float:

@@ -424,7 +424,11 @@ class TestMigrationFailure:
 
         names = [column[0] for column in schema_of(path)["columns"]["events"]]
         assert "applied_first" not in names, "the first statement was not rolled back"
-        assert user_version_of(path) == 1, "the version moved despite the migration failing"
+        # Each step commits on its own, so the steps before the failing one stand and the
+        # version names the last one that finished. It must not name the failing one.
+        assert user_version_of(path) == SCHEMA_VERSION - 1, (
+            "the version moved past the failing migration"
+        )
         db = sqlite3.connect(path)
         try:
             assert int(db.execute("SELECT COUNT(*) FROM events").fetchone()[0]) == 1

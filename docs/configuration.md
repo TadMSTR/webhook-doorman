@@ -74,6 +74,48 @@ because Discord does not render raw HTML; Apprise's `body_format: markdown` is e
 apprise-api converts it through an unsanitised Markdown-to-HTML step. Same format, opposite
 rule. `ARCHITECTURE.md` has the reasoning.
 
+### Per-sink filters
+
+A source's `sinks:` entries are sink names, or `{name, filter}`. A filter sends that one sink a
+subset of the source's events:
+
+```yaml
+sources:
+  - name: vikunja
+    # ... path, parser, verify ...
+    sinks:
+      - name: task-room             # tasks created and completed
+        filter:
+          event_types: [task.created, task.done]
+      - name: phone                 # only new high/urgent tasks
+        filter:
+          event_types: [task.created]
+          require:
+            data.task.priority: ["3", "4"]
+      - audit-log                   # a bare name: every admitted event, as before
+```
+
+- **Two layers, in order.** The source's `filter:` decides whether an event is admitted and
+  stored. A route's `filter:` decides only whether *that* sink gets a delivery.
+- **Same gates.** A route filter has `event_types`, `require` and `deny`, which behave exactly
+  as they do on a source (see [security.md](security.md#1-filter-what-the-destination-sees-at-all)).
+  `max_field_bytes` is source-only, because every sink shares the one stored event.
+- **Values are compared as text.** Paths resolve into the decoded payload. A JSON integer `3`
+  matches `"3"`, and `true` matches `"true"`. Vikunja's priority is the integer at
+  `data.task.priority`: 0 unset, 1 low, 2 medium, 3 high, 4 urgent, 5 "DO NOW".
+- **Nothing is dropped silently.** An event that every route refuses is stored with status
+  `filtered` and reason `sink`, and the producer gets `200`, like any filtered event. The
+  response lists the refusing sinks.
+- **Observable per sink.** Each refusal logs `delivery_filtered` (source, sink, gate and path) and
+  increments `webhook_doorman_deliveries_filtered_total{source,sink,reason}`. Both happen after
+  the dedup check, so a producer's retry is not counted twice.
+- **Replay and release apply the routes again,** against the stored payload. A replayed event
+  does not reach a sink whose filter refuses it.
+
+A config with only bare names behaves exactly as it did before routes existed.
+[`examples/vikunja-chat-and-push.yml`](../examples/vikunja-chat-and-push.yml) is the worked
+version.
+
 ### Verification strategies
 
 | Strategy | Fields | Typical producer |

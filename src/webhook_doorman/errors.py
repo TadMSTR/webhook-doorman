@@ -28,9 +28,20 @@ class SinkError(WebhookDoormanError):
     """
 
     def __init__(
-        self, *args: object, retry_after: float | None = None, latency_ms: int = 0
+        self,
+        *args: object,
+        retry_after: float | None = None,
+        latency_ms: int = 0,
+        response_code: int | None = None,
     ) -> None:
         super().__init__(*args)
+        self.response_code = response_code
+        """The destination's HTTP status, or `None` when no response came back.
+
+        Stored on the delivery row and reported by `GET /admin/dlq`, so an operator can tell a
+        400 from a timeout without parsing the error text.
+        """
+
         self.latency_ms = latency_ms
         """How long the failed attempt took, in milliseconds. `0` when nothing was sent.
 

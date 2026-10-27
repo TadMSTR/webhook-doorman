@@ -58,9 +58,55 @@ from .sanitize import sanitize
 #: that only stops an exact-match forgery is not one.
 #:
 #: The lookahead is what keeps this from over-reaching. `untrusted` must be followed by
-#: whitespace or `>`, so a payload containing `<untrusted-data>` is left alone while
-#: `<untrusted source="...">` is not.
-_FENCE_TAG = re.compile(r"</?\s*untrusted(?=[\s>])[^>]*>", re.IGNORECASE)
+#: whitespace, `/` or `>`, so a payload containing `<untrusted-data>` is left alone while every
+#: spelling of the real tag is not.
+#:
+#: Written so the regex engine has one way to match, because the input is attacker-chosen and
+#: the match runs on the event loop. `<\s*/?\s*` could split a whitespace run between its two
+#: `\s*` in n ways, which made one search quadratic: seconds on a 64 KB issue body. Here the
+#: whitespace before `/` belongs to the optional group and the rest to the second `\s*`, so each
+#: `<` costs linear time. The attribute run is capped for the same reason; an opening that finds
+#: no `>` within the cap is caught by `_FENCE_OPEN` below instead.
+_FENCE_PREFIX = r"<(?:\s*/)?\s*untrusted(?=[\s>/])"
+_FENCE_TAG = re.compile(_FENCE_PREFIX + r"[^>]{0,512}>", re.IGNORECASE)
+
+#: The opening of a fence tag, whether or not it is ever closed. Linear. If any is left after
+#: stripping, the field is adversarial and its brackets are neutralised.
+_FENCE_OPEN = re.compile(_FENCE_PREFIX, re.IGNORECASE)
+
+
+#: Strip passes before giving up on preserving the text. Ordinary content needs one; each
+#: further pass only peels one layer of deliberate nesting.
+_MAX_STRIP_PASSES = 4
+
+
+def _strip_fence_tags(text: str) -> str:
+    """Remove every fence tag, including any that removing another one creates.
+
+    One pass is not enough: removing a nested tag can join the text around it into a new one,
+    which would close the fence early. So it repeats until nothing changes. But each pass is
+    linear, and the number of passes grows with nesting depth, so unbounded repetition is
+    quadratic in attacker-chosen input (seconds for a few hundred KB, on the event loop).
+
+    Two cases mean the text is adversarial by construction, and preserving it stops being worth
+    the cost: still changing after `_MAX_STRIP_PASSES`, or a tag opening left that never closes
+    within the attribute cap. Then every `<` and `>` is replaced with a lookalike, which no tag
+    can be built from. Linear either way, and the fence holds either way.
+    """
+    for _ in range(_MAX_STRIP_PASSES):
+        stripped = _FENCE_TAG.sub("", text)
+        if stripped == text:
+            break
+        text = stripped
+    else:
+        return text.translate(_NEUTRALISE_BRACKETS)
+    if _FENCE_OPEN.search(text):
+        return text.translate(_NEUTRALISE_BRACKETS)
+    return text
+
+
+#: U+2039 / U+203A: readable as angle brackets, and not `<`/`>` to any parser.
+_NEUTRALISE_BRACKETS = str.maketrans({"<": "\u2039", ">": "\u203a"})
 
 
 def _attribute(value: str) -> str:
@@ -76,7 +122,7 @@ def fence_text(content: str, *, source: str, field: str) -> str:
     the log and another to the model reading the message.
     """
     cleaned, _ = sanitize(content)
-    cleaned = _FENCE_TAG.sub("", cleaned)
+    cleaned = _strip_fence_tags(cleaned)
     return (
         f"<untrusted source={_attribute(source)} field={_attribute(field)}>\n"
         f"{cleaned}\n"

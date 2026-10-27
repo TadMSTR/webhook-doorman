@@ -20,6 +20,7 @@ crash-safety claim is true:
 from __future__ import annotations
 
 import json
+import secrets
 from datetime import datetime
 from pathlib import Path
 
@@ -58,7 +59,8 @@ CREATE TABLE IF NOT EXISTS events (
     status                TEXT    NOT NULL DEFAULT 'received',
     untrusted_fields_json TEXT    NOT NULL DEFAULT '[]',
     detection_json        TEXT,
-    quarantined_at        TEXT
+    quarantined_at        TEXT,
+    sinks_json            TEXT
 );
 
 -- `/admin/held` filters on status and pages on id descending.
@@ -92,6 +94,11 @@ CREATE TABLE IF NOT EXISTS dlq (
 );
 
 CREATE INDEX IF NOT EXISTS idx_dlq_exhausted ON dlq (exhausted_at);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -114,6 +121,16 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE events ADD COLUMN detection_json TEXT",
         "ALTER TABLE events ADD COLUMN quarantined_at TEXT",
         "CREATE INDEX IF NOT EXISTS idx_events_status ON events (status, id)",
+    ),
+    3: (
+        # The sinks this event was meant to reach when it was stored, as decided at ingest.
+        # NULL for rows written before v3, which `_resume` treats as "unknown" and never
+        # resumes. Without this, an event stored with no sinks (non-actionable, unparseable) and
+        # one whose dispatch was interrupted looked identical: `received`, zero deliveries.
+        "ALTER TABLE events ADD COLUMN sinks_json TEXT",
+        # Small per-database facts. Holds `install_id`, which keeps idempotency keys sent to
+        # destinations (Matrix transaction ids) unique across a re-created database.
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     ),
 }
 
@@ -138,6 +155,7 @@ class SqliteStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._db: aiosqlite.Connection | None = None
+        self.install_id = ""
 
     @property
     def db(self) -> aiosqlite.Connection:
@@ -162,6 +180,7 @@ class SqliteStore:
         await self._db.execute("PRAGMA busy_timeout=5000")
 
         migrated_from = await self._apply_schema()
+        self.install_id = await self._install_id()
         log.info(
             "store_ready",
             path=str(self.path),
@@ -228,6 +247,23 @@ class SqliteStore:
             log.info("schema_migrated", path=str(self.path), to_version=target)
         return started_at
 
+    async def _install_id(self) -> str:
+        """A random id for this database, created on first connect and stable after.
+
+        Destinations that deduplicate on an idempotency key (Matrix transaction ids) see the
+        delivery row id, which restarts at 1 in a re-created database, and is shared by two
+        instances on one token. Prefixing this makes the key unique across both. Not a secret.
+        """
+        row = await self._fetchone("SELECT value FROM meta WHERE key = 'install_id'")
+        if row is not None:
+            return str(row["value"])
+        value = secrets.token_hex(8)
+        await self.db.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('install_id', ?)", (value,)
+        )
+        row = await self._fetchone("SELECT value FROM meta WHERE key = 'install_id'")
+        return str(row["value"])
+
     async def _table_exists(self, name: str) -> bool:
         row = await self._fetchone(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
@@ -246,8 +282,9 @@ class SqliteStore:
             """
             INSERT OR IGNORE INTO events
                 (source, delivery_id, event_type, summary, received_at,
-                 headers_json, body, context_json, verified, status, untrusted_fields_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 headers_json, body, context_json, verified, status, untrusted_fields_json,
+                 sinks_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.source,
@@ -264,6 +301,7 @@ class SqliteStore:
                 # no deliveries to settle.
                 event.status.value,
                 json.dumps(event.untrusted_fields),
+                json.dumps(event.sinks),
             ),
         )
         if cursor.rowcount:
@@ -292,7 +330,63 @@ class SqliteStore:
             ids.append(int(cursor.lastrowid))
         return ids
 
+    async def enqueue_first_deliveries(self, event_id: int, sinks: list[str]) -> list[int]:
+        """One statement, so SQLite's write lock makes it all-or-nothing. See `Store`.
+
+        Per-sink inserts would not do: after the first row lands, a second caller's `NOT EXISTS`
+        is already false for the remaining sinks, and one interleaving queues half the set.
+        `json_each` turns the sink list into rows inside the same statement instead.
+        """
+        if not sinks:
+            return []
+        now = _iso(_utcnow())
+        cursor = await self.db.execute(
+            """
+            INSERT INTO deliveries (event_id, sink, attempt, status, next_attempt_at, updated_at)
+            SELECT ?, sinks.value, 0, ?, ?, ?
+              FROM json_each(?) AS sinks
+             WHERE NOT EXISTS (SELECT 1 FROM deliveries WHERE event_id = ?)
+               AND EXISTS (SELECT 1 FROM events WHERE id = ? AND status = ?)
+             ORDER BY sinks.key
+            RETURNING id
+            """,
+            (
+                event_id,
+                DeliveryStatus.PENDING.value,
+                now,
+                now,
+                json.dumps(sinks),
+                event_id,
+                event_id,
+                EventStatus.RECEIVED.value,
+            ),
+        )
+        return [int(row[0]) for row in await cursor.fetchall()]
+
+    async def has_deliveries(self, event_id: int) -> bool:
+        row = await self._fetchone(
+            "SELECT EXISTS (SELECT 1 FROM deliveries WHERE event_id = ?) AS n", (event_id,)
+        )
+        return bool(row and row["n"])
+
     # -- delivery ----------------------------------------------------------------------
+
+    async def release_claim(self, delivery_id: int, next_attempt_at: datetime) -> bool:
+        cursor = await self.db.execute(
+            """
+            UPDATE deliveries
+               SET status = ?, attempt = attempt + 1, next_attempt_at = ?, updated_at = ?
+             WHERE id = ? AND status = ?
+            """,
+            (
+                DeliveryStatus.PENDING.value,
+                _iso(next_attempt_at),
+                _iso(_utcnow()),
+                delivery_id,
+                DeliveryStatus.IN_FLIGHT.value,
+            ),
+        )
+        return cursor.rowcount == 1
 
     async def claim_due_deliveries(self, now: datetime, limit: int) -> list[Delivery]:
         cursor = await self.db.execute(
@@ -439,6 +533,7 @@ class SqliteStore:
             status=EventStatus(row["status"]),
             received_at=datetime.fromisoformat(row["received_at"]),
             untrusted_fields=json.loads(row["untrusted_fields_json"] or "[]"),
+            sinks=json.loads(row["sinks_json"]) if row["sinks_json"] is not None else None,
         )
 
     async def record_detection(
@@ -454,27 +549,38 @@ class SqliteStore:
         One statement rather than three, so an event can never be found `quarantined` without
         the verdict that put it there - which is the only thing `GET /admin/held` can show an
         operator to justify the hold.
+
+        Only from `received`. A verdict is recorded once per screening, and a resumed redelivery
+        can screen the same event concurrently with its original ingest; this way a later
+        `received` can never overwrite an earlier `quarantined` or `dropped`. A withheld event is
+        withheld until `release_event` says otherwise.
         """
         await self.db.execute(
             """
             UPDATE events
                SET detection_json = ?, status = ?, quarantined_at = ?
-             WHERE id = ?
+             WHERE id = ? AND status = ?
             """,
             (
                 json.dumps(detection) if detection is not None else None,
                 status.value,
                 _iso(quarantined_at) if quarantined_at is not None else None,
                 event_id,
+                EventStatus.RECEIVED.value,
             ),
         )
 
-    async def release_event(self, event_id: int) -> None:
-        """Take an event out of quarantine. The caller queues the deliveries."""
-        await self.db.execute(
-            "UPDATE events SET status = ?, quarantined_at = NULL WHERE id = ?",
-            (EventStatus.RECEIVED.value, event_id),
+    async def release_event(self, event_id: int) -> bool:
+        """Take an event out of quarantine. The caller queues the deliveries.
+
+        Conditional on the status in the same statement, so a second, concurrent release
+        changes nothing and is told so. See `Store.release_event`.
+        """
+        cursor = await self.db.execute(
+            "UPDATE events SET status = ?, quarantined_at = NULL WHERE id = ? AND status = ?",
+            (EventStatus.RECEIVED.value, event_id, EventStatus.QUARANTINED.value),
         )
+        return cursor.rowcount == 1
 
     async def list_held(self, *, limit: int, before_id: int | None = None) -> list[HeldEntry]:
         """Quarantined events, newest first, for `GET /admin/held`.
@@ -655,7 +761,10 @@ def _row_to_delivery(row: aiosqlite.Row) -> Delivery:
 def _safe_json(body: bytes):
     try:
         return json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (ValueError, RecursionError):
+        # Same set as the ingest path (`app._safe_json`): an integer over the conversion limit
+        # raises ValueError, deep nesting RecursionError. A stored body that ingest accepted
+        # must read back too, or replay, release and delivery of it fail for ever.
         return None
 
 

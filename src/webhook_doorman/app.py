@@ -15,7 +15,6 @@ A source is either enabled or it rejects. There is no third state, and in partic
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -28,6 +27,7 @@ from fastapi.responses import JSONResponse
 from . import __version__, tracing
 from .config import Config, NoneVerify, load_config
 from .filtering import evaluate as evaluate_filter
+from .filtering import route as route_sinks
 from .filtering import truncate
 from .metrics import METRICS
 from .models import DlqEntry, EventStatus, HeldEntry, InboundEvent
@@ -35,7 +35,7 @@ from .parsers import get_parser, parse
 from .redaction import redact_bytes, redact_headers, redact_json, redact_text
 from .sanitize import sanitize_structure
 from .secrets import Resolved, SourceState, resolve
-from .verification import verify
+from .verification import secure_compare, verify
 
 log = structlog.get_logger(__name__)
 
@@ -215,7 +215,10 @@ def build_source_route(
             parsed = parse(parser_name, safe_body, headers)
             delivery_id = compute_delivery_id(state, headers, safe_body)
 
-            payload_json = _safe_json(safe_body)
+            # A second value pass, on the decoded form. `redact_bytes` matches the spellings a
+            # JSON encoder emits, but a producer can escape any character, and decoding undoes
+            # every escape. What reaches templates and filters is redacted either way.
+            payload_json = redact_json(_safe_json(safe_body), secret_values)
 
             # Sanitisation applies on `trust: untrusted` regardless of where the event is
             # going, because the characters it removes are unwanted in a chat room and a log
@@ -244,6 +247,20 @@ def build_source_route(
             verdict = evaluate_filter(source.filter, parsed.event_type, payload_json)
             cap = source.filter.max_field_bytes
 
+            # Then the per-sink routes, which decide only who gets a delivery. An event that every
+            # route refused is stored `filtered` with reason `sink`, so it is never silently
+            # dropped. It is answered 200, like any filtered event.
+            sinks: list[str] = []
+            refused: dict = {}
+            if parsed.actionable and verdict.admitted:
+                sinks, refused = route_sinks(source.sinks, parsed.event_type, payload_json)
+            if not verdict.admitted:
+                status, reason = EventStatus.FILTERED, verdict.reason
+            elif refused and not sinks:
+                status, reason = EventStatus.FILTERED, "sink"
+            else:
+                status, reason = EventStatus.RECEIVED, None
+
             with structlog.contextvars.bound_contextvars(delivery_id=delivery_id):
                 event = InboundEvent(
                     source=source.name,
@@ -256,10 +273,11 @@ def build_source_route(
                     body=safe_body,
                     payload=payload_json,
                     context=truncate(context_value, cap),
-                    sinks=(list(source.sinks) if parsed.actionable and verdict.admitted else []),
+                    sinks=sinks,
                     verified=not isinstance(source.verify, NoneVerify),
-                    status=(EventStatus.FILTERED if not verdict.admitted else EventStatus.RECEIVED),
-                    filter_reason=verdict.reason,
+                    status=status,
+                    filter_reason=reason,
+                    filtered_sinks=refused,
                     untrusted_fields=(
                         list(parsed.untrusted_fields) if source.trust == "untrusted" else []
                     ),
@@ -273,9 +291,16 @@ def build_source_route(
 
 
 def _safe_json(body: bytes) -> Any:
+    """The decoded body, or `None` for a body that is not JSON this process can hold.
+
+    `ValueError` covers more than malformed JSON: an integer over Python's 4300-digit
+    conversion limit raises it too, and deep nesting raises `RecursionError`. Either used to
+    answer 500, which a producer retries for ever. A body that cannot be decoded is stored as
+    a non-JSON event instead, like any other.
+    """
     try:
         return json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (ValueError, RecursionError):
         return None
 
 
@@ -516,7 +541,7 @@ def build_metrics_route(
         expected = resolved.metrics_token()
         if expected is not None:
             presented = authorization.removeprefix("Bearer ").strip()
-            if not hmac.compare_digest(expected, presented):
+            if not secure_compare(expected, presented):
                 log.warning("metrics_auth_failed")
                 raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -629,6 +654,12 @@ def create_app(
         version=__version__,
         description="A fail-closed inbound webhook router.",
         lifespan=lifespan,
+        # No interactive docs and no schema. They are unauthenticated, and `/openapi.json` lists
+        # every ingest path and the admin API, which is the topology `/metrics` is kept off the
+        # public proxy for. A webhook router has no human API client to document itself to.
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
         # tracing.py owns OpenTelemetry export, and it is the only thing that may. FastAPI
         # 0.142 added native telemetry that, on lifespan startup, reads the same
         # OTEL_EXPORTER_OTLP_ENDPOINT and attaches its OWN exporter to whatever TracerProvider
@@ -654,6 +685,12 @@ def create_app(
             name for name, s in resolved.sources.items() if s.config.trust == "untrusted"
         ],
         detector_enabled=resolved.config.detector.backend != "none",
+        filtered_routes=[
+            (name, r.name)
+            for name, s in resolved.sources.items()
+            for r in s.config.sinks
+            if r.filter is not None
+        ],
     )
 
     router = APIRouter()

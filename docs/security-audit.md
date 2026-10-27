@@ -99,4 +99,4 @@ Two limits are worth stating plainly, because a green audit is easy to over-read
 ## Reporting
 
 To report a vulnerability, see [SECURITY.md](../SECURITY.md). Full audit reports are held in
-the `host-forge/build-reports` repository, one directory per build.
+a private build-reports repository, one directory per build.

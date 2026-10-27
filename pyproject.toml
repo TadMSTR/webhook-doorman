@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "webhook-doorman"
-version = "0.6.0"
+version = "0.7.0"
 description = "A fail-closed inbound webhook router: verify, persist, deliver."
 readme = "README.md"
 license = { text = "MIT" }
@@ -48,6 +48,8 @@ dependencies = [
 # Tracing is opt-in and stays out of the default install, which is nine dependencies with an
 # argument for each. Nothing here is imported unless OTEL_EXPORTER_OTLP_ENDPOINT is set, and a
 # missing extra with that variable set is a boot warning rather than a crash — see tracing.py.
+# (`opentelemetry-api` itself is in every install regardless: FastAPI 0.143+ depends on it and
+# imports it at startup. The SDK, exporter and instrumentation are what this extra adds.)
 otel = [
     # The API/SDK packages are 1.x; the instrumentation packages are still 0.x betas and move in
     # lockstep with them, which is why the two halves carry different ceilings.
@@ -58,6 +60,9 @@ otel = [
 ]
 
 dev = [
+    # The mutation gate (ci.yml `mutation` job, tests/check_mutation_floor.py). 3.x because the
+    # [tool.mutmut] table below uses 3.x keys; 2.x reads a different config.
+    "mutmut>=3.8,<4",
     "pip-audit>=2.7,<3",
     # Test-only, and deliberately not a runtime dependency: `metrics.py` emits the exposition
     # format by hand, so the claim that its output is *valid* needs a reference parser to check
@@ -108,3 +113,27 @@ addopts = "--cov=webhook_doorman --cov-report=term-missing --cov-fail-under=95"
 [tool.coverage.run]
 source = ["webhook_doorman"]
 branch = true
+
+# The mutation gate: the three modules where a test that cannot fail costs the most. Measured
+# 2026-10-27: about 515 mutants, 50 s with 8 workers. Floors live in tests/check_mutation_floor.py.
+[tool.mutmut]
+source_paths = ["src/webhook_doorman"]
+# An allowlist, so a new module is not mutated (and its survivors counted) by accident.
+only_mutate = [
+    "src/webhook_doorman/verification.py",
+    "src/webhook_doorman/secrets.py",
+    "src/webhook_doorman/filtering.py",
+]
+# Files the suite reads: shipped configs, docs it checks, CI files it asserts on.
+also_copy = [
+    "config.example.yml", "examples", "docs", "README.md", "CHANGELOG.md", "ARCHITECTURE.md",
+    "SECURITY.md", "AGENTS.md", "CONTRIBUTING.md", ".github", "Dockerfile", "docker-compose.yml",
+    ".env.example", ".gitleaks.toml",
+]
+# The constant-time structural test reads function names from source by AST, and mutmut renames
+# every function it instruments (`x_secure_compare__mutmut_orig`). That test runs in the normal
+# suite; here it can only fail for mutmut's reasons.
+pytest_add_cli_args = [
+    "--no-cov", "-p", "no:cacheprovider",
+    "--deselect", "tests/test_verification.py::TestConstantTimeComparison",
+]

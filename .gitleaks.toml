@@ -31,9 +31,12 @@ description = "Documentation ranges, loopback, and example values are intentiona
 # Test fixtures are allowlisted by VALUE, not by path. Allowlisting tests/ wholesale would hide
 # a real credential pasted into a fixture — which is the most likely way one reaches this repo.
 regexes = [
-  '''test-(github|bearer|admin)-[a-z]+-[0-9a-z]+''',
+  '''test-(github|bearer|admin|vikunja)-[a-z]+-[0-9a-z]+''',
   '''abcdefgh12345678''',
   '''s3cret-value''',
+  # tests/test_tracing.py's SINK_CREDENTIAL, synthetic, in history since v0.3.0 (f9e1258).
+  # gitleaks 8.30.1's generic-api-key matches it; the distro build does not.
+  '''tok-0123456789abcdef-SECRET''',
   '''127\.0\.0\.1''',
   '''0\.0\.0\.0''',
   '''192\.0\.2\.\d{1,3}''',
@@ -43,8 +46,10 @@ regexes = [
   '''10\.9\.1\.\d{1,3}''',
   '''example\.(com|org|net|invalid)''',
 ]
+# Paths only for what is never committed. gitleaks ORs `paths` with `regexes`, so a path entry
+# excuses ANY finding in that file, credential or not. This used to list `.gitleaks.toml`
+# itself; nothing in it needed excusing, and it would have hidden a value pasted into it.
 paths = [
-  '''\.gitleaks\.toml$''',
   '''(^|/)\.venv/''',   # local virtualenv; never committed, but it drowns a local scan
   '''(^|/)\.git/''',
 ]

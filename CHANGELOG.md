@@ -8,19 +8,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-27
+
+Per-sink filters, a full review of the codebase, and an image with no pip. **Upgrading is
+recommended**: this release fixes security issues in the verification, admin, replay and
+content-safety paths (below). Every existing config loads unchanged. Three behaviours do change
+and are worth checking before you deploy: a source listing the same sink twice, or with a
+`{`/`}` in its `path`, is now a startup error; and `/docs` and `/openapi.json` are gone. The
+database migrates to schema v3 on first start (one column and one small table, in a
+transaction); back up `/data` first if you want a way back to 0.6.0.
+
+### Added
+- **Per-sink filters.** A source's `sinks:` entry may be `{name, filter}` as well as a name. The
+  filter has the same `event_types` / `require` / `deny` gates as a source filter, applied after
+  it, and decides only whether that sink gets a delivery. One Vikunja webhook can now send a chat
+  room tasks created and completed, and a phone only new high/urgent ones. See
+  `docs/configuration.md` and `examples/vikunja-chat-and-push.yml`. An event every route refuses
+  is stored as `filtered` (reason `sink`). Refusals are logged as `delivery_filtered` and counted in
+  `webhook_doorman_deliveries_filtered_total{source,sink,reason}`. Replay and release apply the
+  routes again.
+- `webhook_doorman_delivery_attempts_total{outcome="error"}`: the engine failing around an attempt
+  (a store write that raised). The delivery is handed back to `pending` instead of being stranded.
+- CI gates: a Trivy scan of the built image (HIGH/CRITICAL with a fix, no ignore file); a
+  pip-absent check; gitleaks over full history with a prover that it can fail; a mutation gate on
+  `verification.py`, `secrets.py` and `filtering.py`; and a test-suite guard that fails any test
+  touching the network.
+
 ### Security
-- **Locked dependencies refreshed past two published advisories.** certifi 2026.7.22 →
-  2026.10.23 (PYSEC-2026-4320) and the OpenTelemetry family 1.45.0 → 1.45.1 / 0.66b0 → 0.66b1
-  (CVE-2026-114603 in opentelemetry-api). Both shipped in the 0.6.0 image, and both failed the
-  CI audit on fresh runs from 2026-10-26. Dev-only: filelock 3.32.5 → 4.2.4 (CVE-2026-112907,
-  CVE-2026-112913, CVE-2026-112940).
+- Every credential comparison (webhook verification, admin token, `/metrics` token) is one
+  constant-time comparison over UTF-8 bytes. A non-ASCII credential is an ordinary 401, counted
+  and logged, never a 500.
+- `POST /admin/replay` refuses events the detector dropped or quarantined, or the source filter
+  refused (`not_replayable`). Quarantined events leave through `/admin/release` only.
+- `/admin/release` is atomic: concurrent releases of one event queue one set of deliveries.
+- Fence-tag stripping catches every spelling of the tag, including ones that form when another
+  is removed, and stays linear on adversarial input. The detector's `fence_forgery` rule matches
+  the tag's opening in every spelling, so its version is now `2`: stored verdicts say which rule
+  set scored them.
+- On an agent-readable sink, `summary` and `payload` are always fenced, whatever the parser
+  declared or the source's trust was when the event was stored.
+- The detector reads structured fields as their text, sanitised, rather than their Python repr.
+- Secrets are redacted in their JSON-escaped spellings, and again in the decoded `payload` at
+  delivery.
+- A blank admin or metrics token never enables anything, whatever `min_token_length` says.
+- Matrix messages carry an empty `m.mentions`, so event text cannot ping a room.
+- No `/docs`, `/redoc` or `/openapi.json`. They listed every ingest path, unauthenticated.
+- The runtime image ships no pip, in the venv or the base image.
+- Locked dependencies refreshed past two published advisories: certifi 2026.7.22 → 2026.10.23
+  (PYSEC-2026-4320) and the OpenTelemetry family 1.45.0 → 1.45.1 / 0.66b0 → 0.66b1
+  (CVE-2026-114603). Dev-only: filelock 3.32.5 → 4.2.4 (CVE-2026-112907, CVE-2026-112913,
+  CVE-2026-112940) and msgpack 1.2.2 → 1.2.4 (CVE-2026-114613).
+
+### Fixed
+- An event whose deliveries were not queued (a failure between storing it and queueing them) is
+  resumed when the producer redelivers it, instead of being answered as a duplicate and lost.
+  Only events that were meant to reach sinks are resumed, to the sinks recorded when they were
+  stored.
+- A delivery is never left `in_flight` with no log line after a store error. The error is
+  logged, counted, and counts as an attempt, so a failure that repeats reaches the DLQ.
+- A detector verdict never downgrades a withheld event.
+- Matrix transaction ids include a per-database id, so a re-created database cannot reuse one.
+- DLQ entries and failed attempts record the destination's status code and latency, not null
+  and 0.
+- ntfy titles are folded onto one line, and a request httpx refuses to send is dead-lettered at
+  once instead of retried. A multi-line title used to fail every attempt.
+- Matrix retries reuse the delivery's transaction id, so the homeserver collapses a retry of a
+  send that did succeed.
+- A body Python cannot decode (an integer over the conversion limit, deep nesting) and a parser
+  meeting a field of an unexpected type are stored as unparseable events (200), not 500s.
+- Tracing exports to the endpoint `configure()` chose; `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` still
+  wins.
 
 ### Changed
+- Config: a sink listed twice in one source, and a source `path` containing `{` or `}`, are
+  startup errors.
 - fastapi 0.142.2 → 0.143.2, pydantic 2.13.5 → 2.14.1, pydantic-settings 2.15.0 → 2.16.0,
-  ruff 0.16.10 → 0.17.0. fastapi 0.143.0 makes its own OpenTelemetry exporter setup opt-in. This
-  router already turned it off in 0.6.0, so nothing changes here.
-- Action pins: codeql-action 4.38.3, upload-artifact 7.0.2, scorecard-action 2.5.0,
-  login-action 4.7.0, setup-uv 10.3.2.
+  ruff 0.16.10 → 0.17.0. fastapi 0.143.0 makes its own OpenTelemetry exporter setup opt-in, which
+  this router already turned off. fastapi 0.143 also makes `opentelemetry-api` a dependency of
+  every install, and opentelemetry-exporter-otlp-proto-http 1.45.1 adds `requests` (and
+  `charset_normalizer`) to the image.
+- Actions: checkout 7.0.1 and setup-python 7.0.0 (Node 24), codeql-action 4.38.3,
+  upload-artifact 7.0.2, scorecard-action 2.5.0, login-action 4.7.0, setup-uv 10.3.2. No checkout
+  persists credentials.
+- Docs: the coverage floor is 95%; what protects `/admin/` is the token; the 32-character token
+  minimum is the default of `min_token_length`; README's quickstart image tag was 0.1.1.
 
 ## [0.6.0] — 2026-10-07
 
@@ -530,6 +601,7 @@ First release. Security-audited before tagging: one Medium finding, resolved bel
   redacted before storage, collapsing every event onto one dedup id and silently discarding all
   but the first.
 
+[0.7.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.7.0
 [0.6.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.6.0
 [0.5.1]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.5.1
 [0.5.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.5.0

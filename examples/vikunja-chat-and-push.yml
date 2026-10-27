@@ -1,0 +1,60 @@
+# Example — one Vikunja webhook, two sinks, different events to each.
+#
+# The chat room gets tasks created and tasks completed. The phone gets only NEW tasks at high or
+# urgent priority. One Vikunja webhook and one secret do both: each entry under `sinks:` can carry
+# its own filter, applied after the source's filter, deciding only whether that sink gets a
+# delivery. Without it this took a second webhook, with a second secret, per destination.
+#
+#   .env:
+#     VIKUNJA_WEBHOOK_SECRET=<the secret you set on the Vikunja webhook>
+#     MATRIX_HOMESERVER=https://matrix.example.invalid
+#     MATRIX_TOKEN=<bot access token>
+#     MATRIX_ROOM=!tasks:example.invalid
+#     NTFY_TOPIC=<your topic>
+#
+# In Vikunja: project → Webhooks → Create. Target https://hooks.example.invalid/webhook/vikunja,
+# the same secret, and at least the events `task.created` and `task.updated`.
+#
+# Two things about Vikunja's events decide how the filters below are written:
+#
+#   * There is no `task.done` event. Completion arrives as `task.updated` with `done: true`; the
+#     vikunja parser reports that as event type `task.done`, and every other update stays
+#     `task.updated`. Filters match the parser's event type, so `task.done` is the name to use.
+#   * Priority is an integer at `data.task.priority` in the payload: 0 unset, 1 low, 2 medium,
+#     3 high, 4 urgent, 5 "DO NOW". Filter values are compared as TEXT, so the integer 3
+#     matches "3". Add "5" below if "DO NOW" should page you too.
+
+sources:
+  - name: vikunja
+    path: /webhook/vikunja
+    parser: vikunja
+    verify:
+      strategy: hmac_sha256
+      header: X-Vikunja-Signature
+      encoding: hex
+      secret_env: VIKUNJA_WEBHOOK_SECRET
+    sinks:
+      - name: task-room
+        filter:
+          event_types: [task.created, task.done]
+      - name: phone
+        filter:
+          event_types: [task.created]
+          require:
+            data.task.priority: ["3", "4"]
+
+sinks:
+  - name: task-room
+    type: matrix
+    url_env: MATRIX_HOMESERVER
+    token_env: MATRIX_TOKEN
+    room_env: MATRIX_ROOM
+    template: "{{ summary }}"
+
+  - name: phone
+    type: ntfy
+    url: https://ntfy.sh
+    topic_env: NTFY_TOPIC
+    title_template: "Vikunja: {{ title }}"
+    template: "{{ summary }}"
+    tags: memo

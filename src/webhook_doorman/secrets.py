@@ -80,7 +80,9 @@ class Resolved:
         if not name:
             return None
         value = self.secrets.get(name, "")
-        if len(value) < self.config.admin.min_token_length:
+        # Blank is absent whatever `min_token_length` says. A floor of 0 used to let an unset
+        # variable through as "", which compares equal to an empty presented token.
+        if not value.strip() or len(value) < self.config.admin.min_token_length:
             return None
         return value
 
@@ -97,7 +99,9 @@ class Resolved:
         if not name:
             return None
         value = self.secrets.get(name, "")
-        if len(value) < self.config.metrics.min_token_length:
+        # Blank is absent whatever `min_token_length` says. A floor of 0 used to let an unset
+        # variable through as "", which compares equal to an empty presented token.
+        if not value.strip() or len(value) < self.config.metrics.min_token_length:
             return None
         return value
 

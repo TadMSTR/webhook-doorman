@@ -18,6 +18,7 @@ from webhook_doorman.errors import ConfigError
 from webhook_doorman.filtering import (
     FILTER_REASONS,
     TRUNCATION_MARKER,
+    FilterVerdict,
     dig,
     evaluate,
     truncate,
@@ -478,3 +479,11 @@ class TestFilteredEventIsStored:
             "SELECT COUNT(*) AS n FROM deliveries WHERE event_id = ?", (result["event_id"],)
         )
         assert int((await cursor.fetchone())["n"]) == 1
+
+
+def test_an_absent_deny_path_does_not_skip_the_ones_after_it():
+    """`continue`, not `break`: an absent path passes, and the next one is still checked."""
+    verdict = evaluate(
+        make_filter(deny={"not.there": ["x"], "action": ["opened"]}), "issues.opened", PAYLOAD
+    )
+    assert verdict == FilterVerdict(False, "deny", "action")

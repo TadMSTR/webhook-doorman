@@ -94,12 +94,20 @@ def configure(
 
     service_name = environ.get(SERVICE_NAME_VAR, "").strip() or DEFAULT_SERVICE_NAME
     provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
-    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    # The endpoint this function decided on, passed explicitly. `OTLPSpanExporter()` with no
+    # argument re-reads `os.environ`, so a caller's `env` decided whether tracing was on while the
+    # process environment decided where spans went, and the log line below could name the wrong
+    # host. The signal-specific variable still wins, as it does in OTel itself.
+    traces_endpoint = (
+        environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+        or endpoint.rstrip("/") + "/v1/traces"
+    )
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=traces_endpoint)))
     trace.set_tracer_provider(provider)
     _tracer = trace.get_tracer(DEFAULT_SERVICE_NAME)
 
     _instrument(app, secret_values)
-    log.info("tracing_enabled", endpoint=endpoint, service_name=service_name)
+    log.info("tracing_enabled", endpoint=traces_endpoint, service_name=service_name)
     return True
 
 

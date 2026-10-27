@@ -32,11 +32,13 @@ import time
 from collections.abc import Iterable, Mapping
 
 from .filtering import FILTER_REASONS as _FILTER_REASONS
+from .filtering import ROUTE_REASONS as _ROUTE_REASONS
 from .sanitize import SANITIZE_CLASSES as _SANITIZE_CLASSES
 
 #: Every value `outcome` can take on `delivery_attempts_total`. Closed on purpose — see the
-#: cardinality note above.
-DELIVERY_OUTCOMES = ("delivered", "retry", "permanent", "exhausted")
+#: cardinality note above. `error` is the engine failing around an attempt (a store write that
+#: raised), not the sink failing; the delivery is handed back to `pending` when that happens.
+DELIVERY_OUTCOMES = ("delivered", "retry", "permanent", "exhausted", "error")
 
 #: Every value `reason` can take on `requests_rejected_total`. These are the rejections that
 #: happen *before* verification; a signature that does not match is a verification failure and
@@ -47,6 +49,10 @@ REJECTION_REASONS = ("body_too_large", "source_disabled")
 #: than restated, so the metric's label vocabulary and the gates that produce it cannot drift
 #: into disagreeing about what a reason is.
 FILTER_REASONS = _FILTER_REASONS
+
+#: Every value `reason` can take on `deliveries_filtered_total`: the gate in a sink route's
+#: filter that refused the event.
+ROUTE_REASONS = _ROUTE_REASONS
 
 #: Every value the `class` label can take on `content_sanitized_total`. Imported for the same
 #: reason as `FILTER_REASONS` above.
@@ -89,6 +95,11 @@ _HELP: Mapping[str, tuple[str, str]] = {
         "counter",
         "Events stored but not dispatched because the source's filter refused them, by which "
         "gate refused it. Never the offending value — that is producer-controlled.",
+    ),
+    "webhook_doorman_deliveries_filtered_total": (
+        "counter",
+        "Deliveries not created because a sink route's filter refused the event, by source, "
+        "sink and the gate that refused it. The event itself may still have gone elsewhere.",
     ),
     "webhook_doorman_events_deduplicated_total": (
         "counter",
@@ -208,6 +219,7 @@ class Metrics:
         sinks: Iterable[str],
         untrusted_sources: Iterable[str] = (),
         detector_enabled: bool = False,
+        filtered_routes: Iterable[tuple[str, str]] = (),
     ) -> None:
         """Create every config-derived series at zero.
 
@@ -225,6 +237,8 @@ class Metrics:
                 `trusted` source would suggest a check is running there that is not.
             detector_enabled: whether a detector backend is configured. The verdict series are
                 created only then, for the same reason.
+            filtered_routes: `(source, sink)` pairs whose route has a filter. Only these can
+                refuse a delivery, so only these get `deliveries_filtered_total` series.
         """
         for source, strategy in sources.items():
             self.increment("webhook_doorman_events_received_total", 0.0, source=source)
@@ -255,6 +269,15 @@ class Metrics:
                     0.0,
                     source=source,
                     **{"class": sanitize_class},
+                )
+        for source, sink in filtered_routes:
+            for reason in ROUTE_REASONS:
+                self.increment(
+                    "webhook_doorman_deliveries_filtered_total",
+                    0.0,
+                    source=source,
+                    sink=sink,
+                    reason=reason,
                 )
         for sink in sinks:
             for outcome in DELIVERY_OUTCOMES:

@@ -116,11 +116,11 @@ _RULES: tuple[tuple[str, float, re.Pattern[str]], ...] = (
         # ambiguous about intent, and it is the highest-signal rule here.
         "fence_forgery",
         0.8,
-        # Deliberately the same shape as `fencing._FENCE_TAG`, including attributes. Matching
-        # only the bare `<untrusted>` would miss the realistic forgery, which mimics the real
-        # tag and therefore carries a `source` attribute. Stripping and scoring are separate
-        # jobs - `fencing` neutralises it, this records that someone tried.
-        re.compile(r"</?\s*untrusted(?=[\s>])[^>]*>", re.IGNORECASE),
+        # The opening of any spelling of the tag, attributes or not, closed or not: the same
+        # prefix as `fencing._FENCE_PREFIX`, and linear for the same reason (it runs on the
+        # ingest request). Stripping and scoring are separate jobs - `fencing` neutralises it,
+        # this records that someone tried, and the attempt is the prefix.
+        re.compile(r"<(?:\s*/)?\s*untrusted(?=[\s>/])", re.IGNORECASE),
     ),
     (
         "role_marker",
@@ -188,8 +188,9 @@ class HeuristicDetector:
     name = "heuristic"
 
     #: Bumped when `_RULES` changes in a way that moves scores, so a verdict stored last month
-    #: stays interpretable.
-    version = "1"
+    #: stays interpretable. 2 (0.7.0): `fence_forgery` matches the tag's opening in every
+    #: spelling, closed or not, so inputs that scored 0 under 1 can score 0.8 under 2.
+    version = "2"
 
     async def score(self, text: str) -> DetectionResult:
         total = 0.0

@@ -556,8 +556,8 @@ more than one replica, or load past a single writer.
 **Protected.** There is no code path where a missing or empty secret accepts a request. Every
 credential comparison is constant-time. HMAC covers the raw bytes. Credentials are redacted
 before storage and never appear in a log or a response. Verification failures tell the caller
-nothing. The body is capped before it is buffered. `/admin/` requires a token of at least 32
-characters and is disabled without one.
+nothing. The body is capped before it is buffered. `/admin/` requires a token of at least
+`admin.min_token_length` characters (32 by default) and is disabled without one.
 
 **Not protected.** TLS and rate limiting — that is the reverse proxy's job. The exposure decision
 itself: what can reach the published port is the operator's network configuration. The secrecy of

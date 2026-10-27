@@ -38,7 +38,7 @@ updates:
       opentelemetry:
         patterns: ["opentelemetry-*"]
       dev-tools:
-        patterns: ["ruff", "pytest", "pytest-*", "pip-audit"]
+        patterns: ["ruff", "pytest", "pytest-*", "pip-audit", "mutmut"]
       dev-dependencies:
         dependency-type: "development"
     ignore:
@@ -82,6 +82,16 @@ updates:
   # much as anything in the lock, and nothing else in this repo watches them.
   - package-ecosystem: "docker"
     directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # The Trivy scanner verify-image.sh runs. Its Dockerfile is never built; it only holds the pin
+  # so that this ecosystem can bump it.
+  - package-ecosystem: "docker"
+    directory: "/.github/ci/trivy"
     schedule:
       interval: "weekly"
     ignore:

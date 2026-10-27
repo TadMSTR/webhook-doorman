@@ -104,6 +104,16 @@ sources:
     #   * a path that does NOT resolve FAILS a `require` — you asked for a guarantee the
     #     payload did not carry, so it is refused;
     #   * a path that does NOT resolve PASSES a `deny` — absent is not the thing being refused.
+    #
+    # Each entry under `sinks:` may also carry its own filter, which decides only whether THAT
+    # sink gets a delivery (event_types / require / deny; no max_field_bytes). Values compare
+    # as text, so an integer 3 matches "3". See docs/configuration.md, "Per-sink filters".
+    #
+    #   sinks:
+    #     - team-chat                         # a bare name: every admitted event
+    #     - name: pager
+    #       filter:
+    #         event_types: [workflow_run]
     # `deny` is evaluated first, so a payload that satisfies `require` and matches `deny` is
     # refused as `deny`.
     #

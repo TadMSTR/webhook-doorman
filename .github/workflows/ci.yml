@@ -20,10 +20,13 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No token left in .git/config for later steps to read; nothing here pushes.
+          persist-credentials: false
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -58,7 +61,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No token left in .git/config for later steps to read; nothing here pushes.
+          persist-credentials: false
 
       # Each assertion has a floor. A grep that matches nothing yields an empty list, and an
       # empty list "agrees" with anything, so an unparsed file must fail rather than pass.
@@ -79,10 +85,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No token left in .git/config for later steps to read; nothing here pushes.
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -131,7 +140,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No token left in .git/config for later steps to read; nothing here pushes.
+          persist-credentials: false
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -147,7 +159,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -170,10 +182,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No token left in .git/config for later steps to read; nothing here pushes.
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -220,3 +235,38 @@ jobs:
           uv export --frozen --extra dev --extra otel --no-emit-project \
             --format pylock.toml -o audit-dev/pylock.toml
           pip-audit --strict --locked audit-dev
+
+  # Mutation testing on the three security modules: does a test fail when the code changes?
+  # Line coverage cannot answer that, and #759 was the case: `compare_digest` -> `!=` in
+  # verify_hmac survived the whole suite at 97% coverage. Per-module survivor ceilings and
+  # mutant floors are in tests/check_mutation_floor.py, measured, with the reasoning.
+  #
+  # Installed from the lock, not the ranges: a mutation score is only comparable run to run if
+  # the same mutmut and the same pytest produced it.
+  mutation:
+    name: Mutation (security modules)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No token left in .git/config for later steps to read; nothing here pushes.
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      - name: Install the locked dev environment
+        run: uv sync --frozen --extra dev --extra otel --python 3.13
+
+      - name: Run mutmut
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          mutmut run --max-children 4
+
+      - name: Assert the survivor ceilings and mutant floors
+        run: |
+          source .venv/bin/activate
+          python tests/check_mutation_floor.py
+

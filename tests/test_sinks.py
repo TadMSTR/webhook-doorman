@@ -735,3 +735,51 @@ class TestRegistry:
         )
         with pytest.raises(PermanentSinkError):
             build_sink(spec, {})
+
+
+class TestHeaderSafety:
+    """Event text in a header must be one line, and a refused request must not be retried.
+
+    A fenced title is multi-line by construction, so an `agent_readable` ntfy sink with a fenced
+    field in `title_template` used to fail every attempt: h11 refuses CR/LF in a header value
+    before sending, httpx raises `LocalProtocolError`, and that was classed as a retryable
+    transport error. The mock transport skips h11's check, which is why no test saw it.
+    """
+
+    async def test_a_multi_line_title_is_folded_onto_one_line(self, client, httpx_mock):
+        httpx_mock.add_response(url="https://ntfy.example.invalid/alerts", status_code=200)
+        context = {**CONTEXT, "summary": 'line one\r\n<untrusted source="x">\nline two\x00'}
+        await TestNtfyNonAsciiTitle.sink().deliver(context, client)
+        title = httpx_mock.get_requests()[0].headers["title"]
+        assert "\n" not in title and "\r" not in title and "\x00" not in title
+        assert title == 'line one <untrusted source="x"> line two'
+
+    async def test_a_request_httpx_refuses_to_send_is_permanent(self, client, httpx_mock):
+        httpx_mock.add_exception(httpx.LocalProtocolError("Illegal header value"))
+        with pytest.raises(PermanentSinkError, match="refused before sending"):
+            await TestNtfyNonAsciiTitle.sink().deliver(CONTEXT, client)
+
+
+class TestMatrixIdempotencyAndMentions:
+    SECRETS = {"MATRIX_TOKEN": "t" * 16, "MATRIX_ROOM": "!abc:example.invalid"}  # noqa: RUF012
+
+    async def test_the_transaction_id_is_stable_across_retries_of_one_delivery(
+        self, client, httpx_mock
+    ):
+        """The point of a txn id. It used to include the clock, so a retry posted twice."""
+        httpx_mock.add_response(status_code=200, is_reusable=True)
+        sink = TestMatrixSink.sink(self.SECRETS)
+        await sink.deliver({**CONTEXT, "delivery_key": "17"}, client)
+        await sink.deliver({**CONTEXT, "delivery_key": "17"}, client)
+        await sink.deliver({**CONTEXT, "delivery_key": "18"}, client)
+        urls = [str(r.url) for r in httpx_mock.get_requests()]
+        assert urls[0] == urls[1]
+        assert urls[0] != urls[2]
+
+    async def test_mentions_are_switched_off(self, client, httpx_mock):
+        """`@room` in an issue title must not ping the room."""
+        httpx_mock.add_response(status_code=200)
+        sink = TestMatrixSink.sink(self.SECRETS)
+        await sink.deliver({**CONTEXT, "summary": "@room urgent"}, client)
+        body = json.loads(httpx_mock.get_requests()[0].read())
+        assert body["m.mentions"] == {}

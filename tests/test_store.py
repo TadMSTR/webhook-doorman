@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import timedelta
 
 import pytest
@@ -333,3 +334,80 @@ class TestRetention:
             events_before=utcnow() - timedelta(days=30), dlq_before=utcnow() - timedelta(days=90)
         )
         assert (await store.stats())["deliveries"] == 0
+
+
+class TestReleaseClaim:
+    """`release_claim` hands back an `in_flight` delivery only.
+
+    The guard matters when a delivery's `mark_delivered` committed and a later bookkeeping step
+    raised: without it the delivered row would go back to `pending` and be sent again.
+    """
+
+    async def test_it_requeues_an_in_flight_delivery(self, store):
+        event_id, _ = await store.record_event(make_event("rc-1"))
+        [delivery_id] = await store.enqueue_deliveries(event_id, ["notes"])
+        await store.claim_due_deliveries(utcnow(), 10)
+        later = utcnow() + timedelta(minutes=5)
+        assert await store.release_claim(delivery_id, later) is True
+        assert await store.claim_due_deliveries(utcnow(), 10) == []  # not due yet
+
+    async def test_it_leaves_a_delivered_row_alone(self, store):
+        event_id, _ = await store.record_event(make_event("rc-2"))
+        [delivery_id] = await store.enqueue_deliveries(event_id, ["notes"])
+        await store.claim_due_deliveries(utcnow(), 10)
+        await store.mark_delivered(delivery_id, 200, 5)
+        assert await store.release_claim(delivery_id, utcnow()) is False
+        cursor = await store.db.execute(
+            "SELECT status FROM deliveries WHERE id = ?", (delivery_id,)
+        )
+        assert (await cursor.fetchone())["status"] == DeliveryStatus.DELIVERED.value
+
+
+async def test_a_stored_body_python_cannot_decode_still_reads_back(store):
+    """Ingest accepts a body over the int-conversion limit as non-JSON; the store must too (CR-02).
+
+    It used to raise ValueError from `get_event`, so delivery, replay and release of the event
+    failed every time.
+    """
+    huge = b'{"a": ' + b"9" * 5000 + b"}"
+    event = dataclasses.replace(make_event("huge-1"), body=huge, payload=None)
+    event_id, _ = await store.record_event(event)
+    stored = await store.get_event(event_id)
+    assert stored is not None
+    assert stored.payload is None
+
+
+async def test_a_withheld_verdict_is_never_downgraded(store):
+    """F-06. A resumed redelivery can screen concurrently with the original ingest. A later
+    `received` verdict must not overwrite an earlier `quarantined` one."""
+    event_id, _ = await store.record_event(make_event("verdict-1"))
+    await store.record_detection(
+        event_id, detection={"score": 1.0}, status=EventStatus.QUARANTINED, quarantined_at=utcnow()
+    )
+    await store.record_detection(
+        event_id, detection={"score": 0.0}, status=EventStatus.RECEIVED, quarantined_at=None
+    )
+    assert (await store.get_event(event_id)).status is EventStatus.QUARANTINED
+
+
+async def test_install_id_is_stable_per_database_and_differs_between_them(tmp_path):
+    """F-07."""
+    a = SqliteStore(tmp_path / "a.db")
+    await a.connect()
+    first = a.install_id
+    await a.close()
+    await a.connect()
+    assert a.install_id == first
+    await a.close()
+    b = SqliteStore(tmp_path / "b.db")
+    await b.connect()
+    assert b.install_id and b.install_id != first
+    await b.close()
+
+
+async def test_the_intended_sinks_are_stored(store):
+    """F-01's stored fact: the sink list decided at ingest, empty included."""
+    routed, _ = await store.record_event(make_event("sinks-1"))
+    unrouted, _ = await store.record_event(dataclasses.replace(make_event("sinks-2"), sinks=[]))
+    assert (await store.get_event(routed)).sinks == ["chat"]
+    assert (await store.get_event(unrouted)).sinks == []

@@ -68,6 +68,24 @@ if grep -E '^(src/|build/|\.git/)' "$WORK/own.txt"; then
 fi
 echo "image contents clean ($(wc -l < "$WORK/all.txt") entries, $own_count non-vendored)"
 
+# No pip anywhere in the merged filesystem (vikunja#1033). Read from all.txt, not own.txt: both
+# copies live under paths the vendored filter above removes. The python3 count is the control.
+# A listing that had lost /usr/local would show no pip and prove nothing.
+py_count=$(grep -cE '^usr/local/bin/python3' "$WORK/all.txt" || true)
+[ "$py_count" -ge 1 ] || fail "no usr/local/bin/python3 in the image listing — the pip check below would be vacuous"
+# Into a file, not `grep | head`: under pipefail, head closing the pipe kills grep with SIGPIPE,
+# and the `if` reads 141 as "no match". That shipped green against the 0.6.0 image in a draft.
+grep -E '(^|/)site-packages/pip(/|-[0-9][^/]*\.dist-info/)|^usr/local/bin/pip' \
+  "$WORK/all.txt" > "$WORK/pip.txt" || true
+if [ -s "$WORK/pip.txt" ]; then
+  head -5 "$WORK/pip.txt"
+  fail "pip reached the runtime image ($(wc -l < "$WORK/pip.txt") paths)"
+fi
+if docker run --rm --entrypoint python "$IMAGE" -c 'import pip' >/dev/null 2>&1; then
+  fail "'import pip' succeeds inside the image"
+fi
+echo "pip absent (filesystem and import)"
+
 # --- 2. Runtime user --------------------------------------------------------------------------
 echo "--- runtime uid ---"
 uid=$(docker run --rm --entrypoint id "$IMAGE" -u)
@@ -117,6 +135,53 @@ echo "auditing $pkgs installed packages from the image"
 [ "$pkgs" -ge 20 ] || fail "only $pkgs packages found in the image — extraction is wrong and this gate would be vacuous"
 
 pip-audit --strict --path "$sp"
+
+# --- 4b. Image scan: OS packages and everything pip-audit cannot see --------------------------
+#
+# pip-audit reads only the venv's dist-info. It is blind to Debian packages and to vendored
+# copies, such as pip's own certifi and urllib3. On 0.6.0 this step failed (6 fixable
+# HIGH/CRITICAL) while the audit above passed on all but one of them (vikunja#1033).
+#
+# HIGH/CRITICAL with a fix available, and no .trivyignore: an unfixable finding gives a red build
+# with no action behind it, which is how a gate gets bypassed rather than fixed.
+#
+# The scanner's reference comes from .github/ci/trivy/Dockerfile, so Dependabot bumps it. It
+# scans a `docker save` tarball mounted read-only, rather than the daemon through a mounted
+# socket. The socket would give a third-party image root on the runner.
+echo "--- image scan (trivy) ---"
+TRIVY=$(sed -n 's/^FROM \([^ ]*\).*/\1/p' .github/ci/trivy/Dockerfile)
+[[ "$TRIVY" == *@sha256:* ]] || fail "trivy reference '$TRIVY' is not digest-pinned"
+docker save "$IMAGE" -o "$WORK/image-save.tar"
+docker run --rm -v "$WORK:/work:ro" "$TRIVY" image --quiet --scanners vuln \
+  --input /work/image-save.tar --list-all-pkgs --format json > "$WORK/trivy.json"
+
+# The floor, again: a scan that recognised no packages finds nothing and would pass. Measured
+# 2026-10-27: 87 Debian and 49 Python packages without pip, and 87 and 85 on 0.6.0, where
+# pip's vendored copies count too.
+python3 - "$WORK/trivy.json" <<'PY' || fail "trivy gate failed"
+import json, sys
+d = json.load(open(sys.argv[1]))
+os_n = py_n = 0
+bad = []
+for r in d.get("Results") or []:
+    n = len(r.get("Packages") or [])
+    if r.get("Class") == "os-pkgs":
+        os_n += n
+    elif r.get("Type") == "python-pkg":
+        py_n += n
+    for v in r.get("Vulnerabilities") or []:
+        if v.get("Severity") in ("HIGH", "CRITICAL") and v.get("FixedVersion"):
+            bad.append(f'{v["Severity"]:8} {v["PkgName"]} {v["InstalledVersion"]} -> '
+                       f'{v["FixedVersion"]} {v["VulnerabilityID"]} {v.get("PkgPath", "")}')
+print(f"trivy recognised {os_n} OS and {py_n} Python packages")
+if os_n < 40 or py_n < 20:
+    sys.exit("too few packages recognised; the scan is vacuous")
+for b in bad:
+    print("::error::" + b)
+if bad:
+    sys.exit(f"{len(bad)} fixable HIGH/CRITICAL finding(s)")
+print("no fixable HIGH/CRITICAL findings")
+PY
 
 # --- 5. Service contract ----------------------------------------------------------------------
 #

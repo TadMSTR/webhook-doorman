@@ -22,6 +22,10 @@ from ..models import Delivery, DlqEntry, EventStatus, HeldEntry, InboundEvent, S
 class Store(Protocol):
     """Durable storage for events, delivery attempts and the dead-letter queue."""
 
+    #: A random id for this database, stable once created. Set by `connect`. Prefixes
+    #: idempotency keys sent to destinations so they stay unique across a re-created database.
+    install_id: str
+
     async def connect(self) -> None:
         """Open the store and apply any schema migrations. Idempotent.
 
@@ -52,6 +56,20 @@ class Store(Protocol):
 
     async def enqueue_deliveries(self, event_id: int, sinks: list[str]) -> list[int]:
         """Create one pending delivery per sink. Returns the new delivery ids."""
+        ...
+
+    async def enqueue_first_deliveries(self, event_id: int, sinks: list[str]) -> list[int]:
+        """Queue an event's first deliveries, atomically and at most once.
+
+        Queues nothing, and returns `[]`, unless the event has no deliveries yet AND is still
+        `received`. Both conditions are checked in the same statement as the insert. That is the
+        guarantee the ingest path relies on: a redelivery resuming an interrupted dispatch cannot
+        double the deliveries, and cannot queue an event the detector has just withheld.
+        """
+        ...
+
+    async def has_deliveries(self, event_id: int) -> bool:
+        """Whether any delivery row exists for the event."""
         ...
 
     async def claim_due_deliveries(self, now: datetime, limit: int) -> list[Delivery]:
@@ -119,8 +137,23 @@ class Store(Protocol):
         different fact from a score of zero and is stored as a different value.
         """
 
-    async def release_event(self, event_id: int) -> None:
-        """Return a quarantined event to `received`. The caller queues the deliveries."""
+    async def release_event(self, event_id: int) -> bool:
+        """Return a quarantined event to `received`. The caller queues the deliveries.
+
+        Returns whether THIS call did it. The status test and the write are one statement, so of
+        two concurrent releases exactly one gets `True`, and only that one may enqueue.
+        """
+        ...
+
+    async def release_claim(self, delivery_id: int, next_attempt_at: datetime) -> bool:
+        """Hand an `in_flight` delivery back to `pending`, due at `next_attempt_at`.
+
+        For a delivery whose attempt raised in the engine rather than the sink, so it is not left
+        claimed until the next restart. It counts as an attempt: a failure that repeats on every
+        pass (an event that cannot be read back, a full disk) must reach `max_attempts` and the
+        DLQ, not loop for ever.
+        """
+        ...
 
     async def list_held(self, *, limit: int, before_id: int | None = None) -> list[HeldEntry]:
         """Quarantined events, newest first, for `GET /admin/held`.

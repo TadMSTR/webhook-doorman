@@ -475,3 +475,49 @@ class TestDegradedScrape:
         assert families(text), "still valid exposition"
         assert "webhook_doorman_events_received_total" in text
         assert "webhook_doorman_events_stored" not in text
+
+
+class TestNonAsciiCredentialsOverHttp:
+    """A non-ASCII credential is a 401 that is counted and logged, never a 500.
+
+    Fingerprints e191bc2b (webhook verification) and 1505e4aa (admin token). The `/metrics`
+    token had the same shape and is pinned here too. Before the fix, `hmac.compare_digest` raised
+    `TypeError` on the non-ASCII `str`, and each of these answered 500 with a traceback while
+    the counter and the log line that exist to show probing stayed silent.
+
+    `raise_server_exceptions=False` so a regression shows up as the 500 a caller would see,
+    rather than as the exception itself.
+    """
+
+    def _client(self, tmp_path, **overrides):
+        env = {**ENV, "ADMIN_TOKEN": "admin-token-for-tests-0123456789abcd"}
+        resolved = resolve(Config.model_validate(config_data(**overrides)), env)
+        engine = Engine(resolved, store=SqliteStore(tmp_path / "d.db"))
+        app = create_app(resolved=resolved, engine=engine)
+        return TestClient(app, client=("127.0.0.1", 51234), raise_server_exceptions=False)
+
+    def test_webhook_signature(self, tmp_path, capsys):
+        with self._client(tmp_path) as client:
+            bad = {**headers(), "X-Hub-Signature-256": b"sha256=\xff"}
+            assert client.post("/webhook/github", content=BODY, headers=bad).status_code == 401
+            count = sample(
+                scrape(client),
+                "webhook_doorman_verification_failures_total",
+                source="github",
+                strategy="hmac_sha256",
+            )
+        assert count == 1
+        assert "verification_failed" in capsys.readouterr().out
+
+    def test_admin_token(self, tmp_path, capsys):
+        with self._client(tmp_path, admin={"token_env": "ADMIN_TOKEN"}) as client:
+            auth = {"Authorization": b"Bearer \xe9" + b"x" * 40}
+            assert client.post("/admin/replay/1", headers=auth).status_code == 401
+            assert client.get("/admin/dlq", headers=auth).status_code == 401
+        assert "admin_auth_failed" in capsys.readouterr().out
+
+    def test_metrics_token(self, tmp_path, capsys):
+        with self._client(tmp_path, metrics={"token_env": "METRICS_TOKEN"}) as client:
+            auth = {"Authorization": b"Bearer \xe9" + b"x" * 40}
+            assert client.get("/metrics", headers=auth).status_code == 401
+        assert "metrics_auth_failed" in capsys.readouterr().out
