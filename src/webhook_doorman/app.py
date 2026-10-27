@@ -215,7 +215,10 @@ def build_source_route(
             parsed = parse(parser_name, safe_body, headers)
             delivery_id = compute_delivery_id(state, headers, safe_body)
 
-            payload_json = _safe_json(safe_body)
+            # A second value pass, on the decoded form. `redact_bytes` matches the spellings a
+            # JSON encoder emits, but a producer can escape any character, and decoding undoes
+            # every escape. What reaches templates and filters is redacted either way.
+            payload_json = redact_json(_safe_json(safe_body), secret_values)
 
             # Sanitisation applies on `trust: untrusted` regardless of where the event is
             # going, because the characters it removes are unwanted in a chat room and a log
@@ -288,9 +291,16 @@ def build_source_route(
 
 
 def _safe_json(body: bytes) -> Any:
+    """The decoded body, or `None` for a body that is not JSON this process can hold.
+
+    `ValueError` covers more than malformed JSON: an integer over Python's 4300-digit
+    conversion limit raises it too, and deep nesting raises `RecursionError`. Either used to
+    answer 500, which a producer retries for ever. A body that cannot be decoded is stored as
+    a non-JSON event instead, like any other.
+    """
     try:
         return json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (ValueError, RecursionError):
         return None
 
 
@@ -644,6 +654,12 @@ def create_app(
         version=__version__,
         description="A fail-closed inbound webhook router.",
         lifespan=lifespan,
+        # No interactive docs and no schema. They are unauthenticated, and `/openapi.json` lists
+        # every ingest path and the admin API, which is the topology `/metrics` is kept off the
+        # public proxy for. A webhook router has no human API client to document itself to.
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
         # tracing.py owns OpenTelemetry export, and it is the only thing that may. FastAPI
         # 0.142 added native telemetry that, on lifespan startup, reads the same
         # OTEL_EXPORTER_OTLP_ENDPOINT and attaches its OWN exporter to whatever TracerProvider

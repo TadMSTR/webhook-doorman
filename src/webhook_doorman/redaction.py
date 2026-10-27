@@ -21,6 +21,7 @@ Two passes, because credentials arrive by two routes:
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -74,10 +75,28 @@ def redact_bytes(body: bytes, secret_values: Iterable[str]) -> bytes:
     fix; a token sitting in a backed-up SQLite file is not.
     """
     for value in _redactable(secret_values):
-        encoded = value.encode("utf-8", errors="ignore")
-        if encoded and encoded in body:
-            body = body.replace(encoded, REDACTED.encode("ascii"))
+        for form in _byte_forms(value):
+            if form in body:
+                body = body.replace(form, REDACTED.encode("ascii"))
     return body
+
+
+def _byte_forms(value: str) -> list[bytes]:
+    """The spellings of `value` a JSON producer can put on the wire, longest first.
+
+    The raw UTF-8 bytes, plus what standard encoders emit inside a JSON string: `/` as `\\/`
+    (PHP's `json_encode` default) and non-ASCII as `\\uXXXX` (Python's default). Matching only
+    the raw bytes let an escaped secret reach storage, and then reach `payload` in the clear,
+    because decoding undoes the escape. A producer can escape any character it likes, so this
+    is not exhaustive. The decoded `payload` gets its own value pass at ingest (`app.py`) as the
+    backstop.
+    """
+    forms = {value.encode("utf-8", errors="ignore")}
+    for ensure_ascii in (True, False):
+        escaped = json.dumps(value, ensure_ascii=ensure_ascii)[1:-1]
+        forms.add(escaped.encode("utf-8"))
+        forms.add(escaped.replace("/", "\\/").encode("utf-8"))
+    return sorted((f for f in forms if f), key=len, reverse=True)
 
 
 def redact_json(value: Any, secret_values: Iterable[str]) -> Any:

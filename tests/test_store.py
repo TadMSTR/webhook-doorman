@@ -333,3 +333,30 @@ class TestRetention:
             events_before=utcnow() - timedelta(days=30), dlq_before=utcnow() - timedelta(days=90)
         )
         assert (await store.stats())["deliveries"] == 0
+
+
+class TestReleaseClaim:
+    """`release_claim` hands back an `in_flight` delivery only.
+
+    The guard matters when a delivery's `mark_delivered` committed and a later bookkeeping step
+    raised: without it the delivered row would go back to `pending` and be sent again.
+    """
+
+    async def test_it_requeues_an_in_flight_delivery(self, store):
+        event_id, _ = await store.record_event(make_event("rc-1"))
+        [delivery_id] = await store.enqueue_deliveries(event_id, ["notes"])
+        await store.claim_due_deliveries(utcnow(), 10)
+        later = utcnow() + timedelta(minutes=5)
+        assert await store.release_claim(delivery_id, later) is True
+        assert await store.claim_due_deliveries(utcnow(), 10) == []  # not due yet
+
+    async def test_it_leaves_a_delivered_row_alone(self, store):
+        event_id, _ = await store.record_event(make_event("rc-2"))
+        [delivery_id] = await store.enqueue_deliveries(event_id, ["notes"])
+        await store.claim_due_deliveries(utcnow(), 10)
+        await store.mark_delivered(delivery_id, 200, 5)
+        assert await store.release_claim(delivery_id, utcnow()) is False
+        cursor = await store.db.execute(
+            "SELECT status FROM deliveries WHERE id = ?", (delivery_id,)
+        )
+        assert (await cursor.fetchone())["status"] == DeliveryStatus.DELIVERED.value

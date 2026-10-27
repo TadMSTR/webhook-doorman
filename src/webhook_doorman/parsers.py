@@ -20,7 +20,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+import structlog
+
 from .errors import ConfigError
+
+log = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -57,7 +61,8 @@ def _decode(body: bytes) -> Any:
     """Decode a JSON body, or return None. Never raises — a non-JSON body is still an event."""
     try:
         return json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (ValueError, RecursionError):
+        # ValueError includes JSONDecodeError, UnicodeDecodeError and the int-conversion limit.
         return None
 
 
@@ -256,5 +261,18 @@ def register_parser(name: str, parser: Parser) -> None:
 
 
 def parse(name: str, body: bytes, headers: Mapping[str, str]) -> ParsedEvent:
-    """Decode `body` and run the named parser over it."""
-    return get_parser(name)(_decode(body), headers)
+    """Decode `body` and run the named parser over it. Never raises for a bad payload.
+
+    The parsers are written defensively, but a field of an unexpected type (a Grafana `status`
+    of `5`, a GitHub `issue.body` that is a number) could still raise from inside one. That
+    reached the client as a 500, which a producer retries for ever, and the event was never
+    stored. A parser failure is now an unparseable, non-actionable event, stored like any other
+    and logged with the exception's class name (never its message, which can quote the payload).
+    """
+    parser = get_parser(name)
+    payload = _decode(body)
+    try:
+        return parser(payload, headers)
+    except Exception as exc:
+        log.warning("parser_failed", parser=name, error_type=type(exc).__name__)
+        return ParsedEvent(name, f"unparseable {name} payload", actionable=False)

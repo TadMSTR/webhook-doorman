@@ -294,6 +294,13 @@ class SourceConfig(_Strict):
     def _leading_slash(cls, v: str) -> str:
         if not v.startswith("/"):
             raise ValueError(f"path must start with '/' (got {v!r})")
+        if "{" in v or "}" in v:
+            # The path is registered as a FastAPI route, and braces make it a template.
+            # `/{rest:path}` would match every request, `/admin/...` included, and source routes
+            # are registered first, so the reservations below would mean nothing.
+            raise ValueError(
+                f"path must be literal; '{{' and '}}' make it a route template ({v!r})"
+            )
         if v.startswith("/admin"):
             raise ValueError(
                 "path must not live under /admin — that prefix is reserved for the "
@@ -325,6 +332,14 @@ class SourceConfig(_Strict):
     def _at_least_one_sink(cls, v: list[SinkRoute]) -> list[SinkRoute]:
         if not v:
             raise ValueError("must route to at least one sink")
+        names = [r.name for r in v]
+        repeated = sorted({n for n in names if names.count(n) > 1})
+        if repeated:
+            # Each entry is one delivery, so a repeat sends every event twice. With route
+            # filters it is also ambiguous: one entry could admit what the other refuses.
+            raise ValueError(
+                f"sink(s) {repeated} listed more than once; combine their filters into one entry"
+            )
         return v
 
     @property

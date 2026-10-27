@@ -443,7 +443,9 @@ class Engine:
         if not sinks:
             return {"status": "no_sinks", "event_id": event_id}
 
-        await self.store.enqueue_deliveries(event_id, sinks)
+        # At most once: the event is `received` with no deliveries at this point, which is
+        # exactly the state `enqueue_first_deliveries` requires.
+        await self.store.enqueue_first_deliveries(event_id, sinks)
         log.warning("event_released", event_id=event_id, source=event.source, sinks=sinks)
         return {"status": "released", "event_id": event_id, "sinks": sinks}
 
