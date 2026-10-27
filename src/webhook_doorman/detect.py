@@ -188,8 +188,9 @@ class HeuristicDetector:
     name = "heuristic"
 
     #: Bumped when `_RULES` changes in a way that moves scores, so a verdict stored last month
-    #: stays interpretable.
-    version = "1"
+    #: stays interpretable. 2 (0.7.0): `fence_forgery` matches the tag's opening in every
+    #: spelling, closed or not, so inputs that scored 0 under 1 can score 0.8 under 2.
+    version = "2"
 
     async def score(self, text: str) -> DetectionResult:
         total = 0.0

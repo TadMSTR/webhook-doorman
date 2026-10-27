@@ -42,7 +42,9 @@ transaction); back up `/data` first if you want a way back to 0.6.0.
   refused (`not_replayable`). Quarantined events leave through `/admin/release` only.
 - `/admin/release` is atomic: concurrent releases of one event queue one set of deliveries.
 - Fence-tag stripping catches every spelling of the tag, including ones that form when another
-  is removed, and stays linear on adversarial input.
+  is removed, and stays linear on adversarial input. The detector's `fence_forgery` rule matches
+  the tag's opening in every spelling, so its version is now `2`: stored verdicts say which rule
+  set scored them.
 - On an agent-readable sink, `summary` and `payload` are always fenced, whatever the parser
   declared or the source's trust was when the event was stored.
 - The detector reads structured fields as their text, sanitised, rather than their Python repr.

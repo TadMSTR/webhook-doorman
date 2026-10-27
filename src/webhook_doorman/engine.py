@@ -264,17 +264,19 @@ class Engine:
         # still pending is not scored and counted a second time.
         if await self.store.has_deliveries(event_id):
             return None
-
-        withheld = await self._screen(stored, event_id)
-        if withheld is not None:
-            return withheld
         # The stored decision, not this request's: the content and the routing must come from
         # the same event. Narrowed by the current routes, as `release` and `replay` are, so a
-        # route filter tightened since the event was stored is honoured here too.
+        # route filter tightened since the event was stored is honoured here too. Also before
+        # screening: an event no current route accepts would otherwise be scored again on every
+        # redelivery, and answered as a duplicate each time.
         current = set(self._sinks_for(stored))
         sinks = [sink for sink in stored.sinks if sink in current]
         if not sinks:
             return None
+
+        withheld = await self._screen(stored, event_id)
+        if withheld is not None:
+            return withheld
         queued = await self.store.enqueue_first_deliveries(event_id, sinks)
         if not queued:
             return None  # a concurrent redelivery got there first
@@ -553,14 +555,16 @@ class Engine:
         """
         error = self._redact_error(repr(exc))
         log.error("delivery_worker_error", delivery=delivery.id, sink=delivery.sink, error=error)
-        METRICS.increment(
-            "webhook_doorman_delivery_attempts_total", sink=delivery.sink, outcome="error"
-        )
         attempts_made = delivery.attempt + 1
         try:
             if attempts_made >= self.config.delivery.max_attempts:
+                # Counted once, as `exhausted`, like a sink failure's last attempt: the outcomes
+                # of `delivery_attempts_total` sum to the number of attempts.
                 await self._dead_letter(delivery, f"engine error: {error}", None, 0, attempts_made)
                 return
+            METRICS.increment(
+                "webhook_doorman_delivery_attempts_total", sink=delivery.sink, outcome="error"
+            )
             retry_at = utcnow() + timedelta(seconds=self.retry_delay_seconds(attempts_made))
             await self.store.release_claim(delivery.id, retry_at)
         except Exception:

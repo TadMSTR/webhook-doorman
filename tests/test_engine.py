@@ -700,17 +700,58 @@ class TestAuditRound1:
         ]
         assert exhausted and exhausted[0].rsplit(" ", 1)[1] in ("1", "1.0")
         assert "delivery_exhausted" in capsys.readouterr().out
+        # R3-01: each attempt counted once. The last is `exhausted`, the others `error`, so the
+        # outcomes sum to max_attempts.
+        errors = [
+            line
+            for line in METRICS.render(version="t", stats=None).splitlines()
+            if 'outcome="error"' in line and 'sink="notes"' in line
+        ]
+        assert float(errors[0].rsplit(" ", 1)[1]) == CONFIG["delivery"]["max_attempts"] - 1
 
-    async def test_a_resume_honours_a_route_tightened_since(self, engine, monkeypatch):
-        """R2-05. Resume routes by the stored list, narrowed by the current routes, as release
-        and replay are."""
-        _fail_first_enqueue(engine, monkeypatch)
-        with pytest.raises(RuntimeError):
-            await engine.ingest(event("tight-1", sinks=["notes"]))
-        monkeypatch.setattr(engine, "_sinks_for", lambda stored: [])
-        retry = await engine.ingest(event("tight-1", sinks=["notes"]))
-        assert retry.get("resumed") is not True
-        assert (await engine.stats()).get("deliveries_pending", 0) == 0
+    async def test_a_resume_honours_a_route_tightened_since(self, tmp_path, monkeypatch):
+        """R2-05 and R3-02, through a real route filter in config, not a stub.
+
+        The event was stored meant for `notes`; the route now refuses its event type. The
+        redelivery is not resumed, and the detector does not score it again.
+        """
+        config = Config.model_validate(
+            {
+                **CONFIG,
+                "detector": {"backend": "heuristic"},
+                "sources": [
+                    {
+                        **CONFIG["sources"][0],
+                        "sinks": [{"name": "notes", "filter": {"event_types": ["other"]}}],
+                    }
+                ],
+            }
+        )
+        eng = Engine(resolve(config, ENV), store=SqliteStore(tmp_path / "tight.db"))
+        await eng.start()
+        try:
+            calls = {"n": 0}
+
+            class Counting:
+                name = "counting"
+
+                async def score(self, text):
+                    calls["n"] += 1
+                    return DetectionResult(score=0.0, backend="counting")
+
+            eng._detector = Counting()
+            _fail_first_enqueue(eng, monkeypatch)
+            untrusted = {**_event_kwargs("tight-1"), "untrusted_fields": ["summary"]}
+            with pytest.raises(RuntimeError):
+                await eng.ingest(InboundEvent(**untrusted))
+            scored_at_ingest = calls["n"]
+            for _ in range(3):
+                retry = await eng.ingest(InboundEvent(**untrusted))
+                assert retry.get("resumed") is not True
+            assert calls["n"] == scored_at_ingest
+            assert (await eng.stats()).get("deliveries_pending", 0) == 0
+        finally:
+            await eng.stop()
 
     async def test_the_delivered_payload_is_redacted_too(self, tmp_path, httpx_mock):
         """F-02. The decoded `payload` is rebuilt from the stored body on every read, so a secret

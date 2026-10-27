@@ -934,3 +934,9 @@ class TestGenericPayloadIsScoredAsText:
         assert "​" not in untrusted
         result = await build_detector("heuristic").score(untrusted)
         assert result.score >= DetectorConfig().threshold
+
+
+async def test_the_heuristic_version_marks_the_rule_change():
+    """R3-03. 0.7.0 changed which inputs `fence_forgery` scores, so verdicts carry version 2."""
+    result = await build_detector("heuristic").score("hello")
+    assert result.model_version == "2"
