@@ -108,6 +108,9 @@ class StoredEvent:
     status: EventStatus
     received_at: datetime
     untrusted_fields: list[str] = field(default_factory=list)
+    sinks: list[str] | None = None
+    """The sinks this event was meant to reach when it was stored. `None` for a row written
+    before that was recorded (schema v3), which means "unknown", not "none"."""
 
     def template_context(self, *, fence: bool = False) -> dict[str, Any]:
         return _template_context(self, fence=fence, event_id=self.id)
@@ -133,18 +136,21 @@ def _template_context(event, *, fence: bool, event_id: int | None = None) -> dic
         # actions. It is the store's primary key, which is the only identifier here that is
         # ours rather than the producer's.
         context["event_id"] = event_id
-    if not fence or not event.untrusted_fields:
+    if not fence:
         return context
     from .fencing import fence_context
 
-    # `payload` is the producer's whole body, so whatever a parser marked untrusted is in it
-    # too. A parser that lifts `issue.body` into a named field still leaves it reachable as
-    # `{{ payload.issue.body }}`, unfenced and unsanitised, unless the payload is fenced as well.
-    # Fenced, it becomes one string, so `{{ payload.x }}` renders empty on an agent-readable sink.
-    # `fence_context` already documented that, and now it holds for every parser.
+    # `payload` and `summary` are fenced whenever fencing applies, whatever the stored
+    # `untrusted_fields` say. The fence decision is made now, from the current config (see
+    # `Engine._context_for`), but `untrusted_fields` was recorded at ingest: it is empty for an
+    # event stored while its source was `trusted`, for a custom parser that declares nothing,
+    # and for an unparseable payload. `payload` is the producer's whole body, so whatever a
+    # parser marked untrusted is in it too; fenced, it becomes one string, so `{{ payload.x }}`
+    # renders empty on an agent-readable sink, as `fence_context` documents.
     fields = list(event.untrusted_fields)
-    if "payload" not in fields:
-        fields.append("payload")
+    for always in ("summary", "payload"):
+        if always not in fields:
+            fields.append(always)
     return fence_context(context, source=event.source, fields=fields)
 
 

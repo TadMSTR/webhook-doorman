@@ -639,3 +639,94 @@ class TestReplayOfAFilteredEvent:
         body = await engine.replay(event_id)
         assert body == {"status": "not_replayable", "event_id": event_id, "state": "filtered"}
         assert (await engine.stats()).get("deliveries_pending", 0) == 0
+
+
+class TestAuditRound1:
+    """Fixes from the 0.7.0 audit, round 1. Each test fails on the code before its fix."""
+
+    async def test_a_non_actionable_stored_event_is_not_resumed_by_a_routable_redelivery(
+        self, engine
+    ):
+        """F-01. "received, zero deliveries" is also every non-actionable event's resting state.
+
+        A later request with the same delivery id used to resume it, sending the STORED body to
+        sinks chosen by the NEW request, unscreened and (with no declared fields) unfenced.
+        """
+        first = await engine.ingest(event("reuse-1", sinks=[]))
+        assert first["status"] == "ignored"
+        second = await engine.ingest(event("reuse-1", sinks=["notes"]))
+        assert second.get("resumed") is not True
+        assert second["deduplicated"] is True
+        assert (await engine.stats()).get("deliveries_pending", 0) == 0
+
+    async def test_a_resume_routes_by_the_stored_sinks_not_the_redelivery(
+        self, engine, monkeypatch
+    ):
+        _fail_first_enqueue(engine, monkeypatch)
+        with pytest.raises(RuntimeError):
+            await engine.ingest(event("reuse-2", sinks=["notes"]))
+        # The redelivery claims no sinks; the stored decision still stands.
+        retry = await engine.ingest(event("reuse-2", sinks=[]))
+        assert retry.get("resumed") is True
+        rows = await _rows(engine, "SELECT sink FROM deliveries")
+        assert [r["sink"] for r in rows] == ["notes"]
+
+    async def test_a_deterministic_engine_error_reaches_the_dlq(
+        self, engine, httpx_mock, monkeypatch
+    ):
+        """CR-04. A failure that repeats on every pass used to loop for ever, never in the DLQ."""
+        httpx_mock.add_response(url=SINK_URL, status_code=200, is_reusable=True)
+
+        async def always_fails(*args, **kwargs):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(engine.store, "mark_delivered", always_fails)
+        await engine.ingest(event("loop-1"))
+        for _ in range(CONFIG["delivery"]["max_attempts"]):
+            await engine.store.requeue_incomplete()  # collapse the backoff
+            await engine.run_once()
+        stats = await engine.stats()
+        assert stats["dlq"] == 1
+        assert stats.get("deliveries_pending", 0) == 0
+        dlq = await engine.list_dlq(limit=5)
+        assert "engine error" in (dlq[0].error or "")
+
+    async def test_the_delivered_payload_is_redacted_too(self, tmp_path, httpx_mock):
+        """F-02. The decoded `payload` is rebuilt from the stored body on every read, so a secret
+        in an escape spelling the byte pass does not know used to reach the sink in the clear."""
+        secret = ENV["INTERNAL_TOKEN"]  # a resolved secret, so redaction knows it
+        config = Config.model_validate(
+            {
+                **CONFIG,
+                "sinks": [{**CONFIG["sinks"][0], "template": '{"text": "{{ payload.note }}"}'}],
+            }
+        )
+        eng = Engine(resolve(config, ENV), store=SqliteStore(tmp_path / "r.db"))
+        await eng.start()
+        try:
+            # The first letter written as a JSON \\u escape: valid, and no encoder's default.
+            escaped = "\\u0069" + secret[1:]
+            body = ('{"note": "' + escaped + '"}').encode()
+            ev = InboundEvent(**{**_event_kwargs("redact-1"), "body": body, "payload": None})
+            await eng.ingest(ev)
+            httpx_mock.add_response(url=SINK_URL, status_code=200)
+            await eng.run_once()
+            sent = httpx_mock.get_requests()[0].read().decode()
+            assert secret not in sent
+            assert "REDACTED" in sent.upper()
+        finally:
+            await eng.stop()
+
+    async def test_delivery_keys_carry_the_install_id(self, engine, monkeypatch):
+        """F-07. The key must differ across databases, or a re-created one replays ids."""
+        seen = {}
+
+        async def capture(context, client):
+            seen["key"] = context["delivery_key"]
+            raise PermanentSinkError("stop")
+
+        monkeypatch.setattr(engine._sinks["notes"], "deliver", capture)
+        await engine.ingest(event("key-1"))
+        await engine.run_once()
+        assert seen["key"].startswith(engine.store.install_id + "-")
+        assert len(engine.store.install_id) == 16

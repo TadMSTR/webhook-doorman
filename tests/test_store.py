@@ -375,3 +375,39 @@ async def test_a_stored_body_python_cannot_decode_still_reads_back(store):
     stored = await store.get_event(event_id)
     assert stored is not None
     assert stored.payload is None
+
+
+async def test_a_withheld_verdict_is_never_downgraded(store):
+    """F-06. A resumed redelivery can screen concurrently with the original ingest. A later
+    `received` verdict must not overwrite an earlier `quarantined` one."""
+    event_id, _ = await store.record_event(make_event("verdict-1"))
+    await store.record_detection(
+        event_id, detection={"score": 1.0}, status=EventStatus.QUARANTINED, quarantined_at=utcnow()
+    )
+    await store.record_detection(
+        event_id, detection={"score": 0.0}, status=EventStatus.RECEIVED, quarantined_at=None
+    )
+    assert (await store.get_event(event_id)).status is EventStatus.QUARANTINED
+
+
+async def test_install_id_is_stable_per_database_and_differs_between_them(tmp_path):
+    """F-07."""
+    a = SqliteStore(tmp_path / "a.db")
+    await a.connect()
+    first = a.install_id
+    await a.close()
+    await a.connect()
+    assert a.install_id == first
+    await a.close()
+    b = SqliteStore(tmp_path / "b.db")
+    await b.connect()
+    assert b.install_id and b.install_id != first
+    await b.close()
+
+
+async def test_the_intended_sinks_are_stored(store):
+    """F-01's stored fact: the sink list decided at ingest, empty included."""
+    routed, _ = await store.record_event(make_event("sinks-1"))
+    unrouted, _ = await store.record_event(dataclasses.replace(make_event("sinks-2"), sinks=[]))
+    assert (await store.get_event(routed)).sinks == ["chat"]
+    assert (await store.get_event(unrouted)).sinks == []

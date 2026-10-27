@@ -63,19 +63,33 @@ from .sanitize import sanitize
 _FENCE_TAG = re.compile(r"<\s*/?\s*untrusted(?=[\s>/])[^>]*>", re.IGNORECASE)
 
 
+#: Strip passes before giving up on preserving the text. Ordinary content needs one; each
+#: further pass only peels one layer of deliberate nesting.
+_MAX_STRIP_PASSES = 4
+
+
 def _strip_fence_tags(text: str) -> str:
     """Remove every fence tag, including any that removing another one creates.
 
-    One pass is not enough. In `</untr<untrusted>usted>` the inner tag is removed and the
-    outer halves join into a real `</untrusted>`, which would close the fence early and leave
-    the rest of the attacker's text outside it. Repeating until nothing changes ends that:
-    each pass removes at least one `>`, so it terminates.
+    One pass is not enough: removing a nested tag can join the text around it into a new one,
+    which would close the fence early. So it repeats until nothing changes. But each pass is
+    linear, and the number of passes grows with nesting depth, so unbounded repetition is
+    quadratic in attacker-chosen input (seconds for a few hundred KB, on the event loop).
+
+    After `_MAX_STRIP_PASSES`, the text is adversarial by construction, and preserving it stops
+    being worth the cost: every `<` and `>` is replaced with a lookalike, which no tag can be
+    built from. Linear, and the fence holds either way.
     """
-    while True:
+    for _ in range(_MAX_STRIP_PASSES):
         stripped = _FENCE_TAG.sub("", text)
         if stripped == text:
             return stripped
         text = stripped
+    return text.translate(_NEUTRALISE_BRACKETS)
+
+
+#: U+2039 / U+203A: readable as angle brackets, and not `<`/`>` to any parser.
+_NEUTRALISE_BRACKETS = str.maketrans({"<": "\u2039", ">": "\u203a"})
 
 
 def _attribute(value: str) -> str:

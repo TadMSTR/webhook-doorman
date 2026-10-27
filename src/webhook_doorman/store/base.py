@@ -22,6 +22,10 @@ from ..models import Delivery, DlqEntry, EventStatus, HeldEntry, InboundEvent, S
 class Store(Protocol):
     """Durable storage for events, delivery attempts and the dead-letter queue."""
 
+    #: A random id for this database, stable once created. Set by `connect`. Prefixes
+    #: idempotency keys sent to destinations so they stay unique across a re-created database.
+    install_id: str
+
     async def connect(self) -> None:
         """Open the store and apply any schema migrations. Idempotent.
 
@@ -145,7 +149,9 @@ class Store(Protocol):
         """Hand an `in_flight` delivery back to `pending`, due at `next_attempt_at`.
 
         For a delivery whose attempt raised in the engine rather than the sink, so it is not left
-        claimed until the next restart. Not an attempt: the counter does not move.
+        claimed until the next restart. It counts as an attempt: a failure that repeats on every
+        pass (an event that cannot be read back, a full disk) must reach `max_attempts` and the
+        DLQ, not loop for ever.
         """
         ...
 

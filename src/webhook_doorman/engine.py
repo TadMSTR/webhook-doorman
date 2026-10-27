@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import random
 import time
 from datetime import timedelta
@@ -47,7 +48,7 @@ from .models import (
     StoredEvent,
     utcnow,
 )
-from .redaction import redact_text
+from .redaction import redact_json, redact_text
 from .sanitize import sanitize
 from .secrets import Resolved
 from .sinks import Sink, build_sink
@@ -250,10 +251,14 @@ class Engine:
         the redelivered one, so what is checked is what will be sent. Returns `None` for an
         ordinary duplicate.
         """
-        if not event.sinks or event.status is not EventStatus.RECEIVED:
-            return None
         stored = await self.store.get_event(event_id)
         if stored is None or stored.status is not EventStatus.RECEIVED:
+            return None
+        # Only an event that was MEANT to go somewhere. "received with no deliveries" is also
+        # the permanent state of every non-actionable or unparseable event, and resuming one of
+        # those would send a stored body to sinks chosen by a different request. `None` is a
+        # row written before the sink list was stored: unknown, so never resumed.
+        if not stored.sinks:
             return None
         # Checked before screening, so a redelivery of an event whose deliveries are merely
         # still pending is not scored and counted a second time.
@@ -263,7 +268,9 @@ class Engine:
         withheld = await self._screen(stored, event_id)
         if withheld is not None:
             return withheld
-        queued = await self.store.enqueue_first_deliveries(event_id, event.sinks)
+        # The stored decision, not this request's: the content and the routing must come from
+        # the same event.
+        queued = await self.store.enqueue_first_deliveries(event_id, stored.sinks)
         if not queued:
             return None  # a concurrent redelivery got there first
         log.warning(
@@ -272,7 +279,7 @@ class Engine:
             event_type=event.event_type,
             event_id=event_id,
             delivery_id=event.delivery_id,
-            sinks=event.sinks,
+            sinks=stored.sinks,
         )
         return {"status": "accepted", "event_id": event_id, "resumed": True}
 
@@ -530,22 +537,26 @@ class Engine:
         return len(due)
 
     async def _recover(self, delivery: Delivery, exc: Exception) -> None:
-        """Log a failed attempt's engine error and hand the delivery back to `pending`.
+        """Log a failed attempt's engine error, count it, and retry or dead-letter it.
+
+        It is an attempt like any other, so it counts towards `max_attempts`. A failure that
+        repeats on every pass (a stored event that cannot be read back, a full disk) used to
+        hand the delivery back unchanged and loop every poll for ever, never reaching the DLQ.
 
         At-least-once: if the sink had already answered 200 and the failure was recording that,
         the delivery is sent again. That is what a restart did anyway, a restart later.
         """
-        log.error(
-            "delivery_worker_error",
-            delivery=delivery.id,
-            sink=delivery.sink,
-            error=self._redact_error(repr(exc)),
-        )
+        error = self._redact_error(repr(exc))
+        log.error("delivery_worker_error", delivery=delivery.id, sink=delivery.sink, error=error)
         METRICS.increment(
             "webhook_doorman_delivery_attempts_total", sink=delivery.sink, outcome="error"
         )
-        retry_at = utcnow() + timedelta(seconds=self.retry_delay_seconds(delivery.attempt + 1))
+        attempts_made = delivery.attempt + 1
         try:
+            if attempts_made >= self.config.delivery.max_attempts:
+                await self._exhaust(delivery, f"engine error: {error}", None, 0)
+                return
+            retry_at = utcnow() + timedelta(seconds=self.retry_delay_seconds(attempts_made))
             await self.store.release_claim(delivery.id, retry_at)
         except Exception:
             # The store is what failed, so this may fail too. `requeue_incomplete` at the next
@@ -574,7 +585,7 @@ class Engine:
             return
 
         context = self._context_for(event, delivery.sink)
-        context[DELIVERY_KEY] = str(delivery.id)
+        context[DELIVERY_KEY] = f"{self.store.install_id}-{delivery.id}"
         try:
             outcome = await sink.deliver(context, self._require_client())
         except PermanentSinkError as exc:
@@ -638,6 +649,13 @@ class Engine:
         agent_readable = sink_state is not None and sink_state.config.agent_readable
         source = self.config.source_by_name(event.source)
         untrusted = source is None or source.trust == "untrusted"
+        # `payload` is decoded from the stored body on every read, so the ingest-time pass over
+        # the decoded payload (`app.py`) never reaches what is delivered. A secret the byte pass
+        # did not recognise (an escape spelling it does not know) would decode back into the
+        # clear here. Redact the decoded form again, at the point of use.
+        event = dataclasses.replace(
+            event, payload=redact_json(event.payload, self.resolved.secret_values)
+        )
         return event.template_context(fence=agent_readable and untrusted)
 
     @staticmethod
