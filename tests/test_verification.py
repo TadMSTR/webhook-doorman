@@ -305,6 +305,22 @@ class TestNonAsciiCredentials:
         assert not verify(spec, body=BODY, headers=headers, peer=None, secrets=secrets).ok
 
 
+class TestBasicEdges:
+    """Branches mutation testing showed no test could tell from their removal."""
+
+    def test_an_unset_username_is_not_matched_by_an_empty_one(self):
+        """`or`, not `and`: one half unset is unset, even if the caller sends an empty user."""
+        assert not verify_basic(BASIC_SPEC, basic_header("", "s3cret-value"), "", "s3cret-value")
+
+    def test_a_basic_payload_under_another_scheme_is_refused(self):
+        encoded = basic_header("alice", "s3cret-value").removeprefix("Basic ")
+        assert not verify_basic(BASIC_SPEC, f"Bearer {encoded}", "alice", "s3cret-value")
+
+    def test_a_password_may_contain_a_colon(self):
+        """RFC 7617: the user-id cannot contain ':', the password can. Split on the first."""
+        assert verify_basic(BASIC_SPEC, basic_header("alice", "s3:cr:et"), "alice", "s3:cr:et")
+
+
 class TestBasicDispatch:
     """`verify` must hand the configured user and password to the right halves (ad8bdc8e).
 

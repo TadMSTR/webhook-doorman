@@ -123,3 +123,37 @@ class TestAdminToken:
         config = self.config_with_admin(base_config, min_token_length=8)
         base_env["ADMIN_TOKEN"] = "a" * 8
         assert resolve(config, base_env).admin_token() == "a" * 8
+
+
+def test_a_disabled_source_does_not_stop_later_sources_resolving(base_config, base_env):
+    """`continue`, not `break`: every source after a disabled one is still resolved."""
+    base_config["sources"][0]["enabled"] = False
+    resolved = resolve(Config.model_validate(base_config), base_env)
+    assert resolved.sources["internal"].enabled is True
+
+
+def test_a_sink_missing_its_env_does_not_stop_later_sinks_resolving(base_config, base_env):
+    base_config["sinks"].insert(
+        0,
+        {
+            "name": "first",
+            "type": "matrix",
+            "url": "https://matrix.example.invalid",
+            "token_env": "MATRIX_TOKEN",
+            "room_env": "MATRIX_ROOM",
+        },
+    )
+    resolved = resolve(Config.model_validate(base_config), base_env)
+    state = resolved.sinks["first"]
+    assert state.enabled is False
+    assert state.name == "first"  # the state carries its config
+    assert "MATRIX_TOKEN" in state.disabled_reason
+    assert resolved.sinks["notes"].enabled is True
+
+
+def test_a_metrics_token_of_exactly_the_minimum_length_is_accepted(base_config, base_env):
+    base_config["metrics"] = {"token_env": "MT", "min_token_length": 32}
+    exact = resolve(Config.model_validate(base_config), {**base_env, "MT": "m" * 32})
+    short = resolve(Config.model_validate(base_config), {**base_env, "MT": "m" * 31})
+    assert exact.metrics_token() == "m" * 32
+    assert short.metrics_token() is None

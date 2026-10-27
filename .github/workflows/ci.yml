@@ -235,3 +235,38 @@ jobs:
           uv export --frozen --extra dev --extra otel --no-emit-project \
             --format pylock.toml -o audit-dev/pylock.toml
           pip-audit --strict --locked audit-dev
+
+  # Mutation testing on the three security modules: does a test fail when the code changes?
+  # Line coverage cannot answer that, and #759 was the case: `compare_digest` -> `!=` in
+  # verify_hmac survived the whole suite at 97% coverage. Per-module survivor ceilings and
+  # mutant floors are in tests/check_mutation_floor.py, measured, with the reasoning.
+  #
+  # Installed from the lock, not the ranges: a mutation score is only comparable run to run if
+  # the same mutmut and the same pytest produced it.
+  mutation:
+    name: Mutation (security modules)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No token left in .git/config for later steps to read; nothing here pushes.
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      - name: Install the locked dev environment
+        run: uv sync --frozen --extra dev --extra otel --python 3.13
+
+      - name: Run mutmut
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          mutmut run --max-children 4
+
+      - name: Assert the survivor ceilings and mutant floors
+        run: |
+          source .venv/bin/activate
+          python tests/check_mutation_floor.py
+

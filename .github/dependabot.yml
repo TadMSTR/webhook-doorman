@@ -38,7 +38,7 @@ updates:
       opentelemetry:
         patterns: ["opentelemetry-*"]
       dev-tools:
-        patterns: ["ruff", "pytest", "pytest-*", "pip-audit"]
+        patterns: ["ruff", "pytest", "pytest-*", "pip-audit", "mutmut"]
       dev-dependencies:
         dependency-type: "development"
     ignore:
