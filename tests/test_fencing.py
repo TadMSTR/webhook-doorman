@@ -572,6 +572,12 @@ class TestStripIsLinear:
         assert "a < b and c > d" in out
 
 
+#: Separates linear from quadratic, not fast from slow. Linear is about 0.1 s locally and up to
+#: 2 s on a loaded CI runner at 1 MiB; the quadratic pattern ran past 60 s at that size (about
+#: half an hour extrapolated). A tight bound only measures the runner.
+LINEAR_BOUND_S = 10.0
+
+
 class TestFencePatternIsLinear:
     """R2-01. `<\\s*/?\\s*untrusted` let the engine split a whitespace run n ways: a 64 KB issue
     body of `<` plus spaces blocked the event loop for seconds, at ingest and on every fenced
@@ -590,7 +596,7 @@ class TestFencePatternIsLinear:
 
         started = time.perf_counter()
         out = fence_text(content, source="github", field="body")
-        assert time.perf_counter() - started < 1.0
+        assert time.perf_counter() - started < LINEAR_BOUND_S
         inside = out.split("\n", 1)[1].rsplit("\n", 1)[0]
         assert not ("untrusted" in inside.lower() and ("<" in inside or ">" in inside))
 
@@ -606,7 +612,7 @@ class TestFencePatternIsLinear:
 
         started = time.perf_counter()
         await build_detector("heuristic").score(content)
-        assert time.perf_counter() - started < 1.0
+        assert time.perf_counter() - started < LINEAR_BOUND_S
 
     async def test_an_unclosed_opening_is_still_detected(self):
         from webhook_doorman.detect import build_detector
