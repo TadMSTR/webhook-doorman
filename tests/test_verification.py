@@ -368,9 +368,21 @@ PACKAGE = Path(__file__).resolve().parent.parent / "src" / "webhook_doorman"
 #: attribute names and the last segment of a dotted name.
 CREDENTIAL_NAME = re.compile(
     r"(secret|token|password|passwd|signature|digest|credential|expected|presented"
+    r"|^sig$|^sig_|_sig$|mac$|^mac|hmac|^auth|_auth$|authorization|api_?key|^key$|_key$"
     r"|^user$|^pass$|presented_user|presented_pass)",
     re.IGNORECASE,
 )
+
+#: Methods whose result is still the credential: `secrets.get(name)` is a secret, and so is
+#: `token.strip()`. The receiver's name is what identifies it.
+_PASSTHROUGH_METHODS = {"get", "encode", "decode", "strip", "lower", "removeprefix", "removesuffix"}
+
+#: Comparisons that touch a credential-named value and are not authentication decisions, so a
+#: timing side channel does not apply. Each needs its reason; keep this list short.
+ALLOWED_COMPARISONS = {
+    # Redaction's substring search: it decides what to replace in a log line, not who is let in.
+    ("redaction.py", "secret in value"),
+}
 
 
 def _modules() -> list[Path]:
@@ -384,9 +396,30 @@ def _name_of(node: ast.AST) -> str | None:
         return node.id
     if isinstance(node, ast.Attribute):
         return node.attr
+    if isinstance(node, ast.Subscript):  # self.secrets[name]
+        return _name_of(node.value)
     if isinstance(node, ast.Call):
-        return _name_of(node.func)
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr in _PASSTHROUGH_METHODS:
+            return _name_of(func.value)  # resolved.secrets.get(name)
+        return _name_of(func)
     return None
+
+
+_CHECKED_OPS = (ast.Eq, ast.NotEq, ast.In, ast.NotIn)
+
+
+def _credential_comparisons(tree: ast.AST) -> list[ast.Compare]:
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Compare)
+        and any(isinstance(op, _CHECKED_OPS) for op in node.ops)
+        and any(
+            CREDENTIAL_NAME.search(_name_of(operand) or "")
+            for operand in (node.left, *node.comparators)
+        )
+    ]
 
 
 def _calls_compare_digest(node: ast.AST) -> bool:
@@ -394,20 +427,28 @@ def _calls_compare_digest(node: ast.AST) -> bool:
 
 
 class TestConstantTimeComparison:
-    def test_nothing_compares_a_credential_with_eq_or_ne(self):
+    def test_nothing_compares_a_credential_with_eq_ne_or_in(self):
         offenders = []
         for path in _modules():
             tree = ast.parse(path.read_text(), filename=str(path))
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Compare):
+            for node in _credential_comparisons(tree):
+                if (path.name, ast.unparse(node)) in ALLOWED_COMPARISONS:
                     continue
-                if not any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
-                    continue
-                for operand in (node.left, *node.comparators):
-                    name = _name_of(operand)
-                    if name and CREDENTIAL_NAME.search(name):
-                        offenders.append(f"{path.name}:{node.lineno} {ast.unparse(node)}")
-        assert offenders == [], "credential compared with ==/!=:\n" + "\n".join(offenders)
+                offenders.append(f"{path.name}:{node.lineno} {ast.unparse(node)}")
+        assert offenders == [], "credential compared without secure_compare:\n" + "\n".join(
+            offenders
+        )
+
+    def test_compare_digest_is_never_imported_by_name(self):
+        """`from hmac import compare_digest as cd` would hide a call from the check below."""
+        imports = []
+        for path in _modules():
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.ImportFrom) and node.module == "hmac":
+                    names = [a.name for a in node.names]
+                    if "compare_digest" in names or "*" in names:
+                        imports.append(f"{path.name}:{node.lineno}")
+        assert imports == [], "import hmac and call hmac.compare_digest instead: " + str(imports)
 
     def test_compare_digest_is_called_only_inside_secure_compare(self):
         """One choke point, so the bytes conversion and the constant-time call cannot drift."""
@@ -463,13 +504,18 @@ class TestConstantTimeComparison:
             for n in ast.walk(funcs[0])
         ), f"{module}:{function} does not call secure_compare"
 
-    def test_the_structural_test_can_fail(self):
-        """The control: the scan must flag the exact mutation #759 describes."""
-        mutated = "def f(expected, presented):\n    if expected != presented:\n        return 1\n"
-        hits = [
-            n
-            for n in ast.walk(ast.parse(mutated))
-            if isinstance(n, ast.Compare)
-            and any(CREDENTIAL_NAME.search(_name_of(o) or "") for o in (n.left, *n.comparators))
-        ]
-        assert hits
+    @pytest.mark.parametrize(
+        "unsafe",
+        [
+            "expected != presented",  # the #759 mutation
+            "self.secrets[name] == header_value",  # a subscript
+            "header_value == resolved.secrets.get(name)",  # a .get() receiver
+            "sig == computed_mac",  # names outside the original set
+            "auth in valid_keys",  # membership
+            "token.strip() == presented_token",
+        ],
+    )
+    def test_the_structural_test_can_fail(self, unsafe):
+        """The control: each of these must be flagged. The first was #759; the others are the
+        forms the 0.7.0 audit (F-05) showed the first version of this scan missing."""
+        assert _credential_comparisons(ast.parse(f"def f():\n    if {unsafe}:\n        pass\n"))

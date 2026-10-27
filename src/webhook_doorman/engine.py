@@ -400,8 +400,8 @@ class Engine:
             if name in context and context[name] is not None:
                 parts.extend(_text_leaves(context[name]))
         # Sanitised the way a fence sanitises, so the detector reads what an agent would. Text
-        # from `payload` was never sanitised at ingest, and a zero-width character inside
-        # "ig\u200bnore" was enough to step round every rule.
+        # from `payload` is not sanitised at ingest, and invisible characters inside a phrase
+        # would otherwise keep a rule from matching it.
         return sanitize("\n".join(parts))[0].strip()
 
     def detector_health(self) -> dict[str, Any]:

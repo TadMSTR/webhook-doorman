@@ -58,8 +58,8 @@ from .sanitize import sanitize
 #: that only stops an exact-match forgery is not one.
 #:
 #: The lookahead is what keeps this from over-reaching. `untrusted` must be followed by
-#: whitespace, `/` or `>`, so a payload containing `<untrusted-data>` is left alone while
-#: `<untrusted source="...">` and the self-closing `</untrusted/>` are not.
+#: whitespace, `/` or `>`, so a payload containing `<untrusted-data>` is left alone while every
+#: spelling of the real tag is not.
 _FENCE_TAG = re.compile(r"<\s*/?\s*untrusted(?=[\s>/])[^>]*>", re.IGNORECASE)
 
 
