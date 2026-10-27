@@ -37,7 +37,11 @@ TRUNCATION_MARKER = "…[truncated]"
 #: Every value `reason` can take, and therefore every value the `events_filtered_total` label
 #: can take. Closed, and never the offending *value* — that is producer-controlled and would
 #: turn a metric label into unbounded cardinality.
-FILTER_REASONS = ("event_type", "deny", "require")
+FILTER_REASONS = ("event_type", "deny", "require", "sink")
+
+#: The reasons one sink route can refuse an event for. `sink` is not among them: it is the
+#: event-level reason for "every route refused", and is a `FILTER_REASONS` value only.
+ROUTE_REASONS = ("event_type", "deny", "require")
 
 
 @dataclass(frozen=True)
@@ -164,3 +168,24 @@ def truncate(value: Any, limit: int | None) -> Any:
     if isinstance(value, list):
         return [truncate(v, limit) for v in value]
     return value
+
+
+def route(routes, event_type: str, payload: Any) -> tuple[list[str], dict[str, FilterVerdict]]:
+    """Split a source's sink routes into the sinks that get this event and those that refused it.
+
+    Runs after the source's own filter admitted the event. A route with no filter takes every
+    admitted event. Returns `(sinks, refused)`, where `refused` maps a sink name to the verdict
+    of its filter. The caller decides what "every route refused" means; see `app.py`.
+
+    Shared by ingest and by `Engine.replay`/`release`, so "where would this event go" has one
+    answer.
+    """
+    sinks: list[str] = []
+    refused: dict[str, FilterVerdict] = {}
+    for r in routes:
+        verdict = ADMITTED if r.filter is None else evaluate(r.filter, event_type, payload)
+        if verdict.admitted:
+            sinks.append(r.name)
+        else:
+            refused[r.name] = verdict
+    return sinks, refused

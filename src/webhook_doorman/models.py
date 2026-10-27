@@ -73,6 +73,13 @@ class InboundEvent:
     that the decision travels with the thing it was made about — the engine counts it after the
     dedup check, where it means "events filtered" rather than "requests filtered".
     """
+    filtered_sinks: dict[str, Any] = field(default_factory=dict)
+    """Sinks whose route filter refused this event: sink name -> `filtering.FilterVerdict`.
+
+    Counted and logged by the engine after the dedup check, like `filter_reason`. Not persisted:
+    it is the record of one ingest decision, and replay re-applies the routes to the stored
+    payload rather than reading it back.
+    """
 
     def template_context(self, *, fence: bool = False) -> dict[str, Any]:
         """The namespace a sink template renders against.

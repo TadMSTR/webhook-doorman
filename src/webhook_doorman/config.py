@@ -183,29 +183,12 @@ class DedupConfig(_Strict):
     enabled: bool = True
 
 
-class SourceFilter(_Strict):
-    """Which of a source's events are admissible, and how large their fields may be.
-
-    Empty by default, so a config that does not mention it behaves exactly as it did before this
-    model existed. Every field is an independent gate; see `filtering.evaluate` for the order
-    they are applied in and for the missing-path asymmetry between `require` and `deny`.
-
-    Attributes:
-        event_types: allowlist matched against the parser's `event_type`. `None` admits every
-            type. This is a *second*, independent gate from a parser's own idea of what is
-            actionable — `parse_github` already declines to act on anything but a newly opened
-            issue or PR, and merging the two would make one of them unstateable.
-        require: dotted payload path -> values, at least one of which must be present. A path
-            that does not resolve **fails** the requirement.
-        deny: dotted payload path -> values, none of which may be present. A path that does not
-            resolve **passes**.
-        max_field_bytes: byte cap per string field in the stored summary and parser context.
-    """
+class _EventFilter(_Strict):
+    """The three match gates shared by a source's filter and a sink route's filter."""
 
     event_types: list[str] | None = None
     require: dict[str, list[str]] = Field(default_factory=dict)
     deny: dict[str, list[str]] = Field(default_factory=dict)
-    max_field_bytes: int | None = None
 
     @field_validator("event_types")
     @classmethod
@@ -228,6 +211,51 @@ class SourceFilter(_Strict):
                 )
         return v
 
+
+class SinkFilter(_EventFilter):
+    """Which of a source's admitted events one sink receives.
+
+    The same three gates as `SourceFilter`, with the same semantics (see `filtering.evaluate`),
+    applied **after** it. The source filter decides whether an event is admitted at all; this
+    decides only whether this one sink gets a delivery. There is no `max_field_bytes` here: the
+    stored event is shared by every sink, so a per-sink size cap has nothing to cap.
+
+    Values are compared as text. A JSON integer `3` matches `"3"`, and `true` matches `"true"`.
+    """
+
+
+class SinkRoute(_Strict):
+    """One entry in a source's `sinks:` list: a sink name, optionally with a filter.
+
+    A bare string in YAML (`sinks: [chat]`) is the same as `{name: chat}` with no filter, so every
+    config written before routes existed means exactly what it meant.
+    """
+
+    name: str
+    filter: SinkFilter | None = None
+
+
+class SourceFilter(_EventFilter):
+    """Which of a source's events are admissible, and how large their fields may be.
+
+    Empty by default, so a config that does not mention it behaves exactly as it did before this
+    model existed. Every field is an independent gate; see `filtering.evaluate` for the order
+    they are applied in and for the missing-path asymmetry between `require` and `deny`.
+
+    Attributes:
+        event_types: allowlist matched against the parser's `event_type`. `None` admits every
+            type. This is a *second*, independent gate from a parser's own idea of what is
+            actionable — `parse_github` already declines to act on anything but a newly opened
+            issue or PR, and merging the two would make one of them unstateable.
+        require: dotted payload path -> values, at least one of which must be present. A path
+            that does not resolve **fails** the requirement.
+        deny: dotted payload path -> values, none of which may be present. A path that does not
+            resolve **passes**.
+        max_field_bytes: byte cap per string field in the stored summary and parser context.
+    """
+
+    max_field_bytes: int | None = None
+
     @field_validator("max_field_bytes")
     @classmethod
     def _positive(cls, v: int | None) -> int | None:
@@ -240,7 +268,11 @@ class SourceConfig(_Strict):
     name: str
     path: str
     verify: VerifySpec
-    sinks: list[str]
+    sinks: list[SinkRoute]
+    """Where this source's admitted events go. Each entry is a sink name, or `{name, filter}`.
+
+    See `SinkRoute`. Read `sink_names` for the names alone.
+    """
     parser: str = "generic"
     dedup: DedupConfig = Field(default_factory=DedupConfig)
     filter: SourceFilter = Field(default_factory=SourceFilter)
@@ -281,12 +313,23 @@ class SourceConfig(_Strict):
             raise ValueError("must not be blank")
         return v
 
+    @field_validator("sinks", mode="before")
+    @classmethod
+    def _names_are_routes(cls, v):
+        if isinstance(v, list):
+            return [{"name": item} if isinstance(item, str) else item for item in v]
+        return v
+
     @field_validator("sinks")
     @classmethod
-    def _at_least_one_sink(cls, v: list[str]) -> list[str]:
+    def _at_least_one_sink(cls, v: list[SinkRoute]) -> list[SinkRoute]:
         if not v:
             raise ValueError("must route to at least one sink")
         return v
+
+    @property
+    def sink_names(self) -> list[str]:
+        return [route.name for route in self.sinks]
 
     @model_validator(mode="after")
     def _dedup_header_is_not_a_credential(self):
@@ -614,7 +657,7 @@ class Config(_Strict):
 
         known_sinks = {s.name for s in self.sinks}
         for source in self.sources:
-            for sink_name in source.sinks:
+            for sink_name in source.sink_names:
                 if sink_name not in known_sinks:
                     problems.append(
                         f"source {source.name!r}: sinks references unknown sink {sink_name!r} "

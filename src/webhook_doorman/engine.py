@@ -35,6 +35,7 @@ from . import tracing
 from .config import Config
 from .detect import Detector, build_detector
 from .errors import PermanentSinkError, SinkError
+from .filtering import route as route_sinks
 from .logging import log_throttled
 from .metrics import METRICS
 from .models import (
@@ -167,6 +168,25 @@ class Engine:
         # question and already answerable from `delivery_attempts_total`.
         METRICS.increment("webhook_doorman_events_received_total", source=event.source)
 
+        # Per-sink refusals, after the dedup check for the same reason as the event-level count
+        # below. Logged one line per sink: which route refused, and which gate in it.
+        for sink, refusal in event.filtered_sinks.items():
+            log.info(
+                "delivery_filtered",
+                source=event.source,
+                sink=sink,
+                event_type=event.event_type,
+                event_id=event_id,
+                reason=refusal.reason,
+                path=refusal.detail if refusal.reason != "event_type" else None,
+            )
+            METRICS.increment(
+                "webhook_doorman_deliveries_filtered_total",
+                source=event.source,
+                sink=sink,
+                reason=refusal.reason or "unknown",
+            )
+
         # Counted after the dedup check, like `events_received_total` above, so it means
         # "events filtered" rather than "requests filtered" — a producer retrying a delivery
         # we already refused must not inflate the number.
@@ -177,17 +197,23 @@ class Engine:
                 event_type=event.event_type,
                 event_id=event_id,
                 reason=event.filter_reason,
+                sinks=sorted(event.filtered_sinks) or None,
             )
             METRICS.increment(
                 "webhook_doorman_events_filtered_total",
                 source=event.source,
                 reason=event.filter_reason or "unknown",
             )
-            return {
+            body: dict[str, Any] = {
                 "status": "filtered",
                 "event_id": event_id,
                 "reason": event.filter_reason,
             }
+            if event.filtered_sinks:
+                # Names of sinks from this producer's own config, not anything it sent. The
+                # producer already knows its endpoint; the path and gate stay in the log.
+                body["sinks"] = sorted(event.filtered_sinks)
+            return body
 
         if not event.sinks:
             log.info("event_stored_no_sinks", source=event.source, event_type=event.event_type)
@@ -409,7 +435,7 @@ class Engine:
             state = current.status.value if current is not None else "missing"
             return {"status": "not_quarantined", "event_id": event_id, "state": state}
 
-        sinks = self._sinks_for(event.source)
+        sinks = self._sinks_for(event)
         if not sinks:
             return {"status": "no_sinks", "event_id": event_id}
 
@@ -417,15 +443,20 @@ class Engine:
         log.warning("event_released", event_id=event_id, source=event.source, sinks=sinks)
         return {"status": "released", "event_id": event_id, "sinks": sinks}
 
-    def _sinks_for(self, source_name: str) -> list[str]:
-        """The sinks a source routes to, resolved from the current config.
+    def _sinks_for(self, event: StoredEvent) -> list[str]:
+        """The sinks this event routes to under the current config, route filters applied.
 
         Shared by `replay` and `release` rather than written twice: both answer "where would
         this event have gone", and two copies is how they come to disagree after a config
-        change.
+        change. The route filters run against the stored payload, so a replay does not send a
+        sink the events its filter refuses. The source filter is not re-run: an event it refused
+        is `filtered`, and `replay` refuses those.
         """
-        source = self.config.source_by_name(source_name)
-        return list(source.sinks) if source else []
+        source = self.config.source_by_name(event.source)
+        if source is None:
+            return []
+        sinks, _ = route_sinks(source.sinks, event.event_type, event.payload)
+        return sinks
 
     async def replay(self, event_id: int) -> dict[str, Any]:
         """Re-queue every delivery for a stored event.
@@ -443,7 +474,7 @@ class Engine:
             # error, and nothing queued.
             return {"status": "not_replayable", "event_id": event_id, "state": event.status.value}
 
-        sinks = self._sinks_for(event.source)
+        sinks = self._sinks_for(event)
         if not sinks:
             return {"status": "no_sinks", "event_id": event_id}
 

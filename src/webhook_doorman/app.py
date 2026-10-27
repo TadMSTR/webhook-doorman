@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse
 from . import __version__, tracing
 from .config import Config, NoneVerify, load_config
 from .filtering import evaluate as evaluate_filter
+from .filtering import route as route_sinks
 from .filtering import truncate
 from .metrics import METRICS
 from .models import DlqEntry, EventStatus, HeldEntry, InboundEvent
@@ -243,6 +244,20 @@ def build_source_route(
             verdict = evaluate_filter(source.filter, parsed.event_type, payload_json)
             cap = source.filter.max_field_bytes
 
+            # Then the per-sink routes, which decide only who gets a delivery. An event that every
+            # route refused is stored `filtered` with reason `sink`, so it is never silently
+            # dropped. It is answered 200, like any filtered event.
+            sinks: list[str] = []
+            refused: dict = {}
+            if parsed.actionable and verdict.admitted:
+                sinks, refused = route_sinks(source.sinks, parsed.event_type, payload_json)
+            if not verdict.admitted:
+                status, reason = EventStatus.FILTERED, verdict.reason
+            elif refused and not sinks:
+                status, reason = EventStatus.FILTERED, "sink"
+            else:
+                status, reason = EventStatus.RECEIVED, None
+
             with structlog.contextvars.bound_contextvars(delivery_id=delivery_id):
                 event = InboundEvent(
                     source=source.name,
@@ -255,10 +270,11 @@ def build_source_route(
                     body=safe_body,
                     payload=payload_json,
                     context=truncate(context_value, cap),
-                    sinks=(list(source.sinks) if parsed.actionable and verdict.admitted else []),
+                    sinks=sinks,
                     verified=not isinstance(source.verify, NoneVerify),
-                    status=(EventStatus.FILTERED if not verdict.admitted else EventStatus.RECEIVED),
-                    filter_reason=verdict.reason,
+                    status=status,
+                    filter_reason=reason,
+                    filtered_sinks=refused,
                     untrusted_fields=(
                         list(parsed.untrusted_fields) if source.trust == "untrusted" else []
                     ),
@@ -653,6 +669,12 @@ def create_app(
             name for name, s in resolved.sources.items() if s.config.trust == "untrusted"
         ],
         detector_enabled=resolved.config.detector.backend != "none",
+        filtered_routes=[
+            (name, r.name)
+            for name, s in resolved.sources.items()
+            for r in s.config.sinks
+            if r.filter is not None
+        ],
     )
 
     router = APIRouter()

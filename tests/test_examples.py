@@ -36,7 +36,7 @@ def test_every_referenced_sink_exists(path: Path):
     config = load_config(path)
     known = {s.name for s in config.sinks}
     for source in config.sources:
-        assert set(source.sinks) <= known
+        assert set(source.sink_names) <= known
 
 
 @pytest.mark.parametrize("path", ALL_CONFIGS, ids=lambda p: p.name)
