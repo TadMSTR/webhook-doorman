@@ -603,3 +603,39 @@ def _event_kwargs(delivery_id: str) -> dict:
         "payload": {"ok": True},
         "sinks": ["notes"],
     }
+
+
+class TestFirstDeliveriesGuard:
+    """`enqueue_first_deliveries` queues nothing for an event that is no longer `received`.
+
+    The guard that stops a resumed dispatch from racing the detector: if the original ingest
+    quarantined the event between the resume's checks and its insert, the insert must refuse.
+    """
+
+    @pytest.mark.parametrize("status", ["quarantined", "dropped", "filtered", "dispatched"])
+    async def test_a_withheld_or_settled_event_gets_nothing(self, engine, status):
+        result = await engine.ingest(event(f"guard-{status}", sinks=[]))
+        await engine.store.db.execute(
+            "UPDATE events SET status = ? WHERE id = ?", (status, result["event_id"])
+        )
+        assert await engine.store.enqueue_first_deliveries(result["event_id"], ["notes"]) == []
+
+    async def test_a_received_event_with_no_deliveries_gets_its_sinks(self, engine):
+        result = await engine.ingest(event("guard-ok", sinks=[]))
+        ids = await engine.store.enqueue_first_deliveries(result["event_id"], ["notes", "notes"])
+        assert len(ids) == 2
+        assert await engine.store.enqueue_first_deliveries(result["event_id"], ["notes"]) == []
+
+
+class TestReplayOfAFilteredEvent:
+    async def test_a_filtered_event_is_not_replayable(self, engine):
+        """The source's filter refused it; replay must not be the way round that."""
+        filtered = InboundEvent(
+            **{**_event_kwargs("filtered-1"), "sinks": []},
+            status=EventStatus.FILTERED,
+            filter_reason="event_type",
+        )
+        event_id = (await engine.ingest(filtered))["event_id"]
+        body = await engine.replay(event_id)
+        assert body == {"status": "not_replayable", "event_id": event_id, "state": "filtered"}
+        assert (await engine.stats()).get("deliveries_pending", 0) == 0

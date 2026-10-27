@@ -106,6 +106,19 @@ class TestHmac:
 BEARER_SPEC = BearerVerify(strategy="bearer", secret_env="TOKEN")
 
 
+class TestBlankHeaderReason:
+    """A blank header is reported as missing, not as a bad signature.
+
+    The verdict is the same either way, so only the reason pins the guard. The reason is what an
+    operator reads in `verification_failed` to tell a misconfigured producer that sends no
+    header from one that signs with the wrong secret.
+    """
+
+    def test_hmac_without_prefix(self):
+        result = verify_hmac(BARE_HEX_SPEC, BODY, "", "some-secret")
+        assert result.reason == "missing X-Vikunja-Signature header"
+
+
 class TestBearer:
     def test_valid_token_accepted(self):
         assert verify_bearer(BEARER_SPEC, "Bearer abcdefgh12345678", "abcdefgh12345678").ok
