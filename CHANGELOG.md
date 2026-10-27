@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **Locked dependencies refreshed past two published advisories.** certifi 2026.7.22 →
+  2026.10.23 (PYSEC-2026-4320) and the OpenTelemetry family 1.45.0 → 1.45.1 / 0.66b0 → 0.66b1
+  (CVE-2026-114603 in opentelemetry-api). Both shipped in the 0.6.0 image, and both failed the
+  CI audit on fresh runs from 2026-10-26. Dev-only: filelock 3.32.5 → 4.2.4 (CVE-2026-112907,
+  CVE-2026-112913, CVE-2026-112940).
+
+### Changed
+- fastapi 0.142.2 → 0.143.2, pydantic 2.13.5 → 2.14.1, pydantic-settings 2.15.0 → 2.16.0,
+  ruff 0.16.10 → 0.17.0. fastapi 0.143.0 makes its own OpenTelemetry exporter setup opt-in. This
+  router already turned it off in 0.6.0, so nothing changes here.
+- Action pins: codeql-action 4.38.3, upload-artifact 7.0.2, scorecard-action 2.5.0,
+  login-action 4.7.0, setup-uv 10.3.2.
+
 ## [0.6.0] — 2026-10-07
 
 Python 3.14 image, and a fix for FastAPI 0.142 exporting telemetry on its own. Minor rather
