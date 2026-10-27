@@ -64,6 +64,10 @@ def secure_compare(expected: str, presented: str) -> bool:
     Every credential check in the package calls this (`app.py`, `engine.py` and the verifiers
     below), so the conversion and the constant-time call cannot drift apart.
     """
+    # An empty credential never matches, even an empty one. Every caller guards this already;
+    # the choke point holds it too, so a new caller cannot forget.
+    if not expected or not presented:
+        return False
     return hmac.compare_digest(
         expected.encode("utf-8", "surrogatepass"), presented.encode("utf-8", "surrogatepass")
     )

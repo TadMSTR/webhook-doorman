@@ -125,15 +125,32 @@ def no_network_egress(monkeypatch):
             raise AssertionError(f"test attempted a DNS lookup for {name!r}")
         return real_getaddrinfo(host, *args, **kwargs)
 
-    def connect(self, address):
-        if self.family in (socket.AF_INET, socket.AF_INET6):
+    real_connect_ex = socket.socket.connect_ex
+    real_sendto = socket.socket.sendto
+
+    def _check(sock, address, what):
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
             host = address[0]
             if host not in _LOCAL_NAMES and not ipaddress.ip_address(host).is_loopback:
-                attempts.append(f"connection to {address!r}")
-                raise AssertionError(f"test attempted a connection to {address!r}")
+                attempts.append(f"{what} to {address!r}")
+                raise AssertionError(f"test attempted a {what} to {address!r}")
+
+    def connect(self, address):
+        _check(self, address, "connection")
         return real_connect(self, address)
+
+    def connect_ex(self, address):
+        _check(self, address, "connection")
+        return real_connect_ex(self, address)
+
+    def sendto(self, data, *args):
+        # sendto(data, address) or sendto(data, flags, address): the address is always last.
+        _check(self, args[-1], "datagram")
+        return real_sendto(self, data, *args)
 
     monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
     monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+    monkeypatch.setattr(socket.socket, "sendto", sendto)
     yield
     assert not attempts, f"test attempted network egress: {attempts}"

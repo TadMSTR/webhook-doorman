@@ -716,7 +716,10 @@ def _row_to_delivery(row: aiosqlite.Row) -> Delivery:
 def _safe_json(body: bytes):
     try:
         return json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (ValueError, RecursionError):
+        # Same set as the ingest path (`app._safe_json`): an integer over the conversion limit
+        # raises ValueError, deep nesting RecursionError. A stored body that ingest accepted
+        # must read back too, or replay, release and delivery of it fail for ever.
         return None
 
 

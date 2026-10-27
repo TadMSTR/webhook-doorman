@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import timedelta
 
 import pytest
@@ -360,3 +361,17 @@ class TestReleaseClaim:
             "SELECT status FROM deliveries WHERE id = ?", (delivery_id,)
         )
         assert (await cursor.fetchone())["status"] == DeliveryStatus.DELIVERED.value
+
+
+async def test_a_stored_body_python_cannot_decode_still_reads_back(store):
+    """Ingest accepts a body over the int-conversion limit as non-JSON; the store must too (CR-02).
+
+    It used to raise ValueError from `get_event`, so delivery, replay and release of the event
+    failed every time.
+    """
+    huge = b'{"a": ' + b"9" * 5000 + b"}"
+    event = dataclasses.replace(make_event("huge-1"), body=huge, payload=None)
+    event_id, _ = await store.record_event(event)
+    stored = await store.get_event(event_id)
+    assert stored is not None
+    assert stored.payload is None

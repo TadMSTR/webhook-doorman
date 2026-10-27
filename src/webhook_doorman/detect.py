@@ -120,7 +120,7 @@ _RULES: tuple[tuple[str, float, re.Pattern[str]], ...] = (
         # only the bare `<untrusted>` would miss the realistic forgery, which mimics the real
         # tag and therefore carries a `source` attribute. Stripping and scoring are separate
         # jobs - `fencing` neutralises it, this records that someone tried.
-        re.compile(r"</?\s*untrusted(?=[\s>/])[^>]*>", re.IGNORECASE),
+        re.compile(r"<\s*/?\s*untrusted(?=[\s>/])[^>]*>", re.IGNORECASE),
     ),
     (
         "role_marker",

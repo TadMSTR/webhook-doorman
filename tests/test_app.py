@@ -333,7 +333,7 @@ class TestHealthStatusCode:
     """The status code is what `Dockerfile`'s HEALTHCHECK reads, so it carries the verdict.
 
     The distinction these tests pin down is partial vs. total. One disabled source out of two is
-    a deliberate operator state on forge right now — a `GITHUB_WEBHOOK_SECRET` that has not been
+    a deliberate operator state in a real deployment — a `GITHUB_WEBHOOK_SECRET` that has not been
     provisioned — and turning that into an unhealthy container would be a worse answer than the
     unconditional `ok` it replaces.
     """

@@ -1,6 +1,6 @@
 """Escaping is a property of the destination's rendering context, not of the data.
 
-Audit `forge-webhook-router-2026-08` filed a Medium against the first version of this code: a
+An earlier security audit filed a Medium against the first version of this code: a
 GitHub issue title or body — attacker-controlled on a public repo — reached a Vikunja task
 description unescaped, where it is rendered as rich text. That is stored XSS against whoever
 opens the task.

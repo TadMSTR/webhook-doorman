@@ -305,6 +305,16 @@ class TestNonAsciiCredentials:
         assert not verify(spec, body=BODY, headers=headers, peer=None, secrets=secrets).ok
 
 
+def test_secure_compare_never_matches_empty():
+    """The choke point refuses empty credentials itself, not only its callers (CR-08)."""
+    from webhook_doorman.verification import secure_compare
+
+    assert secure_compare("", "") is False
+    assert secure_compare("x", "") is False
+    assert secure_compare("", "x") is False
+    assert secure_compare("s3cret-value", "s3cret-value") is True
+
+
 class TestBasicEdges:
     """Branches mutation testing showed no test could tell from their removal."""
 

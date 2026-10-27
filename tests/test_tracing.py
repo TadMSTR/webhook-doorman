@@ -350,7 +350,7 @@ class TestExtraPresent:
             tracing.configure(
                 env={
                     "OTEL_EXPORTER_OTLP_ENDPOINT": ENDPOINT,
-                    "OTEL_SERVICE_NAME": "doorman-forge",
+                    "OTEL_SERVICE_NAME": "doorman-test",
                 }
             )
             is True

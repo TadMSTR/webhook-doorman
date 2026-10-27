@@ -96,8 +96,10 @@ the held events (`GET /admin/dlq`, `GET /admin/held`).
 What protects it is the admin token, which every route checks before doing anything. Without
 `admin.token_env` set to a long-enough value the whole API is disabled. Blocking the prefix at
 the proxy is defence in depth on top of that, not the control itself. The shipped
-`docker-compose.yml` also publishes the port on `127.0.0.1` only, so nothing reaches any route
-except through your proxy or from the host.
+`docker-compose.yml` publishes the port on `127.0.0.1` only, so as shipped nothing reaches any
+route except through your proxy or from the host. Once you attach the container to the proxy's
+network instead (the commented `networks:` block), every other container on that network can
+reach `:8080` directly, `/admin/` included, and the token is the only thing in the way.
 
 The app serves no `/docs`, `/redoc` or `/openapi.json`: the schema would list every ingest path.
 

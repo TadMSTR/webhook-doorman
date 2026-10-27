@@ -42,8 +42,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-#: The version secret-scan.yml installs. A different binary means a different ruleset: forge's
-#: Debian gitleaks has no entropy floor on github-pat, so a probe can pass there and fail in CI.
+#: The version secret-scan.yml installs. A different binary means a different ruleset: a distro
+#: build of gitleaks has no entropy floor on github-pat, so a probe can pass there and fail in CI.
 GITLEAKS_PINNED = "8.30.1"
 
 #: A distinct exit code for "found something". gitleaks exits 1 for an operational error AND,
