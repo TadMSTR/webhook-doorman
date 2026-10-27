@@ -89,8 +89,17 @@ The `config.yml` mount is fine as a bind mount: it holds no secrets and should b
 
 Two prefixes should be unreachable from outside.
 
-`/admin/` re-fires stored events at their real destinations (`/admin/replay/{event_id}`) and
-lists the dead-letter queue (`/admin/dlq`). It requires a token.
+`/admin/` re-fires stored events at their real destinations (`POST /admin/replay/{event_id}`),
+releases quarantined ones (`POST /admin/release/{event_id}`), and lists the dead-letter queue and
+the held events (`GET /admin/dlq`, `GET /admin/held`).
+
+What protects it is the admin token, which every route checks before doing anything. Without
+`admin.token_env` set to a long-enough value the whole API is disabled. Blocking the prefix at
+the proxy is defence in depth on top of that, not the control itself. The shipped
+`docker-compose.yml` also publishes the port on `127.0.0.1` only, so nothing reaches any route
+except through your proxy or from the host.
+
+The app serves no `/docs`, `/redoc` or `/openapi.json`: the schema would list every ingest path.
 
 `/metrics` is **unauthenticated by default** — that is the Prometheus scrape convention, and
 requiring a token breaks a stock `scrape_config`. It exposes no payload, header or secret, but

@@ -48,6 +48,8 @@ dependencies = [
 # Tracing is opt-in and stays out of the default install, which is nine dependencies with an
 # argument for each. Nothing here is imported unless OTEL_EXPORTER_OTLP_ENDPOINT is set, and a
 # missing extra with that variable set is a boot warning rather than a crash — see tracing.py.
+# (`opentelemetry-api` itself is in every install regardless: FastAPI 0.143+ depends on it and
+# imports it at startup. The SDK, exporter and instrumentation are what this extra adds.)
 otel = [
     # The API/SDK packages are 1.x; the instrumentation packages are still 0.x betas and move in
     # lockstep with them, which is why the two halves carry different ceilings.

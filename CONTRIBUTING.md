@@ -90,8 +90,11 @@ lookups and return `actionable=False` when there is nothing to do.
 
 ## Tests
 
-- The suite must pass and coverage must stay above 80%. Verification, redaction and the config
-  guards are held at 100% — coverage is a floor, not the goal.
+- The suite must pass and coverage must stay at or above 95% (`--cov-fail-under` in
+  `pyproject.toml`). Coverage is a floor, not the goal: a change to verification, redaction or
+  the config guards should come with a test that fails without it.
+- Tests must not touch the network. `tests/conftest.py` fails any test that resolves a name or
+  connects beyond loopback; use `pytest-httpx`, the ASGI test client, or a 127.0.0.1 listener.
 - **Name the scenario, not the function.** `test_forwarded_for_cannot_forge_the_peer`, not
   `test_verify_peer`.
 - **Prove a security test is real.** Before trusting one, confirm it fails against the code

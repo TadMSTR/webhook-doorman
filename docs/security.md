@@ -171,8 +171,10 @@ Control exposure at the boundary that actually has it:
 | Reverse proxy only | join the proxy's network, publish **nothing** |
 | Public ingress | reverse proxy with TLS and rate limiting; block `/admin/` **and `/metrics`** there |
 
-`POST /admin/replay/{event_id}` re-fires a stored event. It requires a token of at least 32
-characters and is disabled entirely without one — and it should never be routed through a public
+`POST /admin/replay/{event_id}` re-fires a stored event, and `POST /admin/release/{event_id}`
+releases a quarantined one. Every `/admin/` route requires the admin token: at least
+`admin.min_token_length` characters (32 by default), and a blank or too-short token disables the
+whole API rather than opening it — and it should never be routed through a public
 reverse proxy.
 
 A source `path` may not start with `/admin` or `/metrics`. That is not stylistic: if an ingest

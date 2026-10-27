@@ -75,8 +75,12 @@ input — a cosmetic upstream change must not become a rejected delivery.
 
 ## Testing
 
-- `pytest` with an 80% floor in CI; verification, redaction and the config guards are held at
-  100%. Coverage is a floor, not a goal — the negative tests are the coverage that matters.
+- `pytest` with a 95% floor in CI (`--cov-fail-under` in `pyproject.toml`). Coverage is a floor,
+  not a goal: the negative tests are the coverage that matters, and for verification, redaction
+  and the config guards a mutation probe is the evidence that a test can fail. Nothing enforces a
+  per-module threshold.
+- No test may leave the machine. `tests/conftest.py` fails any test that resolves a name or
+  connects beyond loopback.
 - Test names describe the scenario: `test_forwarded_for_cannot_forge_the_peer`, not
   `test_verify_peer`.
 - **Fixtures are invented.** No real hostnames, room IDs, tokens or internal addresses anywhere
