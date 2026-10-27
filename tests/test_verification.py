@@ -7,8 +7,11 @@ re-serialised body, a peer outside the allowlist.
 
 from __future__ import annotations
 
+import ast
 import base64
 import json
+import re
+from pathlib import Path
 
 import pytest
 
@@ -242,3 +245,192 @@ class TestDispatch:
             strategy = "future"
 
         assert not verify(Unknown(), body=b"", headers={}, peer="127.0.0.1", secrets={}).ok
+
+
+# ------------------------------------------------------------------------------------------
+# Non-ASCII credentials (fingerprint e191bc2b).
+#
+# `hmac.compare_digest` accepts two `str` values only when both are ASCII and raises TypeError
+# otherwise. A header is attacker-controlled, so `Bearer \xe9` reached it and became a 500 with a
+# traceback, bypassing the `verification_failed` log line and the failure counter. A credential
+# is compared as UTF-8 bytes now, so non-ASCII is an ordinary mismatch, or an ordinary match when
+# the configured secret is itself non-ASCII.
+# ------------------------------------------------------------------------------------------
+
+
+class TestNonAsciiCredentials:
+    def test_non_ascii_bearer_is_a_mismatch_not_an_exception(self):
+        result = verify_bearer(BEARER_SPEC, "Bearer \xe9", "abcdefgh12345678")
+        assert not result.ok
+        assert result.reason == "token mismatch"
+
+    def test_non_ascii_hmac_signature_is_a_mismatch_not_an_exception(self):
+        result = verify_hmac(GITHUB_SPEC, BODY, "sha256=\xff", GITHUB_SECRET)
+        assert not result.ok
+        assert result.reason == "signature mismatch"
+
+    def test_non_ascii_basic_credential_is_a_mismatch_not_an_exception(self):
+        header = basic_header("jürgen", "päss")
+        result = verify_basic(BASIC_SPEC, header, "alice", "s3cret-value")
+        assert not result.ok
+        assert result.reason == "credential mismatch"
+
+    def test_a_non_ascii_configured_credential_can_still_match(self):
+        """Bytes, not a refusal: an operator's non-ASCII password is a valid password."""
+        header = basic_header("jürgen", "päss-NOTREAL")
+        assert verify_basic(BASIC_SPEC, header, "jürgen", "päss-NOTREAL").ok
+        assert verify_bearer(BEARER_SPEC, "Bearer töken", "töken").ok
+
+    @pytest.mark.parametrize(
+        ("spec", "headers", "secrets"),
+        [
+            (GITHUB_SPEC, {"x-hub-signature-256": "sha256=\xff"}, {"GITHUB_WEBHOOK_SECRET": "s"}),
+            (BEARER_SPEC, {"authorization": "Bearer \xe9"}, {"TOKEN": "abcdefgh12345678"}),
+        ],
+    )
+    def test_dispatch_never_raises_on_non_ascii(self, spec, headers, secrets):
+        assert not verify(spec, body=BODY, headers=headers, peer=None, secrets=secrets).ok
+
+
+class TestBasicDispatch:
+    """`verify` must hand the configured user and password to the right halves (ad8bdc8e).
+
+    Every basic case in `TestDispatch` was missing, so swapping `user_env` and `pass_env` in the
+    dispatcher, or replacing the whole arm with an accept, left the suite green.
+    """
+
+    SECRETS = {"U": "alice", "P": "s3cret-value"}  # noqa: RUF012
+
+    def test_correct_credentials_accepted(self):
+        headers = {"authorization": basic_header("alice", "s3cret-value")}
+        assert verify(BASIC_SPEC, body=b"", headers=headers, peer=None, secrets=self.SECRETS).ok
+
+    def test_credentials_presented_swapped_are_rejected(self):
+        headers = {"authorization": basic_header("s3cret-value", "alice")}
+        assert not verify(BASIC_SPEC, body=b"", headers=headers, peer=None, secrets=self.SECRETS).ok
+
+    def test_no_header_is_rejected(self):
+        assert not verify(BASIC_SPEC, body=b"", headers={}, peer=None, secrets=self.SECRETS).ok
+
+
+# ------------------------------------------------------------------------------------------
+# No `==` on a credential, anywhere (#759, fingerprint 774f911b).
+#
+# Replacing `compare_digest` with `!=` in `verify_hmac` survived the whole suite: every
+# behavioural test passes either way, because a timing side channel is not observable in a unit
+# test. So this is a structural test. Every constant-time comparison goes through
+# `secure_compare`, and nothing else in the package may compare a credential-named value with
+# `==` or `!=`. Read from the source by AST, so a comment or string cannot satisfy it.
+# ------------------------------------------------------------------------------------------
+
+PACKAGE = Path(__file__).resolve().parent.parent / "src" / "webhook_doorman"
+
+#: Identifiers that hold, or are derived from, a credential. Matched against variable names,
+#: attribute names and the last segment of a dotted name.
+CREDENTIAL_NAME = re.compile(
+    r"(secret|token|password|passwd|signature|digest|credential|expected|presented"
+    r"|^user$|^pass$|presented_user|presented_pass)",
+    re.IGNORECASE,
+)
+
+
+def _modules() -> list[Path]:
+    files = sorted(PACKAGE.rglob("*.py"))
+    assert len(files) >= 20, f"only {len(files)} modules found under {PACKAGE}: wrong path?"
+    return files
+
+
+def _name_of(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Call):
+        return _name_of(node.func)
+    return None
+
+
+def _calls_compare_digest(node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and _name_of(node.func) == "compare_digest"
+
+
+class TestConstantTimeComparison:
+    def test_nothing_compares_a_credential_with_eq_or_ne(self):
+        offenders = []
+        for path in _modules():
+            tree = ast.parse(path.read_text(), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Compare):
+                    continue
+                if not any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
+                    continue
+                for operand in (node.left, *node.comparators):
+                    name = _name_of(operand)
+                    if name and CREDENTIAL_NAME.search(name):
+                        offenders.append(f"{path.name}:{node.lineno} {ast.unparse(node)}")
+        assert offenders == [], "credential compared with ==/!=:\n" + "\n".join(offenders)
+
+    def test_compare_digest_is_called_only_inside_secure_compare(self):
+        """One choke point, so the bytes conversion and the constant-time call cannot drift."""
+        sites: set[str] = set()
+        for path in _modules():
+            tree = ast.parse(path.read_text(), filename=str(path))
+            for func in ast.walk(tree):
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if func.name == "secure_compare" and path.name == "verification.py":
+                    continue
+                for node in ast.walk(func):
+                    if _calls_compare_digest(node):
+                        sites.add(f"{path.name}:{node.lineno}")
+        assert not sites, "compare_digest outside secure_compare:\n" + "\n".join(sorted(sites))
+
+    def test_secure_compare_is_constant_time_and_bytes(self):
+        tree = ast.parse((PACKAGE / "verification.py").read_text())
+        funcs = [
+            f
+            for f in ast.walk(tree)
+            if isinstance(f, ast.FunctionDef) and f.name == "secure_compare"
+        ]
+        assert len(funcs) == 1, "verification.secure_compare is missing"
+        body = list(ast.walk(funcs[0]))
+        assert any(_calls_compare_digest(n) for n in body), "secure_compare must use compare_digest"
+        assert not any(
+            isinstance(n, ast.Compare) and any(isinstance(op, (ast.Eq, ast.NotEq)) for op in n.ops)
+            for n in body
+        ), "secure_compare must not use ==/!="
+
+    @pytest.mark.parametrize(
+        ("module", "function"),
+        [
+            ("verification.py", "verify_hmac"),
+            ("verification.py", "verify_bearer"),
+            ("verification.py", "verify_basic"),
+            ("engine.py", "check_admin_token"),
+            ("app.py", "metrics"),
+        ],
+    )
+    def test_every_credential_check_calls_secure_compare(self, module, function):
+        """The roster of places that compare a credential. A new one must be added here."""
+        tree = ast.parse((PACKAGE / module).read_text())
+        funcs = [
+            f
+            for f in ast.walk(tree)
+            if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name == function
+        ]
+        assert funcs, f"{module}:{function} not found"
+        assert any(
+            isinstance(n, ast.Call) and _name_of(n.func) == "secure_compare"
+            for n in ast.walk(funcs[0])
+        ), f"{module}:{function} does not call secure_compare"
+
+    def test_the_structural_test_can_fail(self):
+        """The control: the scan must flag the exact mutation #759 describes."""
+        mutated = "def f(expected, presented):\n    if expected != presented:\n        return 1\n"
+        hits = [
+            n
+            for n in ast.walk(ast.parse(mutated))
+            if isinstance(n, ast.Compare)
+            and any(CREDENTIAL_NAME.search(_name_of(o) or "") for o in (n.left, *n.comparators))
+        ]
+        assert hits

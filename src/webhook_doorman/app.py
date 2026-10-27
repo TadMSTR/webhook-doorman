@@ -15,7 +15,6 @@ A source is either enabled or it rejects. There is no third state, and in partic
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -35,7 +34,7 @@ from .parsers import get_parser, parse
 from .redaction import redact_bytes, redact_headers, redact_json, redact_text
 from .sanitize import sanitize_structure
 from .secrets import Resolved, SourceState, resolve
-from .verification import verify
+from .verification import secure_compare, verify
 
 log = structlog.get_logger(__name__)
 
@@ -516,7 +515,7 @@ def build_metrics_route(
         expected = resolved.metrics_token()
         if expected is not None:
             presented = authorization.removeprefix("Bearer ").strip()
-            if not hmac.compare_digest(expected, presented):
+            if not secure_compare(expected, presented):
                 log.warning("metrics_auth_failed")
                 raise HTTPException(status_code=401, detail="Unauthorized")
 

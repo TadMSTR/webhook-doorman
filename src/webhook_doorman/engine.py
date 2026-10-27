@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
 import random
 import time
 from datetime import timedelta
@@ -51,6 +50,7 @@ from .redaction import redact_text
 from .secrets import Resolved
 from .sinks import Sink, build_sink
 from .store import SqliteStore, Store
+from .verification import secure_compare
 
 log = structlog.get_logger(__name__)
 
@@ -659,7 +659,7 @@ class Engine:
         expected = self.resolved.admin_token()
         if not expected or not presented:
             return False
-        return hmac.compare_digest(expected, presented)
+        return secure_compare(expected, presented)
 
 
 def _jittered(seconds: float, jitter: float) -> float:

@@ -15,7 +15,9 @@ Invariants, each with a negative test in `tests/test_verification.py`:
 * HMAC is computed over the **raw bytes** as received. The body is never re-serialised and
   compared — a JSON round-trip changes whitespace and key order, and a signature that survives
   that is not a signature.
-* Every comparison is `hmac.compare_digest`. No `==` on a credential anywhere.
+* Every credential comparison is `secure_compare`, which is `hmac.compare_digest` over UTF-8
+  bytes. No `==` on a credential anywhere. `tests/test_verification.py` checks this
+  structurally, by AST, because a timing side channel is invisible to a behavioural test.
 * A missing or blank credential header never matches, including against an empty secret.
 * `none` sources match the socket peer against a CIDR allowlist, never a forwarded-for header.
 """
@@ -50,6 +52,23 @@ class VerificationResult:
 _OK = VerificationResult(True)
 
 
+def secure_compare(expected: str, presented: str) -> bool:
+    """Constant-time equality for two credentials. The only one in the package.
+
+    Bytes, not `str`. `hmac.compare_digest` takes two `str` values only when both are ASCII and
+    raises `TypeError` otherwise. A credential header is attacker-controlled, so `Bearer \\xe9`
+    reached it and became a 500 with a traceback, which skipped the rejection log line and the
+    failure counter. As bytes, non-ASCII is an ordinary mismatch, and a non-ASCII secret is an
+    ordinary secret. `surrogatepass` keeps the encode itself from ever raising.
+
+    Every credential check in the package calls this (`app.py`, `engine.py` and the verifiers
+    below), so the conversion and the constant-time call cannot drift apart.
+    """
+    return hmac.compare_digest(
+        expected.encode("utf-8", "surrogatepass"), presented.encode("utf-8", "surrogatepass")
+    )
+
+
 def _digest(secret: str, body: bytes, encoding: str) -> str:
     raw = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).digest()
     if encoding == "base64":
@@ -67,7 +86,7 @@ def verify_hmac(spec: HmacVerify, body: bytes, presented: str, secret: str) -> V
         return VerificationResult(False, "signature prefix mismatch")
 
     expected = spec.prefix + _digest(secret, body, spec.encoding)
-    if not hmac.compare_digest(expected, presented):
+    if not secure_compare(expected, presented):
         return VerificationResult(False, "signature mismatch")
     return _OK
 
@@ -80,7 +99,7 @@ def verify_bearer(spec: BearerVerify, presented: str, secret: str) -> Verificati
         return VerificationResult(False, f"missing {spec.header} header")
 
     expected = spec.prefix + secret
-    if not hmac.compare_digest(expected, presented):
+    if not secure_compare(expected, presented):
         return VerificationResult(False, "token mismatch")
     return _OK
 
@@ -109,8 +128,8 @@ def verify_basic(spec: BasicVerify, presented: str, user: str, password: str) ->
     if not sep:
         return VerificationResult(False, "malformed Basic credential")
 
-    user_ok = hmac.compare_digest(user, presented_user)
-    pass_ok = hmac.compare_digest(password, presented_pass)
+    user_ok = secure_compare(user, presented_user)
+    pass_ok = secure_compare(password, presented_pass)
     if not (user_ok and pass_ok):
         return VerificationResult(False, "credential mismatch")
     return _OK
