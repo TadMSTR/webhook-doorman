@@ -58,9 +58,24 @@ from .sanitize import sanitize
 #: that only stops an exact-match forgery is not one.
 #:
 #: The lookahead is what keeps this from over-reaching. `untrusted` must be followed by
-#: whitespace or `>`, so a payload containing `<untrusted-data>` is left alone while
-#: `<untrusted source="...">` is not.
-_FENCE_TAG = re.compile(r"</?\s*untrusted(?=[\s>])[^>]*>", re.IGNORECASE)
+#: whitespace, `/` or `>`, so a payload containing `<untrusted-data>` is left alone while
+#: `<untrusted source="...">` and the self-closing `</untrusted/>` are not.
+_FENCE_TAG = re.compile(r"</?\s*untrusted(?=[\s>/])[^>]*>", re.IGNORECASE)
+
+
+def _strip_fence_tags(text: str) -> str:
+    """Remove every fence tag, including any that removing another one creates.
+
+    One pass is not enough. In `</untr<untrusted>usted>` the inner tag is removed and the
+    outer halves join into a real `</untrusted>`, which would close the fence early and leave
+    the rest of the attacker's text outside it. Repeating until nothing changes ends that:
+    each pass removes at least one `>`, so it terminates.
+    """
+    while True:
+        stripped = _FENCE_TAG.sub("", text)
+        if stripped == text:
+            return stripped
+        text = stripped
 
 
 def _attribute(value: str) -> str:
@@ -76,7 +91,7 @@ def fence_text(content: str, *, source: str, field: str) -> str:
     the log and another to the model reading the message.
     """
     cleaned, _ = sanitize(content)
-    cleaned = _FENCE_TAG.sub("", cleaned)
+    cleaned = _strip_fence_tags(cleaned)
     return (
         f"<untrusted source={_attribute(source)} field={_attribute(field)}>\n"
         f"{cleaned}\n"
