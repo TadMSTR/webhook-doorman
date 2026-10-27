@@ -46,11 +46,18 @@ COPY src ./src
 # `[otel]` is included in the image so enabling tracing is one environment variable rather than
 # a derived image. An adopter who never sets OTEL_EXPORTER_OTLP_ENDPOINT pays image size and
 # nothing else — tracing.py imports none of it unless that variable is set.
+#
+# The venv is created `--without-pip` and filled by the BUILDER's pip through `--python`. A pip
+# inside /opt/venv would ship: it is an installer the service never runs, and it vendors its own
+# certifi, urllib3, msgpack and setuptools, which scanners report and `pip-audit --path` does not
+# see. On the 0.6.0 image, 5 of Trivy's 6 fixable HIGH/CRITICAL findings were pip's vendored
+# copies (vikunja#1033).
 RUN uv export --frozen --no-dev --extra otel --no-emit-project \
         --format requirements.txt -o /tmp/requirements.txt \
- && python -m venv /opt/venv \
- && /opt/venv/bin/pip install --require-hashes --no-deps -r /tmp/requirements.txt \
- && /opt/venv/bin/pip install --no-deps .
+ && python -m venv --without-pip /opt/venv \
+ && python -m pip --python /opt/venv/bin/python install --require-hashes --no-deps \
+        -r /tmp/requirements.txt \
+ && python -m pip --python /opt/venv/bin/python install --no-deps .
 
 # --- runtime ----------------------------------------------------------------------------------
 # Same digest as the builder stage above, and it must stay that way — see the reasoning there.
@@ -64,7 +71,19 @@ ENV PATH="/opt/venv/bin:$PATH" \
 # A fixed, documented UID rather than a floating one. The data directory on the host has to be
 # owned by this UID for SQLite to create its file and the -wal/-shm siblings beside it, and an
 # operator cannot chown to a UID that changes between builds.
-RUN groupadd --system --gid 10001 doorman \
+#
+# The base image's own pip goes too, for the same reason as the venv's (see the builder stage).
+# Nothing at runtime installs packages. The bytes stay in the base layer, but the merged
+# filesystem, which is what runs and what scanners read, has no pip. verify-image.sh asserts it.
+#
+# There is deliberately no `apt-get upgrade` here, unlike ollama-queue-proxy. It would make two
+# builds of one commit differ, which is what the digest pin above exists to stop. The OS layer had
+# 0 fixable HIGH/CRITICAL when this was written (Debian 13.7, 2026-10-27). If Trivy goes red on
+# an OS package, the fix is a new base digest, and Dependabot's docker ecosystem proposes those.
+RUN rm -rf /usr/local/lib/python3.*/site-packages/pip \
+           /usr/local/lib/python3.*/site-packages/pip-*.dist-info \
+           /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.* \
+ && groupadd --system --gid 10001 doorman \
  && useradd --system --uid 10001 --gid 10001 --home-dir /data --shell /usr/sbin/nologin doorman \
  && mkdir -p /data /config \
  && chown -R doorman:doorman /data

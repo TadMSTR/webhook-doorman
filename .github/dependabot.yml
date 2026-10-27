@@ -87,3 +87,13 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+
+  # The Trivy scanner verify-image.sh runs. Its Dockerfile is never built; it only holds the pin
+  # so that this ecosystem can bump it.
+  - package-ecosystem: "docker"
+    directory: "/.github/ci/trivy"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
