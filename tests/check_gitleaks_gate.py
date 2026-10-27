@@ -88,8 +88,12 @@ SKIP = shutil.ignore_patterns(
 )
 
 
-def run_gitleaks(source: Path) -> tuple[int, set[str]]:
-    """Return `(exit code, rule IDs found)`. The report goes outside `source`."""
+def run_gitleaks(source: Path) -> tuple[int, set[str], list[str]]:
+    """Return `(exit code, rule IDs, finding locations)`. The report goes outside `source`.
+
+    A location is `rule file:line commit`, never the match: `--redact` keeps the value out of
+    the report, and printing a location is what lets someone fix a history finding at all.
+    """
     with tempfile.TemporaryDirectory() as rd:
         report = Path(rd) / "report.json"
         code = subprocess.run(
@@ -111,12 +115,17 @@ def run_gitleaks(source: Path) -> tuple[int, set[str]]:
             text=True,
             check=False,
         ).returncode
-        rules: set[str] = set()
+        findings: list[dict] = []
         if report.exists():
             # Unparseable means "no rule IDs recovered". The exit code is still returned.
             with contextlib.suppress(ValueError):
-                rules = {f.get("RuleID", "") for f in json.loads(report.read_text() or "[]")}
-        return code, rules
+                findings = json.loads(report.read_text() or "[]")
+        rules = {f.get("RuleID", "") for f in findings}
+        where = [
+            f"{f.get('RuleID')} {f.get('File')}:{f.get('StartLine')} {str(f.get('Commit'))[:12]}"
+            for f in findings
+        ]
+        return code, rules, where
 
 
 def probe(label: str, rel: str, content: str, rule: str) -> bool:
@@ -147,7 +156,7 @@ def probe(label: str, rel: str, content: str, rule: str) -> bool:
             print(f"FAIL  {label}: the planted value is still in the working tree")
             return False
 
-        code, rules = run_gitleaks(work)
+        code, rules, _ = run_gitleaks(work)
         if code != LEAK_EXIT:
             what = "NOT detected" if code == 0 else f"a scanner ERROR (exit {code})"
             print(f"FAIL  {label}: planted value was {what}, expected exit {LEAK_EXIT}")
@@ -161,12 +170,14 @@ def probe(label: str, rel: str, content: str, rule: str) -> bool:
 
 
 def real_history_clean() -> bool:
-    code, rules = run_gitleaks(REPO)
+    code, rules, where = run_gitleaks(REPO)
     if code == 0:
         print("ok    real history scans clean")
         return True
     if code == LEAK_EXIT:
         print(f"FAIL  real history has findings: {sorted(rules)}")
+        for w in where:
+            print(f"        {w}")
     else:
         print(f"FAIL  gitleaks exited {code} on the real history: a scanner error, not clean")
     return False
