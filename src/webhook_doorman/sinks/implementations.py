@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import base64
 import json
-import time
+import re
 from typing import Any
 from urllib.parse import quote
 
@@ -45,7 +45,7 @@ from ..config import (
 )
 from ..errors import PermanentSinkError
 from ..templating import render, render_html, render_markdown, render_slack, validate
-from .base import DeliveryOutcome, Disposition, HttpSinkBase, Verdict
+from .base import DELIVERY_KEY, DeliveryOutcome, Disposition, HttpSinkBase, Verdict
 
 
 def _resolve_url(spec: Any, secrets: dict[str, str]) -> str:
@@ -56,6 +56,10 @@ def _resolve_url(spec: Any, secrets: dict[str, str]) -> str:
     if not value:
         raise PermanentSinkError(f"{spec.name}: {spec.url_env} is unset")
     return value.rstrip("/")
+
+
+#: Control characters, CR and LF included, collapsed to one space in a header value.
+_HEADER_UNSAFE = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 def _encoded_word(value: str) -> str:
@@ -69,6 +73,10 @@ def _encoded_word(value: str) -> str:
     Encoding only when needed is deliberate: an ASCII title stays readable in a packet capture,
     in a server log, and to any tool downstream that has not implemented RFC 2047.
     """
+    # One line, always. A header value cannot carry CR or LF, and event text routinely does: a
+    # fenced field is multi-line by construction. h11 refuses such a request before it is sent,
+    # which used to surface as a retryable transport error and burned every attempt.
+    value = _HEADER_UNSAFE.sub(" ", value).strip()
     try:
         value.encode("ascii")
     except UnicodeEncodeError:
@@ -95,8 +103,12 @@ class MatrixMessageSink(HttpSinkBase):
 
         message = render(self.spec.template, context)
         # A transaction ID makes the send idempotent on the homeserver: a retry after a timeout
-        # that actually succeeded is collapsed rather than posted twice.
-        txn = f"doorman-{context.get('delivery_id', 'x')}-{int(time.time())}"
+        # that actually succeeded is collapsed rather than posted twice. That only works if the
+        # ID is the same on every attempt of one delivery, so it is the engine's delivery key,
+        # which a replay changes (a new delivery) and a retry does not. It used to include the
+        # clock, which made every retry a new message.
+        key = context.get(DELIVERY_KEY) or context.get("delivery_id", "x")
+        txn = f"doorman-{self.name}-{key}"
         url = (
             f"{base}/_matrix/client/v3/rooms/{quote(room, safe='')}"
             f"/send/m.room.message/{quote(txn, safe='')}"
@@ -106,7 +118,10 @@ class MatrixMessageSink(HttpSinkBase):
             "PUT",
             url,
             headers={"Authorization": f"Bearer {token}"},
-            json={"msgtype": "m.text", "body": message},
+            # An empty `m.mentions` switches off the legacy push rules that scan the body for
+            # `@room` and display names (Matrix spec v1.7). Event text is attacker-authored, and
+            # this is the Matrix counterpart of Discord's `allowed_mentions`.
+            json={"msgtype": "m.text", "body": message, "m.mentions": {}},
         )
 
 

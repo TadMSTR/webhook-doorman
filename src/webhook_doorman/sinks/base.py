@@ -26,6 +26,11 @@ import httpx
 
 from ..errors import PermanentSinkError, SinkError
 
+#: Context key the engine sets to an identifier that is stable across the retries of one
+#: delivery and different for every delivery (a replay is a new one). For idempotency keys at the
+#: destination; see `MatrixSink_`. It is ours, never the producer's.
+DELIVERY_KEY = "delivery_key"
+
 # How much of a destination's response body travels back in an error message. Chosen small on
 # purpose: 200 characters of an arbitrary error page is rarely more diagnostic than 80, and it is
 # 120 more characters of someone else's output to store, log and export.
@@ -128,6 +133,14 @@ class HttpSinkBase:
         except httpx.TimeoutException as exc:
             raise SinkError(
                 f"{self.name}: timeout after {_elapsed(started)}ms: {exc}",
+                latency_ms=_elapsed(started),
+            ) from exc
+        except httpx.LocalProtocolError as exc:
+            # We built a request the HTTP layer refuses to send, such as a header holding a
+            # newline. Deterministic, like the encoding failure above, so it goes straight to the
+            # DLQ rather than through every retry.
+            raise PermanentSinkError(
+                f"{self.name}: request refused before sending: {exc}",
                 latency_ms=_elapsed(started),
             ) from exc
         except httpx.HTTPError as exc:

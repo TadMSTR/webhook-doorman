@@ -48,8 +48,10 @@ from .models import (
     utcnow,
 )
 from .redaction import redact_text
+from .sanitize import sanitize
 from .secrets import Resolved
 from .sinks import Sink, build_sink
+from .sinks.base import DELIVERY_KEY
 from .store import SqliteStore, Store
 from .verification import secure_compare
 
@@ -386,12 +388,14 @@ class Engine:
         `fence_forgery` rule match on every fenced field.
         """
         context = event.template_context()
-        parts = [
-            str(context[name])
-            for name in event.untrusted_fields
-            if name in context and context[name] is not None
-        ]
-        return "\n".join(parts).strip()
+        parts: list[str] = []
+        for name in event.untrusted_fields:
+            if name in context and context[name] is not None:
+                parts.extend(_text_leaves(context[name]))
+        # Sanitised the way a fence sanitises, so the detector reads what an agent would. Text
+        # from `payload` was never sanitised at ingest, and a zero-width character inside
+        # "ig\u200bnore" was enough to step round every rule.
+        return sanitize("\n".join(parts))[0].strip()
 
     def detector_health(self) -> dict[str, Any]:
         """The `detector` block of `/health`.
@@ -567,10 +571,10 @@ class Engine:
             await self._exhaust(delivery, f"sink {delivery.sink!r} is not available", None, 0)
             return
 
+        context = self._context_for(event, delivery.sink)
+        context[DELIVERY_KEY] = str(delivery.id)
         try:
-            outcome = await sink.deliver(
-                self._context_for(event, delivery.sink), self._require_client()
-            )
+            outcome = await sink.deliver(context, self._require_client())
         except PermanentSinkError as exc:
             log.warning(
                 "delivery_permanent_failure",
@@ -790,6 +794,23 @@ class Engine:
         if not expected or not presented:
             return False
         return secure_compare(expected, presented)
+
+
+def _text_leaves(value: Any) -> list[str]:
+    """Every string in a decoded structure, in order, as the text it is.
+
+    `str()` of a dict is Python's repr: newlines become a literal backslash-n, which removes the
+    word boundary and the line start that the detector's rules anchor on. So a generic source's
+    `payload` scored 0.0 where the same text scored 1.0. Scalars that are not strings are kept as
+    text too, because a number is still something an agent reads.
+    """
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [leaf for item in value.values() for leaf in _text_leaves(item)]
+    if isinstance(value, list | tuple):
+        return [leaf for item in value for leaf in _text_leaves(item)]
+    return [] if value is None else [str(value)]
 
 
 def _jittered(seconds: float, jitter: float) -> float:
