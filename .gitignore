@@ -49,5 +49,5 @@ coverage.xml
 
 # --- crash artefacts (a core dump can contain a live secret) ---
 core
-core.*
+core.[0-9]*
 *.core
