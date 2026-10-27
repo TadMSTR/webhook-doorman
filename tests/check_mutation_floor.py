@@ -33,8 +33,15 @@ from collections import Counter
 #: equivalent; the classes are listed in the module docstring. The real ones that run found
 #: (Basic auth `or`/`and` and `partition`, `deny` `continue`/`break`, `resolve` loop exits,
 #: the metrics-token length boundary) have tests now and are not in these numbers.
+#:
+#: verification 83 -> 85 after the 0.7.0 audit (CR-08: `secure_compare` refuses empty input).
+#: Both new survivors were read and are equivalent BECAUSE of that guard, not test gaps:
+#: `secure_compare`'s own `or` -> `and` (with one side empty, compare_digest is False anyway),
+#: and `verify_basic`'s `if not user or not password` -> `and` (an empty half can no longer
+#: match an empty presented half, since the choke point refuses it). Raised with that reason;
+#: never raise a ceiling without reading the survivors.
 MAX_SURVIVED = {
-    "webhook_doorman.verification": 83,
+    "webhook_doorman.verification": 85,
     "webhook_doorman.secrets": 11,
     "webhook_doorman.filtering": 5,
 }
