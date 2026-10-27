@@ -269,8 +269,13 @@ class Engine:
         if withheld is not None:
             return withheld
         # The stored decision, not this request's: the content and the routing must come from
-        # the same event.
-        queued = await self.store.enqueue_first_deliveries(event_id, stored.sinks)
+        # the same event. Narrowed by the current routes, as `release` and `replay` are, so a
+        # route filter tightened since the event was stored is honoured here too.
+        current = set(self._sinks_for(stored))
+        sinks = [sink for sink in stored.sinks if sink in current]
+        if not sinks:
+            return None
+        queued = await self.store.enqueue_first_deliveries(event_id, sinks)
         if not queued:
             return None  # a concurrent redelivery got there first
         log.warning(
@@ -279,7 +284,7 @@ class Engine:
             event_type=event.event_type,
             event_id=event_id,
             delivery_id=event.delivery_id,
-            sinks=stored.sinks,
+            sinks=sinks,
         )
         return {"status": "accepted", "event_id": event_id, "resumed": True}
 
@@ -554,7 +559,7 @@ class Engine:
         attempts_made = delivery.attempt + 1
         try:
             if attempts_made >= self.config.delivery.max_attempts:
-                await self._exhaust(delivery, f"engine error: {error}", None, 0)
+                await self._dead_letter(delivery, f"engine error: {error}", None, 0, attempts_made)
                 return
             retry_at = utcnow() + timedelta(seconds=self.retry_delay_seconds(attempts_made))
             await self.store.release_claim(delivery.id, retry_at)
@@ -681,19 +686,7 @@ class Engine:
         error = self._redact_error(error)
         attempts_made = delivery.attempt + 1
         if attempts_made >= self.config.delivery.max_attempts:
-            log.warning(
-                "delivery_exhausted",
-                delivery=delivery.id,
-                sink=delivery.sink,
-                attempts=attempts_made,
-                error=error,
-            )
-            METRICS.increment(
-                "webhook_doorman_delivery_attempts_total",
-                sink=delivery.sink,
-                outcome="exhausted",
-            )
-            await self._exhaust(delivery, error, code, latency_ms)
+            await self._dead_letter(delivery, error, code, latency_ms, attempts_made)
             return
 
         METRICS.increment(
@@ -716,6 +709,27 @@ class Engine:
             honoured_retry_after=retry_after is not None,
             error=error,
         )
+
+    async def _dead_letter(
+        self, delivery: Delivery, error: str, code: int | None, latency_ms: int, attempts: int
+    ) -> None:
+        """Exhaust a delivery that ran out of attempts, with the log line and the metric.
+
+        One helper for both ways a delivery runs out: sink failures (`_schedule_retry`) and
+        engine errors (`_recover`). An alert keyed on `delivery_exhausted` or on
+        `outcome="exhausted"` has to see both, and it used to miss the second.
+        """
+        log.warning(
+            "delivery_exhausted",
+            delivery=delivery.id,
+            sink=delivery.sink,
+            attempts=attempts,
+            error=error,
+        )
+        METRICS.increment(
+            "webhook_doorman_delivery_attempts_total", sink=delivery.sink, outcome="exhausted"
+        )
+        await self._exhaust(delivery, error, code, latency_ms)
 
     def _redact_error(self, error: str) -> str:
         """Strip resolved secrets from a delivery error before it is persisted or logged.

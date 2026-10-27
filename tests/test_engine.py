@@ -16,6 +16,7 @@ from webhook_doorman.config import Config
 from webhook_doorman.detect import DetectionResult
 from webhook_doorman.engine import Engine
 from webhook_doorman.errors import PermanentSinkError, SinkError
+from webhook_doorman.metrics import METRICS
 from webhook_doorman.models import (
     Delivery,
     DeliveryStatus,
@@ -672,7 +673,7 @@ class TestAuditRound1:
         assert [r["sink"] for r in rows] == ["notes"]
 
     async def test_a_deterministic_engine_error_reaches_the_dlq(
-        self, engine, httpx_mock, monkeypatch
+        self, engine, httpx_mock, monkeypatch, capsys
     ):
         """CR-04. A failure that repeats on every pass used to loop for ever, never in the DLQ."""
         httpx_mock.add_response(url=SINK_URL, status_code=200, is_reusable=True)
@@ -681,6 +682,7 @@ class TestAuditRound1:
             raise RuntimeError("disk full")
 
         monkeypatch.setattr(engine.store, "mark_delivered", always_fails)
+        METRICS.reset()
         await engine.ingest(event("loop-1"))
         for _ in range(CONFIG["delivery"]["max_attempts"]):
             await engine.store.requeue_incomplete()  # collapse the backoff
@@ -690,6 +692,25 @@ class TestAuditRound1:
         assert stats.get("deliveries_pending", 0) == 0
         dlq = await engine.list_dlq(limit=5)
         assert "engine error" in (dlq[0].error or "")
+        # R2-03: the same signal a sink-failure dead-letter gives, so alerts see both.
+        exhausted = [
+            line
+            for line in METRICS.render(version="t", stats=None).splitlines()
+            if 'outcome="exhausted"' in line and 'sink="notes"' in line
+        ]
+        assert exhausted and exhausted[0].rsplit(" ", 1)[1] in ("1", "1.0")
+        assert "delivery_exhausted" in capsys.readouterr().out
+
+    async def test_a_resume_honours_a_route_tightened_since(self, engine, monkeypatch):
+        """R2-05. Resume routes by the stored list, narrowed by the current routes, as release
+        and replay are."""
+        _fail_first_enqueue(engine, monkeypatch)
+        with pytest.raises(RuntimeError):
+            await engine.ingest(event("tight-1", sinks=["notes"]))
+        monkeypatch.setattr(engine, "_sinks_for", lambda stored: [])
+        retry = await engine.ingest(event("tight-1", sinks=["notes"]))
+        assert retry.get("resumed") is not True
+        assert (await engine.stats()).get("deliveries_pending", 0) == 0
 
     async def test_the_delivered_payload_is_redacted_too(self, tmp_path, httpx_mock):
         """F-02. The decoded `payload` is rebuilt from the stored body on every read, so a secret

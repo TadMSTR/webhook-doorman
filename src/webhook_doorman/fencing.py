@@ -60,7 +60,19 @@ from .sanitize import sanitize
 #: The lookahead is what keeps this from over-reaching. `untrusted` must be followed by
 #: whitespace, `/` or `>`, so a payload containing `<untrusted-data>` is left alone while every
 #: spelling of the real tag is not.
-_FENCE_TAG = re.compile(r"<\s*/?\s*untrusted(?=[\s>/])[^>]*>", re.IGNORECASE)
+#:
+#: Written so the regex engine has one way to match, because the input is attacker-chosen and
+#: the match runs on the event loop. `<\s*/?\s*` could split a whitespace run between its two
+#: `\s*` in n ways, which made one search quadratic: seconds on a 64 KB issue body. Here the
+#: whitespace before `/` belongs to the optional group and the rest to the second `\s*`, so each
+#: `<` costs linear time. The attribute run is capped for the same reason; an opening that finds
+#: no `>` within the cap is caught by `_FENCE_OPEN` below instead.
+_FENCE_PREFIX = r"<(?:\s*/)?\s*untrusted(?=[\s>/])"
+_FENCE_TAG = re.compile(_FENCE_PREFIX + r"[^>]{0,512}>", re.IGNORECASE)
+
+#: The opening of a fence tag, whether or not it is ever closed. Linear. If any is left after
+#: stripping, the field is adversarial and its brackets are neutralised.
+_FENCE_OPEN = re.compile(_FENCE_PREFIX, re.IGNORECASE)
 
 
 #: Strip passes before giving up on preserving the text. Ordinary content needs one; each
@@ -76,16 +88,21 @@ def _strip_fence_tags(text: str) -> str:
     linear, and the number of passes grows with nesting depth, so unbounded repetition is
     quadratic in attacker-chosen input (seconds for a few hundred KB, on the event loop).
 
-    After `_MAX_STRIP_PASSES`, the text is adversarial by construction, and preserving it stops
-    being worth the cost: every `<` and `>` is replaced with a lookalike, which no tag can be
-    built from. Linear, and the fence holds either way.
+    Two cases mean the text is adversarial by construction, and preserving it stops being worth
+    the cost: still changing after `_MAX_STRIP_PASSES`, or a tag opening left that never closes
+    within the attribute cap. Then every `<` and `>` is replaced with a lookalike, which no tag
+    can be built from. Linear either way, and the fence holds either way.
     """
     for _ in range(_MAX_STRIP_PASSES):
         stripped = _FENCE_TAG.sub("", text)
         if stripped == text:
-            return stripped
+            break
         text = stripped
-    return text.translate(_NEUTRALISE_BRACKETS)
+    else:
+        return text.translate(_NEUTRALISE_BRACKETS)
+    if _FENCE_OPEN.search(text):
+        return text.translate(_NEUTRALISE_BRACKETS)
+    return text
 
 
 #: U+2039 / U+203A: readable as angle brackets, and not `<`/`>` to any parser.

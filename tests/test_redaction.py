@@ -105,3 +105,13 @@ class TestRedactText:
 
     def test_empty_secret_ignored(self):
         assert redact_text("unchanged", ["", None or ""]) == "unchanged"
+
+
+def test_redact_json_covers_object_keys():
+    """R2-04. A producer can echo a value as a key as easily as a string value."""
+    from webhook_doorman.redaction import REDACTED, redact_json
+
+    secret = "s3cret-value-NOTREAL"
+    out = redact_json({secret: {"nested": [{secret: secret}]}}, [secret])
+    assert secret not in repr(out)
+    assert REDACTED in out

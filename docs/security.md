@@ -157,6 +157,24 @@ Releasing an already-released event is a no-op, not a second enqueue.
 
 A worked configuration is in [`examples/github-to-agent.yml`](../examples/github-to-agent.yml).
 
+## Redaction, and what it does not cover
+
+Every resolved secret value (webhook secrets, sink tokens, the admin token) is removed from what
+is stored and sent, by value, wherever it appears:
+
+- **Headers:** credential headers are removed by name, and every header has its values checked.
+- **Body:** the raw bytes, matched in the spellings a JSON encoder emits as well (`\/` for `/`,
+  `\uXXXX` for non-ASCII).
+- **Decoded payload:** string values and object keys, both at ingest (what filters see) and
+  again at delivery (what sinks receive).
+- **Errors:** errors written to the DLQ and the logs.
+
+**One residual.** A producer can escape any character of a JSON string in a spelling no encoder
+uses by default (`t` as `\u0074`). The decoded payload is redacted either way, so such a secret
+never reaches a sink. The **stored body** keeps it as received, however, so a copy or backup of
+the SQLite file would contain it. That needs the producer's payload to carry one of your secrets
+in the first place. Treat the data volume as you treat the `.env` file.
+
 ## Exposure model
 
 The container always binds `0.0.0.0:8080`. That is not a setting, and the absence is deliberate:

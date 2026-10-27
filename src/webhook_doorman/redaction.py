@@ -118,7 +118,8 @@ def _walk(value: Any, values: list[str]) -> Any:
             value = value.replace(secret, REDACTED)
         return value
     if isinstance(value, dict):
-        return {k: _walk(v, values) for k, v in value.items()}
+        # Keys too: a producer can echo a value as an object key as easily as a string.
+        return {_walk(k, values): _walk(v, values) for k, v in value.items()}
     if isinstance(value, list):
         return [_walk(v, values) for v in value]
     return value

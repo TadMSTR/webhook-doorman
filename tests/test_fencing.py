@@ -570,3 +570,46 @@ class TestStripIsLinear:
     def test_ordinary_angle_brackets_survive(self):
         out = fence_text("if a < b and c > d: pass", source="s", field="f")
         assert "a < b and c > d" in out
+
+
+class TestFencePatternIsLinear:
+    """R2-01. `<\\s*/?\\s*untrusted` let the engine split a whitespace run n ways: a 64 KB issue
+    body of `<` plus spaces blocked the event loop for seconds, at ingest and on every fenced
+    delivery. Both adversarial shapes at the 1 MiB body cap must stay fast."""
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "<" + " " * 1_000_000 + "x",  # whitespace after `<`
+            "<untrusted " * 90_000,  # openings that never close
+        ],
+        ids=["lt-whitespace", "open-no-close"],
+    )
+    def test_fence_text_is_fast_and_holds(self, content):
+        import time
+
+        started = time.perf_counter()
+        out = fence_text(content, source="github", field="body")
+        assert time.perf_counter() - started < 1.0
+        inside = out.split("\n", 1)[1].rsplit("\n", 1)[0]
+        assert not ("untrusted" in inside.lower() and ("<" in inside or ">" in inside))
+
+    @pytest.mark.parametrize(
+        "content",
+        ["<" + " " * 1_000_000 + "x", "<untrusted " * 90_000],
+        ids=["lt-whitespace", "open-no-close"],
+    )
+    async def test_the_detector_is_fast(self, content):
+        import time
+
+        from webhook_doorman.detect import build_detector
+
+        started = time.perf_counter()
+        await build_detector("heuristic").score(content)
+        assert time.perf_counter() - started < 1.0
+
+    async def test_an_unclosed_opening_is_still_detected(self):
+        from webhook_doorman.detect import build_detector
+
+        result = await build_detector("heuristic").score('text <untrusted source="x" never closes')
+        assert "fence_forgery" in result.rules
