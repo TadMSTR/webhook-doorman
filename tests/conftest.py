@@ -10,6 +10,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
+import socket
 from pathlib import Path
 
 import pytest
@@ -97,3 +99,41 @@ def write_config(tmp_path: Path):
         return path
 
     return _write
+
+
+_LOCAL_NAMES = {"localhost", "127.0.0.1", "::1", "testserver", ""}
+
+
+@pytest.fixture(autouse=True)
+def no_network_egress(monkeypatch):
+    """A test may not leave the machine. Resolving or connecting anywhere but loopback fails it.
+
+    Every sink test goes through `pytest-httpx` or the ASGI test client, neither of which opens
+    a socket, and the tracing harness listens on 127.0.0.1 on purpose. Anything else is a test
+    that depends on the network, or one that leaks to it, as the tracing tests once did.
+    """
+    real_getaddrinfo = socket.getaddrinfo
+    real_connect = socket.socket.connect
+    # Recorded as well as raised: an exporter's background thread catches the exception and
+    # retries quietly, and the test would pass. Teardown fails it instead.
+    attempts: list[str] = []
+
+    def getaddrinfo(host, *args, **kwargs):
+        name = host.decode() if isinstance(host, bytes) else (host or "")
+        if name not in _LOCAL_NAMES:
+            attempts.append(f"DNS lookup for {name!r}")
+            raise AssertionError(f"test attempted a DNS lookup for {name!r}")
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    def connect(self, address):
+        if self.family in (socket.AF_INET, socket.AF_INET6):
+            host = address[0]
+            if host not in _LOCAL_NAMES and not ipaddress.ip_address(host).is_loopback:
+                attempts.append(f"connection to {address!r}")
+                raise AssertionError(f"test attempted a connection to {address!r}")
+        return real_connect(self, address)
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    yield
+    assert not attempts, f"test attempted network egress: {attempts}"

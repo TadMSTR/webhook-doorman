@@ -86,6 +86,41 @@ def clean_tracer():
     tracing.reset()
 
 
+@pytest.fixture(autouse=True)
+def no_otlp_export(monkeypatch):
+    """Every exporter `configure` builds is a recorder that never connects.
+
+    The real one sends spans to whatever endpoint the test configured, from a background thread
+    and again at interpreter exit: `collector.example.invalid` meant DNS retries after the
+    suite, and the `localhost:4318` default meant test spans in a developer's live collector.
+    """
+    if not OTEL_INSTALLED:
+        return
+    from opentelemetry.sdk.trace.export import SpanExportResult
+
+    class RecordingExporter:
+        endpoints: list[str] = []  # noqa: RUF012
+
+        def __init__(self, endpoint=None, **_):
+            RecordingExporter.endpoints.append(endpoint)
+
+        def export(self, spans):
+            return SpanExportResult.SUCCESS
+
+        def shutdown(self):
+            pass
+
+        def force_flush(self, timeout_millis=30000):
+            return True
+
+    RecordingExporter.endpoints = []
+    monkeypatch.setattr(
+        "opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter",
+        RecordingExporter,
+    )
+    return RecordingExporter
+
+
 @pytest.fixture
 def otel_absent(monkeypatch):
     """Force the OTel imports to fail, whether or not the extra is installed.
@@ -94,10 +129,16 @@ def otel_absent(monkeypatch):
     exactly the condition an adopter without the extra hits — and simulating it means this test
     keeps testing the degraded path on a machine where OTel *is* present.
     """
+    # The SDK, the exporter and the instrumentation, not the API. FastAPI 0.143+ depends on
+    # `opentelemetry-api` and imports it at every startup, so an install without the extra
+    # still has the API; blocking it simulated a state no real install can be in, and the app
+    # failed to start for that reason alone (only when this test ran first).
+    blocked = ("opentelemetry.sdk", "opentelemetry.exporter", "opentelemetry.instrumentation")
     for name in list(sys.modules):
-        if name == "opentelemetry" or name.startswith("opentelemetry."):
+        if name.startswith(blocked):
             monkeypatch.delitem(sys.modules, name, raising=False)
-    monkeypatch.setitem(sys.modules, "opentelemetry", None)
+    for name in blocked:
+        monkeypatch.setitem(sys.modules, name, None)
 
 
 def build(env: dict[str, str] | None = None):
@@ -220,6 +261,22 @@ class TestExtraPresent:
             server.server_close()
 
         return list(exporter.get_finished_spans())
+
+    def test_spans_go_where_the_env_dict_says(self, no_otlp_export, monkeypatch):
+        """Not where the process environment says. They used to differ."""
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+        tracing.configure(env={"OTEL_EXPORTER_OTLP_ENDPOINT": ENDPOINT + "/"})
+        assert no_otlp_export.endpoints == [ENDPOINT + "/v1/traces"]
+
+    def test_the_traces_specific_endpoint_wins(self, no_otlp_export):
+        tracing.configure(
+            env={
+                "OTEL_EXPORTER_OTLP_ENDPOINT": ENDPOINT,
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://traces.example.invalid/x",
+            }
+        )
+        assert no_otlp_export.endpoints == ["http://traces.example.invalid/x"]
 
     def test_an_endpoint_plus_the_extra_enables_tracing(self):
         assert tracing.configure(env={"OTEL_EXPORTER_OTLP_ENDPOINT": ENDPOINT}) is True
