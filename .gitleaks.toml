@@ -31,7 +31,7 @@ description = "Documentation ranges, loopback, and example values are intentiona
 # Test fixtures are allowlisted by VALUE, not by path. Allowlisting tests/ wholesale would hide
 # a real credential pasted into a fixture — which is the most likely way one reaches this repo.
 regexes = [
-  '''test-(github|bearer|admin)-[a-z]+-[0-9a-z]+''',
+  '''test-(github|bearer|admin|vikunja)-[a-z]+-[0-9a-z]+''',
   '''abcdefgh12345678''',
   '''s3cret-value''',
   # tests/test_tracing.py's SINK_CREDENTIAL, synthetic, in history since v0.3.0 (f9e1258).
