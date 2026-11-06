@@ -167,6 +167,11 @@ jobs:
       # so a person reads it and presses publish. `append_body` covers the race where a
       # release appears between this check and the next step.
       #
+      # The check lists releases rather than asking `releases/tags/<tag>`: that endpoint never
+      # returns a draft, so a re-run before the draft was published took the create branch
+      # again and appended a second set of notes to it. The token has `contents: write`, so the
+      # list includes drafts. The tag is matched through `env`, never spliced into the filter.
+      #
       # Images are tagged by metadata-action's semver patterns, which drop the `v`: `0.7.1`,
       # not `v0.7.1`. The pull line printed `github.ref_name` and named a tag that never existed.
       - name: Check for an existing release
@@ -176,13 +181,15 @@ jobs:
         run: |
           set -euo pipefail
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          if out=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" 2>&1); then
+          # One count per page; any API failure exits non-zero here (fail closed).
+          counts=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '[.[] | select(.tag_name == env.GITHUB_REF_NAME)] | length')
+          total=0
+          for c in $counts; do total=$((total + c)); done
+          if [ "$total" -gt 0 ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-          elif grep -q "HTTP 404" <<<"$out"; then
-            echo "exists=false" >> "$GITHUB_OUTPUT"
           else
-            echo "$out" >&2
-            exit 1
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       - if: steps.release.outputs.exists == 'false'
