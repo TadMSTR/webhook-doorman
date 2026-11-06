@@ -162,8 +162,10 @@ jobs:
 
       # The release is normally created, with curated notes, before this job runs; replacing
       # that body with a generated one is what this job used to do. So it only creates a
-      # release that does not exist yet, and fails closed if it cannot tell. `append_body`
-      # covers the race where one appears between this check and the next step.
+      # release that does not exist yet, and fails closed if it cannot tell. That one is a
+      # **draft**: on a public repo, a mistaken tag push must not publish a release by itself,
+      # so a person reads it and presses publish. `append_body` covers the race where a
+      # release appears between this check and the next step.
       #
       # Images are tagged by metadata-action's semver patterns, which drop the `v`: `0.7.1`,
       # not `v0.7.1`. The pull line printed `github.ref_name` and named a tag that never existed.
@@ -187,6 +189,7 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           generate_release_notes: true
+          draft: true
           append_body: true
           body: |
             ```

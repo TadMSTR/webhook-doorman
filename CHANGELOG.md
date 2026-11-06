@@ -40,7 +40,10 @@ hardening. **Upgrading is recommended** if any source routes to an Apprise sink 
 - **The GitHub release job no longer overwrites existing release notes**, and its pull command
   names the real image tag. Images are tagged `0.7.1`, not `v0.7.1`, so every release since
   the job was added printed a `docker pull` that failed. The job now creates a release only if
-  none exists (and fails closed if it cannot tell).
+  none exists (and fails closed if it cannot tell), and creates it as a draft, so a mistaken
+  tag push cannot publish one.
+- **Base image digest bumped** (`python:3.14-slim`) for a fixable HIGH in the OS layer's `apt`
+  (3.0.3 → 3.0.4), which the image gate's Trivy scan now reports.
 
 ## [0.7.0] — 2026-10-27
 
