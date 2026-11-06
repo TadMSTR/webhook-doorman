@@ -368,8 +368,9 @@ class AppriseNotifySink(HttpSinkBase):
     excerpt in the `SinkError` message worth reading.
 
     **Escaping is per `body_format`, and all three modes are decided rather than defaulted.**
-    `html` escapes as HTML; `markdown` escapes angle brackets, because apprise-api converts
-    Markdown to HTML with an unsanitised Python-Markdown that passes raw tags through; `text`
+    `html` escapes as HTML; `markdown` escapes angle brackets and backslash-escapes `\\`, `[`
+    and `]`, because apprise-api converts Markdown to HTML with an unsanitised Python-Markdown
+    that passes raw tags and link URLs through; `text`
     is not escaped, because apprise-api runs its own `escape_html` on the text-to-HTML path.
     An audit found `markdown` originally sharing the `text` rule — the format's name made it
     look like a plain-text sibling when its renderer makes it a rich-text one. See

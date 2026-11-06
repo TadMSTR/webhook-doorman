@@ -144,7 +144,7 @@ interpolated value, for destinations that render rich text — today, the Vikunj
 `description`. `render_slack()` applies Slack's own three-character escape.
 `render_markdown()` escapes angle brackets, and backslash-escapes `\`, `[` and `]`, for
 Markdown a destination converts to HTML. Python-Markdown sanitises neither raw HTML nor link
-URLs, so both raw tags and `[x](javascript:...)` have to be stopped in the value.
+URLs, so both raw tags and link syntax have to be stopped in the value.
 
 **The renderer decides, not the format.** Two of the four serve Markdown destinations and they
 need opposite treatment. Discord's message content is Markdown and takes `render()`, because

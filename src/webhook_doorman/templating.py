@@ -82,7 +82,7 @@ def _build(autoescape: bool, finalize: Callable[[Any], str] | None = None) -> Sa
 _SLACK_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
 
 # Markdown: the angle brackets stop raw HTML, and a backslash on `[` and `]` stops link and
-# image syntax (`[x](javascript:...)`, `![x](data:...)`, reference links). Order matters:
+# image syntax (inline, image and reference forms). Order matters:
 # `\` must go first, or a value's own `\` would cancel the escape added before its `[`.
 # See `render_markdown` for why `&` is not here — it is a deliberate exclusion, not an
 # oversight, so do not "complete the set".
@@ -204,8 +204,8 @@ def render_markdown(template: str, context: dict[str, Any]) -> str:
 
     Escaping the angle brackets stops raw HTML, and is checked both ways: an escaped
     `&lt;script&gt;` renders as literal text through the same converter. It is **not** enough
-    on its own. Python-Markdown does not sanitise link URLs either, so `[x](javascript:...)`
-    in a value became a live `<a href="javascript:...">`, and `![x](data:...)` an `<img>`.
+    on its own. Python-Markdown does not sanitise link URLs either, so link or image syntax
+    in a value rendered as a live link or image, whatever its URL scheme.
     Every link form needs `[`, so `[` and `]` get a backslash escape, and `\\` gets one first
     so a value cannot cancel it. The result renders as literal text through the converter, and
     a native Markdown renderer shows the plain characters (a backslash escape of punctuation

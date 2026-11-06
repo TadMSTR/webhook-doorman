@@ -73,7 +73,7 @@ It follows the *renderer*, not the format. Discord's content is Markdown and is 
 because Discord does not render raw HTML; Apprise's `body_format: markdown` is escaped because
 apprise-api converts it through an unsanitised Markdown-to-HTML step. Same format, opposite
 rule. `ARCHITECTURE.md` has the reasoning. That escape covers raw HTML (`<` and `>`) and link
-syntax (`\`, `[` and `]`, so `[x](javascript:...)` in a value stays text). It cannot cover a
+syntax (`\`, `[` and `]`, so link and image syntax in a value stays text). It cannot cover a
 value the template places inside a link target, as in `[details]({{ url }})`: don't put
 untrusted values there.
 

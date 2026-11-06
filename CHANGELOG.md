@@ -17,9 +17,9 @@ hardening. **Upgrading is recommended** if any source routes to an Apprise sink 
 ### Security
 - **Apprise `body_format: markdown` no longer passes link syntax through.** Escaping the angle
   brackets stopped raw HTML but not Markdown links: apprise-api's Python-Markdown does not
-  sanitise link URLs, so `[x](javascript:...)` in an interpolated value became a live
-  `<a href="javascript:...">` (and `![x](data:...)` an `<img>`) on any target that renders
-  the HTML. Interpolated values now also get a backslash escape on `\`, `[` and `]`, which
+  sanitise link URLs, so link and image syntax in an interpolated value rendered as a live
+  link or image on any target that renders the HTML. Interpolated values now also get a
+  backslash escape on `\`, `[` and `]`, which
   stops every inline, reference and image link form. The text still reads the same, through the
   converter and in a native Markdown renderer. A value that the template itself places inside a
   link target (`[details]({{ url }})`) cannot be made safe by escaping. The docs now say so.
