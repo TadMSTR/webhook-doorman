@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-11-06
+
+A content-safety fix for Apprise's Markdown mode, a filter fix, and publish-pipeline
+hardening. **Upgrading is recommended** if any source routes to an Apprise sink with
+`body_format: markdown`. Configs load unchanged, and the database schema is unchanged.
+
+### Security
+- **Apprise `body_format: markdown` no longer passes link syntax through.** Escaping the angle
+  brackets stopped raw HTML but not Markdown links: apprise-api's Python-Markdown does not
+  sanitise link URLs, so `[x](javascript:...)` in an interpolated value became a live
+  `<a href="javascript:...">` (and `![x](data:...)` an `<img>`) on any target that renders
+  the HTML. Interpolated values now also get a backslash escape on `\`, `[` and `]`, which
+  stops every inline, reference and image link form. The text still reads the same, through the
+  converter and in a native Markdown renderer. A value that the template itself places inside a
+  link target (`[details]({{ url }})`) cannot be made safe by escaping. The docs now say so.
+- **CI tools are pinned and hash-checked.** `pip install pip-audit` / `pip install build`
+  resolved whatever PyPI served, including in the publish job that holds `packages: write`.
+  Both now come from a new `ci-tools` dependency group in `uv.lock`, installed with
+  `pip install --require-hashes --no-deps` (`.github/ci/install-ci-tools.sh`).
+- **Publishing is gated on CI.** `publish.yml` calls `ci.yml` (tests, lint, lock check,
+  dependency audit, mutation gate) and the image job `needs` it, so a tag on a commit whose CI
+  fails no longer publishes.
+
+### Fixed
+- **A filter can match a JSON `null`.** `deny: {x: ["null"]}` never refused `x: null`, and
+  `require: {x: ["null"]}` always refused it, because a null and a missing path both resolved
+  to "absent". A missing path still fails `require` and passes `deny`. A null at the path is
+  now the value `"null"`, as it already was inside a list. Configs that do not name `"null"`
+  behave as before.
+- **The GitHub release job no longer overwrites existing release notes**, and its pull command
+  names the real image tag. Images are tagged `0.7.1`, not `v0.7.1`, so every release since
+  the job was added printed a `docker pull` that failed. The job now creates a release only if
+  none exists (and fails closed if it cannot tell).
+
 ## [0.7.0] — 2026-10-27
 
 Per-sink filters, a full review of the codebase, and an image with no pip. **Upgrading is
@@ -601,6 +635,7 @@ First release. Security-audited before tagging: one Medium finding, resolved bel
   redacted before storage, collapsing every event onto one dedup id and silently discarding all
   but the first.
 
+[0.7.1]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.7.1
 [0.7.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.7.0
 [0.6.0]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.6.0
 [0.5.1]: https://github.com/TadMSTR/webhook-doorman/releases/tag/v0.5.1

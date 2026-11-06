@@ -72,7 +72,10 @@ without knowing what it was for.
 It follows the *renderer*, not the format. Discord's content is Markdown and is left unescaped
 because Discord does not render raw HTML; Apprise's `body_format: markdown` is escaped because
 apprise-api converts it through an unsanitised Markdown-to-HTML step. Same format, opposite
-rule. `ARCHITECTURE.md` has the reasoning.
+rule. `ARCHITECTURE.md` has the reasoning. That escape covers raw HTML (`<` and `>`) and link
+syntax (`\`, `[` and `]`, so `[x](javascript:...)` in a value stays text). It cannot cover a
+value the template places inside a link target, as in `[details]({{ url }})`: don't put
+untrusted values there.
 
 ### Per-sink filters
 
@@ -101,7 +104,8 @@ sources:
   as they do on a source (see [security.md](security.md#1-filter-what-the-destination-sees-at-all)).
   `max_field_bytes` is source-only, because every sink shares the one stored event.
 - **Values are compared as text.** Paths resolve into the decoded payload. A JSON integer `3`
-  matches `"3"`, and `true` matches `"true"`. Vikunja's priority is the integer at
+  matches `"3"`, `true` matches `"true"`, and a JSON `null` matches `"null"` (a path that does
+  not resolve at all is missing, not null). Vikunja's priority is the integer at
   `data.task.priority`: 0 unset, 1 low, 2 medium, 3 high, 4 urgent, 5 "DO NOW".
 - **Nothing is dropped silently.** An event that every route refuses is stored with status
   `filtered` and reason `sink`, and the producer gets `200`, like any filtered event. The

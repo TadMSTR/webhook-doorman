@@ -15,8 +15,19 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/webhook-doorman
 
 jobs:
+  # The whole of ci.yml — tests, lint, lock check, dependency audit, mutation gate — as a
+  # prerequisite of the image. Before this, a tag on a commit whose CI was red still published:
+  # tags were cut after a green merge in practice, but nothing enforced it. Calling the same
+  # file, rather than copying its jobs here, keeps one definition of "green".
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   image:
     name: Build, verify and publish multi-arch image
+    needs: ci
     runs-on: ubuntu-latest
 
     # Scoped to this job rather than the workflow. `packages: write` is what lets the built-in
@@ -91,8 +102,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install pip-audit
-        run: pip install pip-audit
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      - name: Install pip-audit (pinned and hash-checked from uv.lock)
+        run: .github/ci/install-ci-tools.sh
 
       # The same script ci.yml runs on every PR: contents, runtime uid, entry point, a
       # dependency audit of the tree that actually shipped, and the HTTP service contract.
@@ -146,10 +160,35 @@ jobs:
           # No token left in .git/config for later steps to read; nothing here pushes.
           persist-credentials: false
 
-      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      # The release is normally created, with curated notes, before this job runs; replacing
+      # that body with a generated one is what this job used to do. So it only creates a
+      # release that does not exist yet, and fails closed if it cannot tell. `append_body`
+      # covers the race where one appears between this check and the next step.
+      #
+      # Images are tagged by metadata-action's semver patterns, which drop the `v`: `0.7.1`,
+      # not `v0.7.1`. The pull line printed `github.ref_name` and named a tag that never existed.
+      - name: Check for an existing release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          if out=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" 2>&1); then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif grep -q "HTTP 404" <<<"$out"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$out" >&2
+            exit 1
+          fi
+
+      - if: steps.release.outputs.exists == 'false'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           generate_release_notes: true
+          append_body: true
           body: |
             ```
-            docker pull ghcr.io/tadmstr/webhook-doorman:${{ github.ref_name }}
+            docker pull ghcr.io/tadmstr/webhook-doorman:${{ steps.release.outputs.version }}
             ```

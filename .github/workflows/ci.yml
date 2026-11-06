@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # publish.yml calls this whole workflow and gates the image on it, so a tag on a commit
+  # whose tests, lint, lock check or mutation gate fail cannot publish.
+  workflow_call:
 
 permissions:
   contents: read
@@ -95,10 +98,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      - name: Install build (pinned and hash-checked from uv.lock)
+        run: .github/ci/install-ci-tools.sh
+
       - name: Build wheel and sdist
-        run: |
-          pip install build
-          python -m build
+        run: python -m build
 
       # Installing the built wheel, not the source tree: a packaging mistake that only shows
       # up in the artifact (a missing package directory, a bad build-backend string) is invisible
@@ -163,8 +170,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install pip-audit
-        run: pip install pip-audit
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      - name: Install pip-audit (pinned and hash-checked from uv.lock)
+        run: .github/ci/install-ci-tools.sh
 
       # Image contents, runtime uid, the entry point and `--check`, a dependency audit of the
       # tree that actually shipped, and the HTTP service contract.
@@ -195,8 +205,8 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
-      - name: Install pip-audit
-        run: pip install pip-audit
+      - name: Install pip-audit (pinned and hash-checked from uv.lock)
+        run: .github/ci/install-ci-tools.sh
 
       # A lockfile that has drifted from pyproject.toml describes a tree nobody installs, which
       # is the same defect this job was rebuilt to remove, relocated one file over. `--check`

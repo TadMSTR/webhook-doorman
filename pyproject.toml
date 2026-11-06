@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "webhook-doorman"
-version = "0.7.0"
+version = "0.7.1"
 description = "A fail-closed inbound webhook router: verify, persist, deliver."
 readme = "README.md"
 license = { text = "MIT" }
@@ -73,6 +73,16 @@ dev = [
     "pytest-cov>=5.0,<8",
     "pytest-httpx>=0.30,<1",
     "ruff==0.17.0",
+]
+
+[dependency-groups]
+# The tools CI installs with pip outside the project venv: pip-audit in the image, audit and
+# publish jobs, and build in the artifact job. A group, not the `dev` extra, so each job installs
+# only this closure, pinned and hash-checked from uv.lock (`uv export --only-group ci-tools`),
+# rather than whatever PyPI serves that minute. The publish job holds `packages: write`.
+ci-tools = [
+    "build>=1.2,<2",
+    "pip-audit>=2.7,<3",
 ]
 
 [project.scripts]
