@@ -52,6 +52,9 @@ Two asymmetries, and they are what make both directions useful:
   does not carry, so it is refused;
 - a path that does **not** resolve **passes** a `deny` — absent is not the thing you are refusing.
 
+A JSON `null` at the path is not absent: it is the value `"null"`. `deny: {x: ["null"]}` refuses
+`x: null`, and `require: {x: ["null"]}` admits it.
+
 `deny` is evaluated first, so a payload that satisfies `require` *and* matches `deny` is refused
 as `deny`. A filtered event is **stored**, with status `filtered` and zero deliveries, and the
 producer gets a 200 — a non-2xx makes a well-behaved producer retry harder over a decision that

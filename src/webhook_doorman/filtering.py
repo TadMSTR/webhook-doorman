@@ -13,6 +13,8 @@ Three rules are worth stating because each one is a choice:
   payload to carry; a payload that does not carry it has not provided the guarantee, so it is
   refused. `deny` is a specific thing you are refusing; something absent is not that thing. The
   asymmetry is what makes both usable — a symmetric rule would make one of them useless.
+  A JSON `null` is not missing, it is the value `"null"`: `deny: {x: ["null"]}` refuses
+  `x: null`, and `require: {x: ["null"]}` admits it.
 * **Order is `event_types` → `deny` → `require`.** `deny` is checked first so that a payload
   which satisfies `require` *and* matches `deny` is rejected as `deny`, which is the answer an
   operator is looking for when both are configured.
@@ -60,18 +62,26 @@ class FilterVerdict:
 ADMITTED = FilterVerdict(admitted=True)
 
 
+#: What `dig` returns for a path that does not resolve. Not `None`: that is JSON `null`, which
+#: is a value a filter can name (`"null"`), and conflating the two made it unmatchable.
+MISSING: Any = object()
+
+
 def dig(payload: Any, path: str) -> Any:
-    """Resolve a dotted path into a decoded payload. `None` if it does not resolve.
+    """Resolve a dotted path into a decoded payload. `MISSING` if it does not resolve.
+
+    A JSON `null` at the end of the path resolves to `None`. A `null` part-way along it is
+    missing, the same as any other non-object: there is nothing to descend into.
 
     Defensive in the style of `parsers._dig`: webhook payloads are documented optimistically and
     delivered otherwise, and a filter that raises on a missing key would turn a cosmetic upstream
     change into a rejected delivery.
     """
     current = payload
-    for key in path.split("."):
-        if not isinstance(current, dict):
-            return None
-        current = current.get(key)
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return MISSING
+        current = current[part]
     return current
 
 
@@ -117,14 +127,14 @@ def evaluate(source_filter, event_type: str, payload: Any) -> FilterVerdict:
 
     for path, values in source_filter.deny.items():
         resolved = dig(payload, path)
-        if resolved is None:
+        if resolved is MISSING:
             continue  # Absent is not the thing being refused.
         if _matches(resolved, values):
             return FilterVerdict(False, "deny", path)
 
     for path, values in source_filter.require.items():
         resolved = dig(payload, path)
-        if resolved is None or not _matches(resolved, values):
+        if resolved is MISSING or not _matches(resolved, values):
             # Fail-closed: the payload did not carry the guarantee that was asked for.
             return FilterVerdict(False, "require", path)
 

@@ -18,6 +18,7 @@ because an over-broad fix that HTML-escapes chat messages is its own bug.
 from __future__ import annotations
 
 import json
+import re
 
 import httpx
 import pytest
@@ -314,6 +315,48 @@ class TestAppriseBodyFormatChoosesTheEscape:
         # attribute text survives harmlessly once there is no tag for it to attach to.
         assert "<" not in body
         assert "&lt;img" in body
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "[click](javascript:alert(1))",
+            "![x](data:text/html;base64,PHNjcmlwdD4=)",
+            "[click](vbscript:msgbox(1))",
+            "[click][1]\n\n[1]: javascript:alert(1)",
+        ],
+    )
+    async def test_markdown_body_cannot_carry_link_syntax(self, client, httpx_mock, value):
+        """Python-Markdown does not sanitise link URLs: `[x](javascript:...)` in a value
+        became `<a href="javascript:...">`. Every link and image form needs `[`, so no
+        unescaped bracket may survive from an interpolated value."""
+        httpx_mock.add_response(url=APPRISE_URL, status_code=200)
+        await apprise_sink(body_format="markdown", template="{{ body }}").deliver(
+            {**CONTEXT, "body": value}, client
+        )
+
+        body = json.loads(httpx_mock.get_requests()[0].read())["body"]
+        assert re.search(r"(?<!\\)\[", body) is None, body
+        assert re.search(r"(?<!\\)\]", body) is None, body
+
+    async def test_markdown_value_cannot_cancel_the_bracket_escape(self, client, httpx_mock):
+        """A value's own backslash before `[` would turn `\\[` into a literal backslash and
+        an unescaped bracket. Backslashes are escaped first, so it stays text."""
+        httpx_mock.add_response(url=APPRISE_URL, status_code=200)
+        await apprise_sink(body_format="markdown", template="{{ body }}").deliver(
+            {**CONTEXT, "body": "\\[x](javascript:1)"}, client
+        )
+
+        body = json.loads(httpx_mock.get_requests()[0].read())["body"]
+        assert body == "\\\\\\[x\\](javascript:1)"
+
+    async def test_markdown_leaves_operator_link_syntax_alone(self, client, httpx_mock):
+        httpx_mock.add_response(url=APPRISE_URL, status_code=200)
+        await apprise_sink(
+            body_format="markdown", template="[runbook](https://runbook.example) {{ source }}"
+        ).deliver(CONTEXT, client)
+
+        body = json.loads(httpx_mock.get_requests()[0].read())["body"]
+        assert body == "[runbook](https://runbook.example) github"
 
     async def test_markdown_leaves_an_ampersand_alone(self, client, httpx_mock):
         """The deliberate exclusion, asserted so nobody "completes the set" later.

@@ -17,6 +17,7 @@ from webhook_doorman.config import Config, SourceFilter
 from webhook_doorman.errors import ConfigError
 from webhook_doorman.filtering import (
     FILTER_REASONS,
+    MISSING,
     TRUNCATION_MARKER,
     FilterVerdict,
     dig,
@@ -154,10 +155,51 @@ class TestValueMatching:
         assert evaluate(f, "e", payload).admitted is True
 
     def test_a_null_inside_a_list_matches_as_null(self):
-        """`dig` short-circuits a top-level null, so this is the only path that reaches it."""
         payload = {"issue": {"assignees": [None]}}
         f = make_filter(deny={"issue.assignees": ["null"]})
         assert evaluate(f, "e", payload).reason == "deny"
+
+
+_NULL_MILESTONE = {"issue": {"milestone": None}}
+
+
+class TestNullIsAValue:
+    """A JSON `null` at the path is present, not missing.
+
+    `dig` used to return `None` for both, so `deny: {x: ["null"]}` never refused `x: null`
+    and `require: {x: ["null"]}` always refused it, while a null inside a list matched.
+    """
+
+    def test_deny_null_refuses_a_null(self):
+        f = make_filter(deny={"issue.milestone": ["null"]})
+        verdict = evaluate(f, "e", _NULL_MILESTONE)
+        assert (verdict.admitted, verdict.reason) == (False, "deny")
+
+    def test_require_null_admits_a_null(self):
+        f = make_filter(require={"issue.milestone": ["null"]})
+        assert evaluate(f, "e", _NULL_MILESTONE).admitted is True
+
+    def test_deny_null_still_passes_a_missing_path(self):
+        f = make_filter(deny={"issue.milestone": ["null"]})
+        assert evaluate(f, "e", {"issue": {}}).admitted is True
+
+    def test_require_null_still_refuses_a_missing_path(self):
+        f = make_filter(require={"issue.milestone": ["null"]})
+        verdict = evaluate(f, "e", {"issue": {}})
+        assert (verdict.admitted, verdict.reason) == (False, "require")
+
+    def test_a_null_does_not_match_other_values(self):
+        """Unchanged for every config that does not name `"null"`."""
+        assert evaluate(
+            make_filter(deny={"issue.milestone": ["v1"]}), "e", _NULL_MILESTONE
+        ).admitted
+        f = make_filter(require={"issue.milestone": ["v1"]})
+        assert evaluate(f, "e", _NULL_MILESTONE).reason == "require"
+
+    def test_a_null_part_way_along_the_path_is_missing(self):
+        payload = {"issue": {"milestone": None}}
+        f = make_filter(deny={"issue.milestone.title": ["null"]})
+        assert evaluate(f, "e", payload).admitted is True
 
     def test_a_number_matches_as_text(self):
         assert evaluate(make_filter(require={"issue.number": ["7"]}), "e", PAYLOAD).admitted is True
@@ -175,11 +217,14 @@ class TestDig:
     def test_resolves_a_nested_path(self):
         assert dig(PAYLOAD, "issue.user.login") == "octocat"
 
-    def test_returns_none_for_a_missing_path(self):
-        assert dig(PAYLOAD, "issue.absent") is None
+    def test_returns_missing_for_a_missing_path(self):
+        assert dig(PAYLOAD, "issue.absent") is MISSING
 
-    def test_returns_none_rather_than_raising_on_a_scalar(self):
-        assert dig(PAYLOAD, "issue.number.deeper") is None
+    def test_returns_missing_rather_than_raising_on_a_scalar(self):
+        assert dig(PAYLOAD, "issue.number.deeper") is MISSING
+
+    def test_returns_none_for_a_json_null(self):
+        assert dig({"a": {"b": None}}, "a.b") is None
 
 
 class TestTruncation:

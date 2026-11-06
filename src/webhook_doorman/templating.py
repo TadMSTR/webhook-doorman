@@ -25,7 +25,8 @@ gets most of the cases wrong:
   `Fix A &amp; B`, and escaping a JSON body breaks it outright.
 * `render_html()` — autoescape **on**. Destinations that render their input as rich text.
 * `render_slack()` — Slack's own three-character escape, which is neither of the above.
-* `render_markdown()` — angle brackets only, for Markdown that a destination converts to HTML.
+* `render_markdown()` — angle brackets, plus a backslash escape on `\\`, `[` and `]`, for
+  Markdown that a destination converts to HTML.
 
 Note that two of these four are Markdown destinations that need *opposite* treatment, which is
 the clearest statement of why this is not a per-format setting. Discord's message content is
@@ -80,9 +81,18 @@ def _build(autoescape: bool, finalize: Callable[[Any], str] | None = None) -> Sa
 # `<` arrives as `&amp;lt;`.
 _SLACK_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
 
-# Markdown needs only the angle brackets. See `render_markdown` for why `&` is not here —
-# it is a deliberate exclusion, not an oversight, so do not "complete the set".
-_MARKDOWN_ESCAPES = (("<", "&lt;"), (">", "&gt;"))
+# Markdown: the angle brackets stop raw HTML, and a backslash on `[` and `]` stops link and
+# image syntax (inline, image and reference forms). Order matters:
+# `\` must go first, or a value's own `\` would cancel the escape added before its `[`.
+# See `render_markdown` for why `&` is not here — it is a deliberate exclusion, not an
+# oversight, so do not "complete the set".
+_MARKDOWN_ESCAPES = (
+    ("\\", "\\\\"),
+    ("[", "\\["),
+    ("]", "\\]"),
+    ("<", "&lt;"),
+    (">", "&gt;"),
+)
 
 
 def _slack_escape(value: Any) -> str:
@@ -181,7 +191,7 @@ def render_slack(template: str, context: dict[str, Any]) -> str:
 
 
 def render_markdown(template: str, context: dict[str, Any]) -> str:
-    """Render `template` as Markdown, escaping `<` and `>` in interpolated values.
+    """Render `template` as Markdown, neutralising raw HTML and link syntax in interpolated values.
 
     **Markdown is not a safe format by default.** Standard Markdown passes raw inline and block
     HTML straight through to its output — that is a specified feature, not a bug — so a
@@ -192,8 +202,19 @@ def render_markdown(template: str, context: dict[str, Any]) -> str:
     contrast, calls `escape_html` server-side — which is why `render()` remains correct there
     and is wrong here.
 
-    Escaping the angle brackets is sufficient and is checked both ways: an escaped
-    `&lt;script&gt;` renders as literal text through the same converter.
+    Escaping the angle brackets stops raw HTML, and is checked both ways: an escaped
+    `&lt;script&gt;` renders as literal text through the same converter. It is **not** enough
+    on its own. Python-Markdown does not sanitise link URLs either, so link or image syntax
+    in a value rendered as a live link or image, whatever its URL scheme.
+    Every link form needs `[`, so `[` and `]` get a backslash escape, and `\\` gets one first
+    so a value cannot cancel it. The result renders as literal text through the converter, and
+    a native Markdown renderer shows the plain characters (a backslash escape of punctuation
+    is standard Markdown). The `<javascript:...>` autolink is already covered by the angle
+    brackets, and Python-Markdown does not link a bare URL.
+
+    **The limit:** escaping protects a value placed in text. A value the template puts inside
+    a link target, as in `[details]({{ url }})`, is not made safe: the scheme comes from the
+    value, and no escape changes it. Do not interpolate untrusted values into a link target.
 
     **`&` is deliberately not escaped**, unlike `render_slack`. Markdown-to-HTML converts a bare
     `&` to `&amp;` itself, so nothing is gained, and the two fates of this content are the only
