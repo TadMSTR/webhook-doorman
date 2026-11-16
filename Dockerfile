@@ -18,7 +18,7 @@
 # This digest is an OCI image index covering linux/amd64 and linux/arm64 (verified), so the
 # multi-arch publish still resolves per-platform. Do not replace it with a single-platform
 # digest — that would break the arm64 leg.
-FROM python:3.14-slim@sha256:af8a5aa14780025dbfbcfbc81bd8a91ebd87711dd5b0f48ed71090949dd7cb1d AS builder
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
@@ -61,7 +61,7 @@ RUN uv export --frozen --no-dev --extra otel --no-emit-project \
 
 # --- runtime ----------------------------------------------------------------------------------
 # Same digest as the builder stage above, and it must stay that way — see the reasoning there.
-FROM python:3.14-slim@sha256:af8a5aa14780025dbfbcfbc81bd8a91ebd87711dd5b0f48ed71090949dd7cb1d AS runtime
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS runtime
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
